@@ -50,7 +50,7 @@ class AggTradesArchiveAdapter(BinanceArchiveAdapter):
 
     dataset = DatasetKind.AGG_TRADES
 
-    def read(self, record: ArchiveRecord) -> pd.DataFrame:
+    def read(self, record: ArchiveRecord, *, start=None, end=None) -> pd.DataFrame:
         if record.dataset != self.dataset:
             raise ValueError(f"AggTradesArchiveAdapter cannot read {record.dataset.value}")
         with open_csv_stream(record.path) as stream:
@@ -69,6 +69,14 @@ class AggTradesArchiveAdapter(BinanceArchiveAdapter):
         raw.columns = _AGG_TRADE_COLUMNS
 
         event_time = timestamp_series(raw["transact_time"])
+        if start is not None or end is not None:
+            mask = pd.Series(True, index=raw.index)
+            if start is not None:
+                mask &= event_time >= start
+            if end is not None:
+                mask &= event_time < end
+            raw = raw.loc[mask].reset_index(drop=True)
+            event_time = event_time.loc[mask].reset_index(drop=True)
         price = pd.to_numeric(raw["price"], errors="raise")
         quantity = pd.to_numeric(raw["quantity"], errors="raise")
         buyer_maker = _boolean_series(raw["is_buyer_maker"])
@@ -115,7 +123,7 @@ class TradesArchiveAdapter(BinanceArchiveAdapter):
 
     dataset = DatasetKind.TRADES
 
-    def read(self, record: ArchiveRecord) -> pd.DataFrame:
+    def read(self, record: ArchiveRecord, *, start=None, end=None) -> pd.DataFrame:
         if record.dataset != self.dataset:
             raise ValueError(f"TradesArchiveAdapter cannot read {record.dataset.value}")
         with open_csv_stream(record.path) as stream:
@@ -129,6 +137,14 @@ class TradesArchiveAdapter(BinanceArchiveAdapter):
         raw = raw.iloc[:, :len(_TRADE_COLUMNS)].copy()
         raw.columns = _TRADE_COLUMNS
         event_time = timestamp_series(raw["transact_time"])
+        if start is not None or end is not None:
+            mask = pd.Series(True, index=raw.index)
+            if start is not None:
+                mask &= event_time >= start
+            if end is not None:
+                mask &= event_time < end
+            raw = raw.loc[mask].reset_index(drop=True)
+            event_time = event_time.loc[mask].reset_index(drop=True)
         price = pd.to_numeric(raw["price"], errors="raise")
         quantity = pd.to_numeric(raw["quantity"], errors="raise")
         quote = pd.to_numeric(raw["quote_quantity"], errors="raise")

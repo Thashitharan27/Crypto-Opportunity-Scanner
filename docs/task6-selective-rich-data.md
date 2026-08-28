@@ -36,8 +36,10 @@ plan.
 
 Funding, basis, and positioning retain their provider warmups. Taker-flow uses
 the configured interval (5m by default), and trade-flow uses its configured raw
-event family (aggregate trades by default). Strategy-interval klines are reused
-from Task 5; optional intrabar klines are acquired only when explicitly set.
+event family (aggregate trades by default). Auxiliary klines always retain their
+one-hour warmup even when their interval equals the Task 5 strategy interval;
+the Data Lake reuses `[start,end)` and acquisition fills only a missing leading
+gap. Optional intrabar klines are acquired only when explicitly set.
 
 Requirements with the same symbol, dataset, and interval are coalesced while
 retaining every sorted feature, reason, and that feature's own required/optional
@@ -53,7 +55,9 @@ Both Data Hub `ACQUIRED` and `MISSING` outcomes are revalidated: a missing
 monthly archive can coexist with a successful daily fallback. Raw trade-event
 readiness validates one existing Data Lake partition at a time, so Task 6 never
 concatenates an entire `AGG_TRADES` or `TRADES` request merely to establish
-archive readiness.
+archive readiness. It slices each archive to the request before validation,
+applies the existing overlap-integrity contract pairwise, and reuses the existing
+canonical-source-keyed Data Lake quality cache on subsequent scans.
 
 Missing rich data never rejects or removes a final candidate. It makes a
 required feature `UNAVAILABLE`, an optional enrichment `DEGRADED`, or—in the

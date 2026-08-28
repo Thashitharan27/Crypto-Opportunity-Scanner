@@ -129,12 +129,13 @@ class DatasetQualityReport:
             if issue.code not in _MISSING_COVERAGE_CODES:
                 continue
             for value in issue.details.get("ranges", ()):
+                if value.get("end_exclusive"):
+                    ranges.append(MissingCoverageRange(
+                        pd.Timestamp(value["start"]).to_pydatetime(),
+                        pd.Timestamp(value["end"]).to_pydatetime(),
+                    ))
+                    continue
                 if delta is None:
-                    if value.get("end_exclusive"):
-                        ranges.append(MissingCoverageRange(
-                            pd.Timestamp(value["start"]).to_pydatetime(),
-                            pd.Timestamp(value["end"]).to_pydatetime(),
-                        ))
                     continue
                 start = pd.Timestamp(value["start"]).to_pydatetime()
                 # Quality gap ranges store the last missing grid timestamp.

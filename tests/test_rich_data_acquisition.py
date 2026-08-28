@@ -9,6 +9,7 @@ from crypto_strategy_lab.data.binance.selective_acquisition import (
 )
 from crypto_strategy_lab.data.quality import (
     DataQualityIssue, DataQualityStatus, DatasetQualityReport,
+    MissingCoverageRange,
 )
 from crypto_strategy_lab.data.query import DataRequest
 from crypto_strategy_lab.data.schemas import ArchiveRecord, DatasetKind, MarketKind
@@ -63,13 +64,18 @@ def test_feature_dependency_mapping_and_warmups():
     }
     positioning = plan(("futures_positioning",)).requirements
     assert {(r.dataset, r.interval) for r in positioning} == {(DatasetKind.FUTURES_METRICS, None), (DatasetKind.KLINES, "1h")}
-    assert [r.dataset for r in plan(("futures_positioning",), interval="1h").requirements] == [DatasetKind.FUTURES_METRICS]
+    one_hour = plan(("futures_positioning",), interval="1h").requirements
+    assert {(r.dataset, r.interval) for r in one_hour} == {
+        (DatasetKind.FUTURES_METRICS, None), (DatasetKind.KLINES, "1h")}
+    assert next(r for r in one_hour if r.dataset is DatasetKind.KLINES).start == START.replace(hour=23, day=9)
 
 
 def test_parameterized_sources_intrabar_and_no_parallel_dataset():
     taker = plan(("taker_flow_context",)).requirements
     assert [(r.dataset, r.interval) for r in taker] == [(DatasetKind.KLINES, "5m")]
-    assert not plan(("taker_flow_context",), interval="5m").requirements
+    same_interval = plan(("taker_flow_context",), interval="5m").requirements
+    assert [(r.dataset, r.interval, r.start) for r in same_interval] == [
+        (DatasetKind.KLINES, "5m", START.replace(hour=23, day=9))]
     for source, expected in (("AGG_TRADES", DatasetKind.AGG_TRADES), ("TRADES", DatasetKind.TRADES)):
         reqs = plan(("trade_flow_context",), {"trade_flow_context": {"trade_flow_source": source}}).requirements
         assert [r.dataset for r in reqs] == [expected]
@@ -151,6 +157,38 @@ def test_reuse_missing_range_post_validation_and_source_identity():
     item = result.symbols[0].datasets[0]
     assert backend.requests[0].missing_ranges[0].start == item.requirement.start
     assert item.state is AcquisitionState.MISSING
+
+
+def test_same_interval_strategy_coverage_downloads_only_auxiliary_warmup():
+    warmup_start = START.replace(hour=23, day=9)
+    gap_issue = DataQualityIssue(
+        "MISSING_INTERNAL_INTERVAL", DataQualityStatus.ERROR, "warmup missing",
+        details={"ranges": [{"start": warmup_start.isoformat(),
+                              "end": START.isoformat(), "end_exclusive": True}]},
+    )
+
+    class PartialStore(Store):
+        def data_quality_report(self, request, dataset, *, interval=None, required=True):
+            if self.refreshes > 1:
+                return super().data_quality_report(request, dataset, interval=interval, required=required)
+            return DatasetQualityReport(
+                dataset.value, request.symbol, interval, required,
+                request.start.isoformat(), request.end.isoformat(),
+                START.isoformat(), END.isoformat(), None, None, 1, None,
+                DataQualityStatus.ERROR, (gap_issue,),
+            )
+
+    store = PartialStore(
+        {(DatasetKind.KLINES, "5m"): DataQualityStatus.MISSING},
+        {(DatasetKind.KLINES, "5m"): DataQualityStatus.OK},
+    )
+    backend = Backend()
+    result = SelectiveRichDataAcquirer(
+        store, backend, RichDataAcquisitionConfig(("taker_flow_context",)),
+    ).acquire(candidate_set(candidate(interval="5m")))
+    assert backend.requests[0].missing_ranges == (
+        MissingCoverageRange(warmup_start, START),)
+    assert result.symbols[0].datasets[0].state is AcquisitionState.ACQUIRED
 
 
 def test_data_hub_missing_is_revalidated_after_successful_daily_fallback():
@@ -253,6 +291,71 @@ def test_real_event_readiness_is_partition_bounded_and_never_calls_full_load(tmp
         ),
     ).acquire(candidate_set(candidate()))
     assert result.symbols[0].datasets[0].state is AcquisitionState.REUSED
+
+
+def _trade_record(raw, name, rows, start=START, end=END, fingerprint=None):
+    path = raw / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "trade_id,price,quantity,quote_quantity,transact_time,is_buyer_maker\n"
+        + "\n".join(rows) + "\n", encoding="utf-8",
+    )
+    return ArchiveRecord(
+        raw, path, MarketKind.FUTURES_UM, DatasetKind.TRADES, "BTCUSDT", None,
+        "monthly", start, end, path.stat().st_size, path.stat().st_mtime_ns,
+        fingerprint or name,
+    )
+
+
+def test_event_quality_slices_monthly_rows_before_validation_and_reuses_cache(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    record = _trade_record(
+        raw, "monthly.csv",
+        ["1,-1,1,-1,1707436800000,false",  # invalid price, outside request
+         "2,100,1,100,1707523200000,false"],
+        start=START.replace(day=9), end=END,
+    )
+    store = MarketDataStore(raw, tmp_path / "cache")
+    monkeypatch.setattr(store.catalog, "records_for", lambda *args, **kwargs: [record])
+    reads = [0]
+    original = store._adapter_for(DatasetKind.TRADES).read
+
+    def counted(item, **kwargs):
+        reads[0] += 1
+        return original(item, **kwargs)
+
+    monkeypatch.setattr(store._adapter_for(DatasetKind.TRADES), "read", counted)
+    request = candidate().strategy_data_request
+    first = store.event_archive_quality_report(request, DatasetKind.TRADES)
+    first_reads = reads[0]
+    second = store.event_archive_quality_report(request, DatasetKind.TRADES)
+    assert first.status is DataQualityStatus.OK
+    assert second.status is DataQualityStatus.OK and second.cache_hit
+    assert reads[0] == first_reads
+
+
+def test_event_quality_detects_conflicting_partition_overlap(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    records = [
+        _trade_record(raw, "monthly.csv", ["1,100,1,100,1707523200000,false"]),
+        _trade_record(raw, "daily.csv", ["1,101,1,101,1707523200000,false"]),
+    ]
+    store = MarketDataStore(raw, tmp_path / "cache")
+    monkeypatch.setattr(store.catalog, "records_for", lambda *args, **kwargs: records)
+    report = store.event_archive_quality_report(
+        candidate().strategy_data_request, DatasetKind.TRADES,
+    )
+    assert report.has_non_missing_errors()
+    assert "CONFLICTING_ARCHIVE_OVERLAP" in {issue.code for issue in report.issues}
+
+    monkeypatch.setattr(store, "refresh_catalog", lambda: 2)
+    result = SelectiveRichDataAcquirer(
+        store, Backend(), RichDataAcquisitionConfig(
+            ("trade_flow_context",),
+            {"trade_flow_context": {"trade_flow_source": "TRADES"}},
+        ),
+    ).acquire(candidate_set(candidate()))
+    assert result.symbols[0].datasets[0].state is AcquisitionState.QUALITY_FAILED
 
 
 def test_complete_feature_config_parameters_are_filtered_to_enabled_features():

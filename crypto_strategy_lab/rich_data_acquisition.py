@@ -145,12 +145,10 @@ def resolve_rich_data_requirements(
                 ))
             elif name == "futures_positioning":
                 specs.append((DatasetKind.FUTURES_METRICS, None, timedelta(days=max(1.0, float(params["oi_zscore_window_days"]))), RequirementRequiredness.REQUIRED_FOR_FEATURE, "open-interest positioning"))
-                if base.strategy_interval != "1h":
-                    specs.append((DatasetKind.KLINES, "1h", timedelta(hours=1), RequirementRequiredness.OPTIONAL_FOR_FEATURE, "one-hour price telemetry"))
+                specs.append((DatasetKind.KLINES, "1h", timedelta(hours=1), RequirementRequiredness.OPTIONAL_FOR_FEATURE, "one-hour price telemetry"))
             elif name == "taker_flow_context":
                 interval = normalize_binance_interval(str(params["taker_flow_interval"]))
-                if interval != base.strategy_interval:
-                    specs.append((DatasetKind.KLINES, interval, timedelta(hours=1), RequirementRequiredness.REQUIRED_FOR_FEATURE, "parameterized taker-flow klines"))
+                specs.append((DatasetKind.KLINES, interval, timedelta(hours=1), RequirementRequiredness.REQUIRED_FOR_FEATURE, "parameterized taker-flow klines"))
             elif name == "trade_flow_context":
                 try:
                     source = DatasetKind[str(params["trade_flow_source"]).upper()]
