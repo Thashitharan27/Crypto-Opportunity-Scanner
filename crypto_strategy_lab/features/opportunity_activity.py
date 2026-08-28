@@ -19,8 +19,8 @@ OPPORTUNITY_ACTIVITY_FEATURE_VERSION = "1"
 class OpportunityActivityFeatureProvider:
     """Compute the four activity measures absent from Strategy Lab's registry.
 
-    The 49-bar warmup comprises 48 quote-volume candles and the prior close
-    needed for 24 log returns.  Missing quote volume stays missing.
+    The 50-candle readiness gate preserves the legacy bot's minimum history.
+    Missing quote volume stays missing.
     """
 
     definition: FeatureDefinition = FeatureDefinition(
@@ -29,7 +29,7 @@ class OpportunityActivityFeatureProvider:
         required_datasets=(DatasetKind.KLINES,),
         parameters={"window": ParameterDefinition(int, 24), "denominator_floor": ParameterDefinition(float, 1e-9)},
         output_columns=("realized_volatility", "recent_range_pct", "range_expansion", "volume_ratio"),
-        warmup_bars=49,
+        warmup_bars=50,
         availability_rule="current_completed_kline_available_at",
     )
 
@@ -67,6 +67,15 @@ class OpportunityActivityFeatureProvider:
         output = pd.DataFrame({"timestamp": pd.to_datetime(frame.period_start, utc=True),
             "available_at": pd.to_datetime(frame.available_at, utc=True), "realized_volatility": rv,
             "recent_range_pct": recent_range, "range_expansion": expansion, "volume_ratio": volume_ratio})
+        minimum_history = 2 * n + 2
+        # Realized volatility/range are mathematically finite sooner, but the
+        # legacy bot did not admit a symbol until its full 50-candle history
+        # gate was met. Mask every activity output to preserve that contract.
+        output.loc[output.index < minimum_history - 1,
+                   ["realized_volatility", "recent_range_pct",
+                    "range_expansion", "volume_ratio"]] = np.nan
         output.attrs.update(feature_name=self.definition.name, feature_version=self.definition.version,
-                            effective_warmup_bars=2*n+1, request_cache_key=request.cache_key())
+                            effective_warmup_bars=minimum_history,
+                            minimum_history_bars=minimum_history,
+                            request_cache_key=request.cache_key())
         return output

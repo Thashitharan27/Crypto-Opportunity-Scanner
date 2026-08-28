@@ -12,6 +12,7 @@ from typing import Mapping, Sequence
 import pandas as pd
 
 from crypto_strategy_lab.data.source_identity import SourceSignature
+from crypto_strategy_lab.data.timing import normalize_binance_interval
 
 
 class ScoreStatus(str, Enum):
@@ -54,6 +55,7 @@ class OpportunityScoringConfig:
     def __post_init__(self):
         if not self.strategy_interval.strip():
             raise ValueError("strategy_interval must not be empty")
+        object.__setattr__(self, "strategy_interval", normalize_binance_interval(self.strategy_interval))
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,7 @@ class OpportunityFeatureSnapshot:
     feature_timestamp: datetime; available_at: datetime; values: Mapping[str, object]
     source_signature: SourceSignature
     feature_versions: Mapping[str, str] = field(default_factory=dict)
+    completed_candle_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +85,65 @@ class OpportunityScoringResult:
     rows: tuple[OpportunityScoreRow, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class OpportunityReportProvenance:
+    """Mandatory Task 4 report provenance (not a Task 7 run manifest)."""
+
+    evaluation_horizon: str
+    strategy_interval: str
+    models: tuple[OpportunityScoringModelDefinition, ...]
+    feature_versions: Mapping[str, str]
+    source_identities: tuple[str, ...]
+
+    def __post_init__(self):
+        horizon = pd.Timedelta(self.evaluation_horizon)
+        if horizon <= pd.Timedelta(0):
+            raise ValueError("evaluation_horizon must be positive")
+        object.__setattr__(self, "evaluation_horizon", str(horizon))
+        object.__setattr__(self, "strategy_interval",
+                           normalize_binance_interval(self.strategy_interval))
+        object.__setattr__(self, "source_identities",
+                           tuple(sorted(set(self.source_identities))))
+
+    def serializable(self) -> dict[str, object]:
+        return {
+            "evaluation_horizon": self.evaluation_horizon,
+            "strategy_interval": self.strategy_interval,
+            "scoring_models": [
+                {
+                    "name": model.name,
+                    "version": model.version,
+                    "ordinal_percentiles": model.ordinal_percentiles,
+                    "supported_intervals": model.supported_intervals,
+                    "components": [asdict(component) for component in model.components],
+                }
+                for model in self.models
+            ],
+            "feature_versions": dict(sorted(self.feature_versions.items())),
+            "source_identities": list(self.source_identities),
+        }
+
+
+def report_provenance(scores: Sequence[OpportunityScoreRow], *, evaluation_horizon: str,
+                      config: OpportunityScoringConfig) -> OpportunityReportProvenance:
+    """Build required provenance from frozen rows and explicit evaluation config."""
+    versions: dict[str, str] = {}
+    sources: set[str] = set()
+    for row in scores:
+        if normalize_binance_interval(row.strategy_interval) != config.strategy_interval:
+            continue
+        sources.add(row.source_identity)
+        for name, version in row.feature_versions.items():
+            existing = versions.get(name)
+            if existing is not None and existing != version:
+                raise ValueError(f"conflicting feature versions for {name}")
+            versions[name] = version
+    return OpportunityReportProvenance(
+        evaluation_horizon, config.strategy_interval, config.models, versions,
+        tuple(sources),
+    )
+
+
 def latest_causal_snapshot(symbol: str, discovery_rank: int, decision_time: datetime, strategy_interval: str,
                            feature_frame: pd.DataFrame, source_signature: SourceSignature,
                            feature_versions: Mapping[str, str] | None = None) -> OpportunityFeatureSnapshot | None:
@@ -96,7 +158,7 @@ def latest_causal_snapshot(symbol: str, discovery_rank: int, decision_time: date
     ignored = {"timestamp", "available_at", "_available", "_timestamp"}
     return OpportunityFeatureSnapshot(symbol, discovery_rank, boundary.to_pydatetime(), strategy_interval,
         row._timestamp.to_pydatetime(), row._available.to_pydatetime(), {k: row[k] for k in eligible.columns if k not in ignored},
-        source_signature, dict(feature_versions or {}))
+        source_signature, dict(feature_versions or {}), len(eligible))
 
 
 def snapshot_from_registry_features(symbol: str, discovery_rank: int, decision_time: datetime,
@@ -112,7 +174,7 @@ def snapshot_from_registry_features(symbol: str, discovery_rank: int, decision_t
     required=("core_directional","policy_market_context","opportunity_activity")
     if any(name not in feature_frames for name in required): return None
     boundary=pd.Timestamp(decision_time); boundary=boundary.tz_localize("UTC") if boundary.tzinfo is None else boundary.tz_convert("UTC")
-    values={}; versions={}; chosen=[]
+    values={}; versions={}; chosen=[]; completed_candle_count=None
     for name in required:
         frame=feature_frames[name]
         eligible=frame[pd.to_datetime(frame.available_at,utc=True)<=boundary].copy()
@@ -121,9 +183,12 @@ def snapshot_from_registry_features(symbol: str, discovery_rank: int, decision_t
         row=eligible.sort_values(["_a","_t"],kind="stable").iloc[-1]; chosen.append(row)
         values.update({column:row[column] for column in frame.columns if column not in {"timestamp","available_at"}})
         versions[name]=str(frame.attrs.get("feature_version","unknown"))
+        if name == "opportunity_activity":
+            completed_candle_count = len(eligible)
     available=max(row._a for row in chosen); timestamp=max(row._t for row in chosen)
     return OpportunityFeatureSnapshot(symbol,discovery_rank,boundary.to_pydatetime(),strategy_interval,
-        timestamp.to_pydatetime(),available.to_pydatetime(),values,source_signature,versions)
+        timestamp.to_pydatetime(),available.to_pydatetime(),values,source_signature,versions,
+        completed_candle_count)
 
 
 def _percentiles(items, ordinal):
@@ -139,7 +204,10 @@ def _percentiles(items, ordinal):
 def score_opportunities(snapshots: Sequence[OpportunityFeatureSnapshot], decision_time: datetime,
                         config: OpportunityScoringConfig = OpportunityScoringConfig()) -> OpportunityScoringResult:
     boundary=pd.Timestamp(decision_time); boundary=boundary.tz_localize("UTC") if boundary.tzinfo is None else boundary.tz_convert("UTC")
-    current=[s for s in snapshots if pd.Timestamp(s.decision_time)==boundary and pd.Timestamp(s.available_at)<=boundary]
+    current=[s for s in snapshots
+             if pd.Timestamp(s.decision_time)==boundary
+             and pd.Timestamp(s.available_at)<=boundary
+             and normalize_binance_interval(s.strategy_interval)==config.strategy_interval]
     current=sorted(current, key=lambda s:(s.discovery_rank,s.symbol))
     output=[]
     for model in config.models:
@@ -148,10 +216,12 @@ def score_opportunities(snapshots: Sequence[OpportunityFeatureSnapshot], decisio
             values=dict(s.values); momentum=values.get("momentum_return_24h")
             values["abs_momentum_24h"] = abs(float(momentum)) if _finite(momentum) else None
             missing=[c.name for c in model.components if not _finite(values.get(c.name))]
-            if s.strategy_interval != config.strategy_interval:
-                missing.insert(0, f"strategy_interval={s.strategy_interval!r} does not match config {config.strategy_interval!r}")
-            elif model.supported_intervals and s.strategy_interval not in model.supported_intervals:
+            normalized_interval = normalize_binance_interval(s.strategy_interval)
+            if model.supported_intervals and normalized_interval not in model.supported_intervals:
                 missing.insert(0, f"model supports only {', '.join(model.supported_intervals)} strategy interval")
+            if ((model.name, model.version) == ("legacy_volatility", "1")
+                    and (s.completed_candle_count or 0) < 50):
+                missing.insert(0, "legacy_volatility_v1 requires 50 completed 1h candles")
             if missing: missing_by_symbol[s.symbol]=missing
             else: valid.append((s,values))
         normalized={s.symbol:{} for s,_ in valid}
@@ -294,17 +364,34 @@ def _aggregate(model,stratum_type,stratum,k,pool,selected,evaluated):
         "unscorable_rate":1-scorable/population if population else 1.0}]
 
 
-def write_opportunity_reports(directory: Path, scores: Sequence[OpportunityScoreRow], comparison: Sequence[Mapping], metadata: Mapping) -> None:
+def write_opportunity_reports(directory: Path, scores: Sequence[OpportunityScoreRow],
+                              comparison: Sequence[Mapping],
+                              provenance: OpportunityReportProvenance) -> None:
     """Write deterministic research artifacts; this is not a run publication system."""
     directory.mkdir(parents=True,exist_ok=True)
     def flat(row):
         d=asdict(row); d["status"]=row.status.value
         for key in ("raw_components","normalized_components","component_weights","feature_versions"): d[key]=json.dumps(d[key],sort_keys=True)
         return d
+    serialized_provenance=provenance.serializable()
     score_rows=[flat(r) for r in sorted(scores,key=lambda r:(r.decision_time,r.model_name,r.model_rank or 10**9,r.symbol))]
+    for row in score_rows:
+        row["evaluation_horizon"] = provenance.evaluation_horizon
+    comparison_rows=[]
+    model_definitions=json.dumps(serialized_provenance["scoring_models"],sort_keys=True)
+    for source in comparison:
+        row=dict(source)
+        row.update(evaluation_horizon=provenance.evaluation_horizon,
+                   strategy_interval=provenance.strategy_interval,
+                   scoring_model_definitions=model_definitions,
+                   feature_versions=json.dumps(serialized_provenance["feature_versions"],sort_keys=True),
+                   source_identities=json.dumps(serialized_provenance["source_identities"],sort_keys=True))
+        comparison_rows.append(row)
     _csv(directory/"opportunity_score_rows.csv",score_rows)
-    _csv(directory/"opportunity_model_comparison.csv",list(comparison))
-    (directory/"opportunity_comparison.json").write_text(json.dumps({"metadata":metadata,"comparison":list(comparison)},sort_keys=True,indent=2,default=str)+"\n")
+    _csv(directory/"opportunity_model_comparison.csv",comparison_rows)
+    (directory/"opportunity_comparison.json").write_text(json.dumps(
+        {"provenance":serialized_provenance,"comparison":list(comparison)},
+        sort_keys=True,indent=2,default=str)+"\n")
 
 
 def _csv(path,rows):

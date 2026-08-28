@@ -14,8 +14,9 @@ Regime is context only and momentum is ranked by absolute magnitude while its
 sign is retained. `OpportunityActivityFeatureProvider` v1 adds only 24-bar
 realized volatility, recent range %, current-range expansion over the older
 preceding 24-bar median (`shift(24).rolling(24)`) using the historical
-`1e-9` floor, and the latest/prior 24-bar **quote-volume** ratio. Its effective
-warmup is 49 bars, and absent quote volume remains missing.
+`1e-9` floor, and the latest/prior 24-bar **quote-volume** ratio. All activity
+outputs are masked until 50 completed candles to preserve the original bot's
+minimum-history gate, and absent quote volume remains missing.
 
 `legacy_volatility_v1` is explicitly limited to 1h strategy candles and weights
 those measures plus reused ATR % by
@@ -27,6 +28,10 @@ ATR %, range, expansion, volume, ADX and DI spread. `momentum_activity_v1` uses
 momentum. Alternatives use average-rank, tie-aware percentiles; final ties use
 score descending, discovery rank ascending, then symbol. Missing inputs make a
 row explicitly `UNSCORABLE`; none are imputed.
+Strategy interval aliases are normalized through the canonical DataRequest
+interval contract. Snapshots outside the configured interval are rejected at
+the universe boundary and therefore cannot leak into either modeled rankings or
+the discovery/no-second-stage controls.
 
 ## Evaluation and reports
 
@@ -42,7 +47,9 @@ all three models, and the untruncated `no_second_stage` control at top 5/10/20,
 with counts, coverage/rejection, means, medians, 1/2 ATR reach rates, discovery
 lift, year strata and regime strata. Deterministic writers emit score CSV,
 comparison CSV and JSON research content while deliberately not implementing a
-Task 7 publication/run manifest.
+Task 7 publication/run manifest. Report provenance is mandatory and includes
+the evaluation horizon, normalized strategy interval, every model version and
+component weight, feature versions, and canonical candle source identities.
 
 Limitations: these fixed baselines are neither fitted nor production-promoted;
 the legacy formulas preserve 1h semantics, structural regime depends on its

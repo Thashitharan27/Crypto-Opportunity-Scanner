@@ -18,7 +18,7 @@ def snap(symbol,rank,offset=0,missing=False):
     values={"realized_volatility":1+offset,"atr":2,"atr_pct":2+offset,"recent_range_pct":3+offset,
         "range_expansion":4+offset,"volume_ratio":None if missing else 5+offset,"adx":6+offset,
         "di_spread":7+offset,"di_spread_1":6+offset,"momentum_return_24h":-(8+offset),"market_regime":"SIDEWAYS"}
-    return OpportunityFeatureSnapshot(symbol,rank,T,"1h",T,T,values,SIG,{"core_directional":"1","policy_market_context":"1","opportunity_activity":"1"})
+    return OpportunityFeatureSnapshot(symbol,rank,T,"1h",T,T,values,SIG,{"core_directional":"1","policy_market_context":"1","opportunity_activity":"1"},50)
 
 def test_exact_legacy_weights_and_ordinal_ties():
     assert [c.weight for c in LEGACY_VOLATILITY_V1.components]==[.30,.25,.20,.10,.15]
@@ -49,6 +49,8 @@ def test_activity_uses_quote_volume_and_future_rows_are_clipped():
     from crypto_strategy_lab.data.query import DataRequest
     req=DataRequest("X",times[0].to_pydatetime(),(times[-1]+pd.Timedelta(hours=1)).to_pydatetime(),"1h")
     features=provider.compute(req,{DatasetKind.KLINES:frame},params)
+    assert features.iloc[48][["realized_volatility","recent_range_pct","range_expansion","volume_ratio"]].isna().all()
+    assert features.iloc[49][["realized_volatility","recent_range_pct","range_expansion","volume_ratio"]].notna().all()
     assert features.iloc[-1].volume_ratio==1
     returns=pd.Series(frame.close).apply(float).pipe(lambda x: np.log(x/x.shift())).iloc[-24:]
     assert features.iloc[-1].realized_volatility==pytest.approx(returns.std(ddof=0)*24**.5)
@@ -83,11 +85,29 @@ def test_forward_outcome_requires_complete_fixed_grid():
 
 def test_non_hourly_legacy_is_explicitly_unscorable_and_config_is_enforced():
     four=snap("A",1)
-    four=OpportunityFeatureSnapshot(four.symbol,four.discovery_rank,four.decision_time,"4h",four.feature_timestamp,four.available_at,four.values,SIG)
+    four=OpportunityFeatureSnapshot(four.symbol,four.discovery_rank,four.decision_time,"4h",four.feature_timestamp,four.available_at,four.values,SIG,completed_candle_count=50)
     legacy=score_opportunities([four],T,OpportunityScoringConfig("4h",(LEGACY_VOLATILITY_V1,))).rows[0]
     assert legacy.status==ScoreStatus.UNSCORABLE and "supports only 1h" in legacy.unscorable_reason
-    mismatch=score_opportunities([four],T,OpportunityScoringConfig("1h",(BALANCED_ACTIVITY_V1,))).rows[0]
-    assert mismatch.status==ScoreStatus.UNSCORABLE and "does not match config" in mismatch.unscorable_reason
+    mismatch=score_opportunities([four],T,OpportunityScoringConfig("1h",(BALANCED_ACTIVITY_V1,)))
+    assert mismatch.rows==()
+
+
+def test_interval_aliases_normalize_and_mismatches_never_reach_controls():
+    alias=snap("A",1)
+    alias=OpportunityFeatureSnapshot(alias.symbol,alias.discovery_rank,alias.decision_time,"60m",alias.feature_timestamp,alias.available_at,alias.values,SIG,completed_candle_count=50)
+    four=snap("B",2)
+    four=OpportunityFeatureSnapshot(four.symbol,four.discovery_rank,four.decision_time,"4h",four.feature_timestamp,four.available_at,four.values,SIG,completed_candle_count=50)
+    rows=score_opportunities([four,alias],T,OpportunityScoringConfig("60m",(BALANCED_ACTIVITY_V1,))).rows
+    assert [row.symbol for row in rows]==["A"]
+    report=build_comparison(rows,{},top_ks=(1,))
+    assert all(row["candidate_count"]==1 for row in report if row["model"] in {"discovery_order","no_second_stage","balanced_activity_v1"})
+
+
+def test_legacy_requires_50_completed_candles():
+    forty_nine=snap("A",1)
+    forty_nine=OpportunityFeatureSnapshot(forty_nine.symbol,forty_nine.discovery_rank,forty_nine.decision_time,"1h",forty_nine.feature_timestamp,forty_nine.available_at,forty_nine.values,SIG,completed_candle_count=49)
+    assert score_opportunities([forty_nine],T,OpportunityScoringConfig(models=(LEGACY_VOLATILITY_V1,))).rows[0].status==ScoreStatus.UNSCORABLE
+    assert score_opportunities([snap("A",1)],T,OpportunityScoringConfig(models=(LEGACY_VOLATILITY_V1,))).rows[0].status==ScoreStatus.SCORABLE
 
 def test_unscorable_preserves_raw_telemetry_and_has_no_trade_contract():
     row=score_opportunities([snap("A",1,missing=True)],T,OpportunityScoringConfig(models=(LEGACY_VOLATILITY_V1,))).rows[0]
@@ -112,7 +132,7 @@ def test_registry_snapshot_reuses_existing_feature_outputs_at_boundary():
 def test_comparison_population_strata_and_missing_lift():
     first=score_opportunities([snap("A",1),snap("B",2,missing=True)],T,OpportunityScoringConfig(models=(LEGACY_VOLATILITY_V1,))).rows
     later_time=datetime(2026,1,3,tzinfo=timezone.utc)
-    later_snap=snap("C",1); later_snap=OpportunityFeatureSnapshot("C",1,later_time,"1h",later_time,later_time,{**later_snap.values,"market_regime":"BULL"},SIG)
+    later_snap=snap("C",1); later_snap=OpportunityFeatureSnapshot("C",1,later_time,"1h",later_time,later_time,{**later_snap.values,"market_regime":"BULL"},SIG,completed_candle_count=50)
     second=score_opportunities([later_snap],later_time,OpportunityScoringConfig(models=(LEGACY_VOLATILITY_V1,))).rows
     outcome=OpportunityOutcome("A",T,100,.2,.1,.05,1.5)
     report=build_comparison(first+second,{("A",T):outcome},top_ks=(1,))
@@ -129,3 +149,20 @@ def test_source_identity_is_canonical_signature():
     assert snap("A",1).source_signature.cache_identity()==snap("B",2).source_signature.cache_identity()
     changed=SourceSignature(DatasetKind.KLINES,"changed",2)
     assert changed.cache_identity()!=SIG.cache_identity()
+
+
+def test_report_requires_and_serializes_research_provenance(tmp_path):
+    config=OpportunityScoringConfig(models=(LEGACY_VOLATILITY_V1,))
+    rows=score_opportunities([snap("A",1)],T,config).rows
+    provenance=report_provenance(rows,evaluation_horizon="24h",config=config)
+    comparison=build_comparison(rows,{},top_ks=(1,))
+    write_opportunity_reports(tmp_path,rows,comparison,provenance)
+    import json
+    payload=json.loads((tmp_path/"opportunity_comparison.json").read_text())
+    assert payload["provenance"]["evaluation_horizon"]=="1 days 00:00:00"
+    assert payload["provenance"]["strategy_interval"]=="1h"
+    assert payload["provenance"]["scoring_models"][0]["components"][0]=={"name":"realized_volatility","weight":.3}
+    assert payload["provenance"]["feature_versions"]["core_directional"]=="1"
+    assert payload["provenance"]["source_identities"]==[SIG.cache_identity()]
+    csv_text=(tmp_path/"opportunity_model_comparison.csv").read_text()
+    assert "evaluation_horizon" in csv_text and "scoring_model_definitions" in csv_text
