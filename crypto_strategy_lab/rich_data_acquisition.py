@@ -58,6 +58,7 @@ class RichDataRequirement:
     feature_names: tuple[str, ...]
     reasons: tuple[str, ...]
     requiredness: RequirementRequiredness
+    feature_requiredness: tuple[tuple[str, RequirementRequiredness], ...]
     data_request: DataRequest
 
 
@@ -117,7 +118,15 @@ def resolve_rich_data_requirements(
 ) -> RichDataAcquisitionPlan:
     """Resolve only explicit features over ``FinalCandidateSet.candidates``."""
     registry = registry or production_feature_registry()
-    resolved = registry.resolve(config.enabled_features, config.feature_parameters)
+    closure = registry.dependency_order(config.enabled_features)
+    supplied = config.feature_parameters or {}
+    unknown_parameters = sorted(set(supplied) - set(registry.names()))
+    if unknown_parameters:
+        raise ValueError(f"Parameters supplied for unknown features: {unknown_parameters}")
+    # FeatureConfig supplies parameters for the complete production registry.
+    # Resolve only the explicitly enabled feature/dependency closure.
+    parameters = {name: supplied[name] for name in closure if name in supplied}
+    resolved = registry.resolve(config.enabled_features, parameters)
     by_name = {item.definition.name: item for item in resolved}
     raw: list[RichDataRequirement] = []
     for candidate in sorted(candidates.candidates, key=lambda c: (c.final_rank, c.symbol)):
@@ -154,11 +163,11 @@ def resolve_rich_data_requirements(
                 specs.extend((kind, None, timedelta(0), RequirementRequiredness.OPTIONAL_FOR_FEATURE, "order-book any-of source") for kind in (DatasetKind.BOOK_TICKER, DatasetKind.BOOK_DEPTH))
             for dataset, interval, warmup, requiredness, reason in specs:
                 request = _request(base, dataset, interval, base.start - warmup, base.end)
-                raw.append(RichDataRequirement(base.symbol, candidate.final_rank, dataset, interval, request.start, request.end, (name,), (reason,), requiredness, request))
+                raw.append(RichDataRequirement(base.symbol, candidate.final_rank, dataset, interval, request.start, request.end, (name,), (reason,), requiredness, ((name, requiredness),), request))
         if config.intrabar_interval and config.intrabar_interval != base.strategy_interval:
             interval = config.intrabar_interval
             request = _request(base, DatasetKind.KLINES, interval, base.start, base.end)
-            raw.append(RichDataRequirement(base.symbol, candidate.final_rank, DatasetKind.KLINES, interval, request.start, request.end, ("intrabar",), ("explicit intrabar execution data",), RequirementRequiredness.OPTIONAL_FOR_FEATURE, request))
+            raw.append(RichDataRequirement(base.symbol, candidate.final_rank, DatasetKind.KLINES, interval, request.start, request.end, ("intrabar",), ("explicit intrabar execution data",), RequirementRequiredness.OPTIONAL_FOR_FEATURE, (("intrabar", RequirementRequiredness.OPTIONAL_FOR_FEATURE),), request))
     merged = _coalesce(raw)
     feature_plans = tuple(FeatureDataRequirementPlan(name, tuple(r for r in merged if name in r.feature_names)) for name in config.enabled_features)
     return RichDataAcquisitionPlan(merged, feature_plans)
@@ -178,7 +187,9 @@ def _coalesce(requirements):
         prior = groups[key]
         start, end = min(prior.start, item.start), max(prior.end, item.end)
         requiredness = RequirementRequiredness.REQUIRED_FOR_FEATURE if RequirementRequiredness.REQUIRED_FOR_FEATURE in {prior.requiredness, item.requiredness} else RequirementRequiredness.OPTIONAL_FOR_FEATURE
-        groups[key] = replace(prior, start=start, end=end, feature_names=tuple(sorted(set(prior.feature_names + item.feature_names))), reasons=tuple(sorted(set(prior.reasons + item.reasons))), requiredness=requiredness, data_request=_request(prior.data_request, prior.dataset, prior.interval, start, end))
+        roles = dict(prior.feature_requiredness)
+        roles.update(dict(item.feature_requiredness))
+        groups[key] = replace(prior, start=start, end=end, feature_names=tuple(sorted(set(prior.feature_names + item.feature_names))), reasons=tuple(sorted(set(prior.reasons + item.reasons))), requiredness=requiredness, feature_requiredness=tuple(sorted(roles.items())), data_request=_request(prior.data_request, prior.dataset, prior.interval, start, end))
     return tuple(sorted(groups.values(), key=lambda r: (r.final_rank, r.dataset.value, r.interval or "", r.start, r.symbol)))
 
 
@@ -195,7 +206,10 @@ class SelectiveRichDataAcquirer:
                 results[_key(req)] = RichDatasetResult(req, AcquisitionState.CANCELLED, detail="not attempted")
                 continue
             try:
-                report = self.store.data_quality_report(req.data_request, req.dataset, interval=req.interval, required=req.requiredness is RequirementRequiredness.REQUIRED_FOR_FEATURE)
+                quality = (self.store.event_archive_quality_report
+                           if req.dataset in {DatasetKind.AGG_TRADES, DatasetKind.TRADES}
+                           else self.store.data_quality_report)
+                report = quality(req.data_request, req.dataset, interval=req.interval, required=req.requiredness is RequirementRequiredness.REQUIRED_FOR_FEATURE)
             except ValueError as exc:
                 results[_key(req)] = RichDatasetResult(req, AcquisitionState.QUALITY_FAILED, detail=f"Data Lake validation failed: {exc}")
                 continue
@@ -231,16 +245,21 @@ class SelectiveRichDataAcquirer:
                     except Exception as exc: outcome = BackendAcquisitionResult(AcquisitionState.DOWNLOAD_FAILED, str(exc))
                     # Work that reached backend completion remains intact. Cancellation
                     # prevents subsequent scheduling; it does not rewrite completed work.
-                    if outcome.state is AcquisitionState.ACQUIRED:
+                    if outcome.state in {AcquisitionState.ACQUIRED, AcquisitionState.MISSING}:
                         results[_key(req)] = self._verify(req, gaps)
                     else:
-                        state = AcquisitionState.CANCELLED if cancelled and cancelled() else outcome.state
-                        results[_key(req)] = RichDatasetResult(req, state, gaps, prior.status, detail=outcome.detail)
+                        results[_key(req)] = RichDatasetResult(req, outcome.state, gaps, prior.status, detail=outcome.detail)
                 schedule()
 
     def _verify(self, req, gaps):
         self.store.refresh_catalog()
-        report = self.store.data_quality_report(req.data_request, req.dataset, interval=req.interval, required=req.requiredness is RequirementRequiredness.REQUIRED_FOR_FEATURE)
+        try:
+            quality = (self.store.event_archive_quality_report
+                       if req.dataset in {DatasetKind.AGG_TRADES, DatasetKind.TRADES}
+                       else self.store.data_quality_report)
+            report = quality(req.data_request, req.dataset, interval=req.interval, required=req.requiredness is RequirementRequiredness.REQUIRED_FOR_FEATURE)
+        except ValueError as exc:
+            return RichDatasetResult(req, AcquisitionState.QUALITY_FAILED, tuple(gaps), detail=f"post-acquisition Data Lake validation failed: {exc}")
         if report.status is DataQualityStatus.OK:
             return self._available(req, report, AcquisitionState.ACQUIRED, gaps)
         state = AcquisitionState.QUALITY_FAILED if report.has_non_missing_errors() else AcquisitionState.MISSING
@@ -264,8 +283,8 @@ class SelectiveRichDataAcquirer:
                     count = sum(available(r) for r in relevant)
                     readiness = FeatureReadiness.READY if count == 2 else FeatureReadiness.DEGRADED if count == 1 else FeatureReadiness.UNAVAILABLE
                 else:
-                    required = tuple(r for r in relevant if r.requirement.requiredness is RequirementRequiredness.REQUIRED_FOR_FEATURE)
-                    optional = tuple(r for r in relevant if r.requirement.requiredness is RequirementRequiredness.OPTIONAL_FOR_FEATURE)
+                    required = tuple(r for r in relevant if dict(r.requirement.feature_requiredness)[feature] is RequirementRequiredness.REQUIRED_FOR_FEATURE)
+                    optional = tuple(r for r in relevant if dict(r.requirement.feature_requiredness)[feature] is RequirementRequiredness.OPTIONAL_FOR_FEATURE)
                     readiness = FeatureReadiness.UNAVAILABLE if any(not available(r) for r in required) else FeatureReadiness.DEGRADED if any(not available(r) for r in optional) else FeatureReadiness.READY
                 features.append(FeatureDataReadiness(feature, readiness, relevant))
             symbols.append(SymbolRichDataResult(candidate.symbol, candidate.final_rank, candidate.strategy_source_identity, datasets, tuple(features)))

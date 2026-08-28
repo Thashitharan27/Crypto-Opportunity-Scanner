@@ -396,6 +396,89 @@ class MarketDataStore:
         )
         return report
 
+    def event_archive_quality_report(
+        self, request, dataset, *, interval=None, required=True
+    ):
+        """Validate large trade archives one partition at a time.
+
+        This is the Task 6 readiness boundary for raw trade events.  It uses the
+        canonical catalog identity and existing adapters/quality contracts, but
+        deliberately never calls ``load_dataset`` for the complete request.
+        """
+        if dataset not in {DatasetKind.AGG_TRADES, DatasetKind.TRADES}:
+            raise ValueError(f"partition-bounded event quality is unsupported for {dataset.value}")
+        if interval is not None:
+            raise ValueError(f"{dataset.value} does not accept an interval")
+
+        from .quality import (
+            DataQualityIssue, DataQualityStatus, DatasetQualityReport,
+            validate_dataset,
+        )
+
+        records = self.catalog.records_for(self.raw_root, request, dataset, None)
+        if not records:
+            return validate_dataset(None, request, dataset, required=required)
+
+        signature = self.canonical_source_identity(request, dataset).cache_identity()
+        issues = []
+        row_count = 0
+        adapter = self._adapter_for(dataset)
+        covered = []
+        for record in records:
+            start = max(request.start, record.period_start or request.start)
+            end = min(request.end, record.period_end or request.end)
+            if start >= end:
+                continue
+            frame = adapter.read(record)
+            partition_request = DataRequest(
+                request.symbol, start, end, request.strategy_interval,
+                datasets=(dataset,), market=request.market, exchange=request.exchange,
+            )
+            partition = validate_dataset(
+                frame, partition_request, dataset, required=required,
+                source_identity=signature,
+                coverage_start=record.period_start,
+                coverage_end=record.period_end,
+            )
+            issues.extend(partition.issues)
+            row_count += partition.row_count
+            covered.append((start, end))
+            del frame
+
+        merged = []
+        for start, end in sorted(covered):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        cursor = request.start
+        gaps = []
+        for start, end in merged:
+            if cursor < start:
+                gaps.append({"start": cursor.isoformat(), "end": start.isoformat(), "end_exclusive": True})
+            cursor = max(cursor, end)
+        if cursor < request.end:
+            gaps.append({"start": cursor.isoformat(), "end": request.end.isoformat(), "end_exclusive": True})
+        if gaps:
+            issues.append(DataQualityIssue(
+                "MISSING_INTERNAL_INTERVAL", DataQualityStatus.ERROR if required else DataQualityStatus.WARN,
+                "Catalog archive coverage does not span the requested event range",
+                count=len(gaps), details={"ranges": gaps},
+            ))
+        # Partition validation can legitimately repeat equivalent issues; stable
+        # serialization and readiness only require their explicit presence.
+        status = (DataQualityStatus.ERROR if any(i.severity is DataQualityStatus.ERROR for i in issues)
+                  else DataQualityStatus.WARN if issues else DataQualityStatus.OK)
+        return DatasetQualityReport(
+            dataset.value, request.symbol, None, required,
+            request.start.isoformat(), request.end.isoformat(),
+            merged[0][0].isoformat() if merged else None,
+            merged[-1][1].isoformat() if merged else None,
+            merged[0][0].isoformat() if merged and not gaps else None,
+            merged[-1][1].isoformat() if merged and not gaps else None,
+            row_count, signature, status, tuple(issues),
+        )
+
     def load_execution_klines(
         self,
         request: DataRequest,

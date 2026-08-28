@@ -40,12 +40,20 @@ event family (aggregate trades by default). Strategy-interval klines are reused
 from Task 5; optional intrabar klines are acquired only when explicitly set.
 
 Requirements with the same symbol, dataset, and interval are coalesced while
-retaining every sorted feature and reason. Acquisition checks quality first,
+retaining every sorted feature, reason, and that feature's own required/optional
+role. Thus one physical source can remain optional for one feature and required
+for another. Acquisition checks quality first,
 downloads only structured missing ranges with bounded outer concurrency and one
 Data Hub worker, then refreshes and revalidates. Structural failure is reported
 as `QUALITY_FAILED` and is never treated as a repair request. Raw event frames
 are not loaded merely to establish readiness; canonical catalog quality and
 `SourceSignature.cache_identity()` remain authoritative.
+
+Both Data Hub `ACQUIRED` and `MISSING` outcomes are revalidated: a missing
+monthly archive can coexist with a successful daily fallback. Raw trade-event
+readiness validates one existing Data Lake partition at a time, so Task 6 never
+concatenates an entire `AGG_TRADES` or `TRADES` request merely to establish
+archive readiness.
 
 Missing rich data never rejects or removes a final candidate. It makes a
 required feature `UNAVAILABLE`, an optional enrichment `DEGRADED`, or—in the

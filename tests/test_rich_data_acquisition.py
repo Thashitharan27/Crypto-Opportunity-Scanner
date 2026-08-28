@@ -11,8 +11,10 @@ from crypto_strategy_lab.data.quality import (
     DataQualityIssue, DataQualityStatus, DatasetQualityReport,
 )
 from crypto_strategy_lab.data.query import DataRequest
-from crypto_strategy_lab.data.schemas import DatasetKind
+from crypto_strategy_lab.data.schemas import ArchiveRecord, DatasetKind, MarketKind
 from crypto_strategy_lab.data.source_identity import SourceSignature
+from crypto_strategy_lab.data.store import MarketDataStore
+from crypto_strategy_lab.data_lake_config import FeatureConfig
 from crypto_strategy_lab.rich_data_acquisition import (
     FeatureReadiness, RequirementRequiredness, RichDataAcquisitionConfig,
     SelectiveRichDataAcquirer, resolve_rich_data_requirements,
@@ -83,6 +85,21 @@ def test_coalescing_preserves_features_and_reasons():
     assert len(klines[0].reasons) == 2
 
 
+def test_coalesced_source_preserves_each_features_requiredness():
+    config = RichDataAcquisitionConfig(
+        ("futures_positioning", "taker_flow_context"),
+        {"taker_flow_context": {"taker_flow_interval": "1h"}},
+    )
+    store = Store({(DatasetKind.FUTURES_METRICS, None): DataQualityStatus.OK})
+    result = SelectiveRichDataAcquirer(
+        store, Backend(AcquisitionState.MISSING), config
+    ).acquire(candidate_set(candidate()))
+    assert {item.feature_name: item.readiness for item in result.symbols[0].features} == {
+        "futures_positioning": FeatureReadiness.DEGRADED,
+        "taker_flow_context": FeatureReadiness.UNAVAILABLE,
+    }
+
+
 def report(req, status, *, corrupt=False):
     issues = ()
     if status is not DataQualityStatus.OK:
@@ -109,6 +126,7 @@ class Store:
     def source_signature(self, request, dataset, *, interval=None):
         self.calls.append((request.symbol, dataset, interval))
         return SourceSignature(dataset, f"{request.symbol}-{dataset.value}", 1)
+    event_archive_quality_report = data_quality_report
 
 
 class Backend:
@@ -133,6 +151,30 @@ def test_reuse_missing_range_post_validation_and_source_identity():
     item = result.symbols[0].datasets[0]
     assert backend.requests[0].missing_ranges[0].start == item.requirement.start
     assert item.state is AcquisitionState.MISSING
+
+
+def test_data_hub_missing_is_revalidated_after_successful_daily_fallback():
+    store = Store({}, {(DatasetKind.FUNDING_RATE, None): DataQualityStatus.OK})
+    result = SelectiveRichDataAcquirer(
+        store, Backend(AcquisitionState.MISSING),
+        RichDataAcquisitionConfig(("funding_context",)),
+    ).acquire(candidate_set(candidate()))
+    item = result.symbols[0].datasets[0]
+    assert item.state is AcquisitionState.ACQUIRED
+    assert item.source_signature is not None
+
+
+def test_post_download_validation_exception_is_isolated_as_quality_failed():
+    class RaisingPostStore(Store):
+        def data_quality_report(self, *args, **kwargs):
+            if self.refreshes > 1:
+                raise ValueError("invalid downloaded archive")
+            return super().data_quality_report(*args, **kwargs)
+    result = SelectiveRichDataAcquirer(
+        RaisingPostStore({}), Backend(),
+        RichDataAcquisitionConfig(("funding_context",)),
+    ).acquire(candidate_set(candidate()))
+    assert result.symbols[0].datasets[0].state is AcquisitionState.QUALITY_FAILED
 
 
 def test_corruption_is_not_downloaded_and_required_candidate_remains():
@@ -173,10 +215,52 @@ def test_data_hub_mapping_is_total_and_exact():
     assert {kind: data_hub_dataset_key(kind) for kind in DatasetKind} == expected
 
 
-def test_event_readiness_never_loads_frames():
+def test_event_readiness_fake_never_loads_frames():
     result, store, _ = acquire(("trade_flow_context",), {(DatasetKind.AGG_TRADES, None): DataQualityStatus.OK})
     assert result.symbols[0].features[0].readiness is FeatureReadiness.READY
     assert not hasattr(store, "load_dataset")
+
+
+def test_real_event_readiness_is_partition_bounded_and_never_calls_full_load(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    path = raw / "trade.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "trade_id,price,quantity,quote_quantity,transact_time,is_buyer_maker\n"
+        "1,100,1,100,1707523200000,false\n",
+        encoding="utf-8",
+    )
+    record = ArchiveRecord(
+        raw, path, MarketKind.FUTURES_UM, DatasetKind.TRADES, "BTCUSDT", None,
+        "daily", START, END, path.stat().st_size, path.stat().st_mtime_ns,
+        "trade-source",
+    )
+    store = MarketDataStore(raw, tmp_path / "cache")
+    store.catalog.sync_root(raw, [record])
+    # Keep the contract test independent of DuckDB's optional timezone module;
+    # the real store, adapter, validator, and source identity remain exercised.
+    monkeypatch.setattr(store.catalog, "records_for", lambda *args, **kwargs: [record])
+    monkeypatch.setattr(store, "refresh_catalog", lambda: 1)
+    monkeypatch.setattr(
+        store, "load_dataset",
+        lambda *args, **kwargs: pytest.fail("full-range load_dataset invoked"),
+    )
+    result = SelectiveRichDataAcquirer(
+        store, Backend(),
+        RichDataAcquisitionConfig(
+            ("trade_flow_context",),
+            {"trade_flow_context": {"trade_flow_source": "TRADES"}},
+        ),
+    ).acquire(candidate_set(candidate()))
+    assert result.symbols[0].datasets[0].state is AcquisitionState.REUSED
+
+
+def test_complete_feature_config_parameters_are_filtered_to_enabled_features():
+    parameters = FeatureConfig().registry_parameters()
+    result = plan(("funding_context",), parameters)
+    assert [item.dataset for item in result.requirements] == [DatasetKind.FUNDING_RATE]
+    with pytest.raises(ValueError, match="unknown features"):
+        plan(("funding_context",), {**parameters, "not_registered": {}})
 
 
 def test_cancellation_marks_unstarted_requirements_explicitly():
@@ -187,3 +271,18 @@ def test_cancellation_marks_unstarted_requirements_explicitly():
     assert result.symbols[0].datasets
     assert {item.state for item in result.symbols[0].datasets} == {AcquisitionState.CANCELLED}
     assert not backend.requests
+
+
+def test_cancellation_does_not_rewrite_completed_backend_failure():
+    cancellation = [False]
+
+    class CompletingBackend(Backend):
+        def acquire_archive(self, request, *, cancelled=None):
+            cancellation[0] = True
+            return BackendAcquisitionResult(AcquisitionState.DOWNLOAD_FAILED)
+
+    result = SelectiveRichDataAcquirer(
+        Store({}), CompletingBackend(),
+        RichDataAcquisitionConfig(("funding_context",)),
+    ).acquire(candidate_set(candidate()), cancelled=lambda: cancellation[0])
+    assert result.symbols[0].datasets[0].state is AcquisitionState.DOWNLOAD_FAILED
