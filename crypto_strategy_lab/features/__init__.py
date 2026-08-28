@@ -40,6 +40,7 @@ from .production_context import (
     ProductionContextFeatureProvider,
 )
 from .registry import FeatureRegistry
+from .opportunity_activity import OpportunityActivityFeatureProvider
 from .state_transition import StateTransitionDailyFeatureProvider
 from .support_resistance import (
     SUPPORT_RESISTANCE_FEATURE_NAME,
@@ -62,6 +63,7 @@ __all__ = [
     "OutputField",
     "ParameterDefinition",
     "FeatureRegistry",
+    "OpportunityActivityFeatureProvider",
     "FeatureFrameCache",
     "CORE_DIRECTIONAL_FEATURE_NAME",
     "CORE_DIRECTIONAL_FEATURE_VERSION",
@@ -109,6 +111,7 @@ def production_feature_registry(*, structural_benchmark=None) -> FeatureRegistry
         MarketContextFeatureProvider(),
         ProductionContextFeatureProvider(),
         PolicyMarketFeatureProvider(structural_benchmark=structural_benchmark),
+        OpportunityActivityFeatureProvider(),
         SupportResistanceFeatureProvider(),
         StateTransitionDailyFeatureProvider(),
         FuturesPositioningFeatureProvider(),
