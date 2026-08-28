@@ -67,9 +67,17 @@ class CandleAcquisitionRequest:
 
 @dataclass(frozen=True, slots=True)
 class BackendAcquisitionResult:
-    succeeded: bool
-    cancelled: bool = False
+    state: AcquisitionState
     detail: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {
+            AcquisitionState.ACQUIRED,
+            AcquisitionState.MISSING,
+            AcquisitionState.DOWNLOAD_FAILED,
+            AcquisitionState.CANCELLED,
+        }:
+            raise ValueError(f"invalid backend acquisition state: {self.state.value}")
 
 
 class CandleAcquisitionBackend(Protocol):
@@ -146,7 +154,7 @@ class BinanceDataHubBackend:
     with ``workers=1`` to prevent multiplicative concurrency.
     """
 
-    def __init__(self, root: Path, *, module: str = "binance_data_hub", project_path: Path | None = None):
+    def __init__(self, root: Path, *, module: str = "binance_data_hub.archive_downloader", project_path: Path | None = None):
         self.root = Path(root)
         self.module = module
         self.project_path = Path(project_path) if project_path else None
@@ -169,7 +177,7 @@ class BinanceDataHubBackend:
         downloader = self._downloader()
         for gap in request.missing_ranges:
             if cancelled and cancelled():
-                return BackendAcquisitionResult(False, True, "cancelled")
+                return BackendAcquisitionResult(AcquisitionState.CANCELLED, "cancelled")
             try:
                 outcome = downloader(
                     [request.data_request.symbol], [DatasetKind.KLINES.value],
@@ -182,20 +190,37 @@ class BinanceDataHubBackend:
                     verify=False, cancelled=cancelled,
                 )
             except Exception as exc:
-                return BackendAcquisitionResult(False, False, str(exc))
+                return BackendAcquisitionResult(AcquisitionState.DOWNLOAD_FAILED, str(exc))
             failed = _outcome_value(outcome, "failed")
             missing = _outcome_value(outcome, "missing")
             was_cancelled = _outcome_value(outcome, "cancelled")
             if was_cancelled:
-                return BackendAcquisitionResult(False, True, "Data Hub cancelled acquisition")
-            if outcome is False or failed or missing:
-                return BackendAcquisitionResult(False, False, "Data Hub reported failure")
-        return BackendAcquisitionResult(True)
+                return BackendAcquisitionResult(
+                    AcquisitionState.CANCELLED, "Data Hub cancelled acquisition"
+                )
+            if failed or outcome is False:
+                return BackendAcquisitionResult(
+                    AcquisitionState.DOWNLOAD_FAILED, "Data Hub reported failed archives"
+                )
+            if missing:
+                return BackendAcquisitionResult(
+                    AcquisitionState.MISSING, "Data Hub reported unpublished/missing archives"
+                )
+        return BackendAcquisitionResult(AcquisitionState.ACQUIRED)
 
 
 def _outcome_value(outcome, name: str):
-    """Read Data Hub's report shape without coupling to its concrete class."""
-    value = outcome.get(name) if isinstance(outcome, Mapping) else getattr(outcome, name, None)
+    """Read Data Hub's nested counts from mapping or equivalent result objects."""
+    counts = (
+        outcome.get("counts")
+        if isinstance(outcome, Mapping)
+        else getattr(outcome, "counts", None)
+    )
+    if counts is not None:
+        value = counts.get(name) if isinstance(counts, Mapping) else getattr(counts, name, None)
+    else:
+        # Retain compatibility with small adapters exposing the counts directly.
+        value = outcome.get(name) if isinstance(outcome, Mapping) else getattr(outcome, name, None)
     return bool(value)
 
 
@@ -218,7 +243,16 @@ class SelectiveCandleAcquirer:
             if cancelled and cancelled():
                 results[ranked.symbol] = self._result(ranked, request, AcquisitionState.CANCELLED, detail="not attempted")
                 continue
-            report = self.store.data_quality_report(request, DatasetKind.KLINES, interval=request.strategy_interval)
+            try:
+                report = self.store.data_quality_report(
+                    request, DatasetKind.KLINES, interval=request.strategy_interval
+                )
+            except ValueError as exc:
+                results[ranked.symbol] = self._result(
+                    ranked, request, AcquisitionState.QUALITY_FAILED,
+                    detail=f"Data Lake validation failed: {exc}",
+                )
+                continue
             if report.status is DataQualityStatus.OK:
                 results[ranked.symbol] = self._verified(ranked, request, report, AcquisitionState.REUSED)
             elif report.has_non_missing_errors():
@@ -259,13 +293,17 @@ class SelectiveCandleAcquirer:
                     try:
                         outcome = future.result()
                     except Exception as exc:
-                        outcome = BackendAcquisitionResult(False, False, str(exc))
-                    if outcome.cancelled or (cancelled and cancelled()):
+                        outcome = BackendAcquisitionResult(
+                            AcquisitionState.DOWNLOAD_FAILED, str(exc)
+                        )
+                    if outcome.state is AcquisitionState.CANCELLED or (cancelled and cancelled()):
                         results[ranked.symbol] = self._result(ranked, request, AcquisitionState.CANCELLED,
                                                                ranges=gaps, quality=prior, detail=outcome.detail)
-                    elif not outcome.succeeded:
-                        results[ranked.symbol] = self._result(ranked, request, AcquisitionState.DOWNLOAD_FAILED,
-                                                               ranges=gaps, quality=prior, detail=outcome.detail)
+                    elif outcome.state is not AcquisitionState.ACQUIRED:
+                        results[ranked.symbol] = self._result(
+                            ranked, request, outcome.state, ranges=gaps,
+                            quality=prior, detail=outcome.detail,
+                        )
                     else:
                         results[ranked.symbol] = self._post_verify(ranked, request, gaps)
                 schedule()
@@ -275,8 +313,15 @@ class SelectiveCandleAcquirer:
 
     def _post_verify(self, ranked, request, gaps):
         self.store.refresh_catalog()
-        report = self.store.data_quality_report(request, DatasetKind.KLINES,
-                                                interval=request.strategy_interval)
+        try:
+            report = self.store.data_quality_report(
+                request, DatasetKind.KLINES, interval=request.strategy_interval
+            )
+        except ValueError as exc:
+            return self._result(
+                ranked, request, AcquisitionState.QUALITY_FAILED, ranges=gaps,
+                detail=f"post-acquisition Data Lake validation failed: {exc}",
+            )
         if report.status is DataQualityStatus.OK:
             return self._verified(ranked, request, report, AcquisitionState.ACQUIRED, gaps)
         state = AcquisitionState.QUALITY_FAILED if report.has_non_missing_errors() else AcquisitionState.MISSING

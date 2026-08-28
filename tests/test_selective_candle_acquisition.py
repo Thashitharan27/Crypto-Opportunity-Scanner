@@ -8,6 +8,7 @@ import threading
 import time
 
 import pandas as pd
+import pytest
 
 from crypto_strategy_lab.data.binance.historical_discovery import (
     DiscoveryDecisionTime, HistoricalDiscoveryConfig, HistoricalDiscoveryResult,
@@ -102,7 +103,7 @@ class FakeBackend:
             self.store.versions[symbol] = self.store.versions.get(symbol, 0) + 1
         with self.lock:
             self.active -= 1
-        return BackendAcquisitionResult(True)
+        return BackendAcquisitionResult(AcquisitionState.ACQUIRED)
 
 
 def acquire(rows, store, backend, *, size=25, workers=4, cancelled=None):
@@ -213,7 +214,7 @@ def test_data_hub_bridge_is_explicitly_configured_and_preserves_half_open_dates(
     outcome = BinanceDataHubBackend(tmp_path, module="configured.hub").acquire(
         CandleAcquisitionRequest(request, (MissingCoverageRange(START, END),))
     )
-    assert outcome.succeeded
+    assert outcome.state is AcquisitionState.ACQUIRED
     args, kwargs = calls[0]
     assert args[:3] == (["BTCUSDT"], ["klines"], ["1h"])
     assert kwargs["start_date"] == START.date()
@@ -230,3 +231,75 @@ def test_unresolved_data_hub_has_clear_configuration_error(monkeypatch, tmp_path
         assert "configure" in str(exc)
     else:
         raise AssertionError("missing Data Hub must not silently fall back")
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ({"downloaded": 1, "skipped": 0, "missing": 0, "failed": 0, "cancelled": 0},
+         AcquisitionState.ACQUIRED),
+        ({"downloaded": 0, "skipped": 1, "missing": 0, "failed": 0, "cancelled": 0},
+         AcquisitionState.ACQUIRED),
+        ({"downloaded": 0, "skipped": 0, "missing": 1, "failed": 0, "cancelled": 0},
+         AcquisitionState.MISSING),
+        ({"downloaded": 0, "skipped": 0, "missing": 0, "failed": 1, "cancelled": 0},
+         AcquisitionState.DOWNLOAD_FAILED),
+        ({"downloaded": 0, "skipped": 0, "missing": 0, "failed": 0, "cancelled": 1},
+         AcquisitionState.CANCELLED),
+    ],
+)
+def test_data_hub_nested_counts_map_to_typed_backend_states(
+    monkeypatch, tmp_path, counts, expected
+):
+    summary = {"planned": 1, "files": [], "counts": counts, "results": []}
+    module = type(
+        "ArchiveDownloader", (),
+        {"download_archive_library": staticmethod(lambda *args, **kwargs: summary)},
+    )
+    monkeypatch.setattr("importlib.import_module", lambda name: module)
+    request = DataRequest("BTCUSDT", START, END, "1h")
+    result = BinanceDataHubBackend(tmp_path).acquire(
+        CandleAcquisitionRequest(request, (MissingCoverageRange(START, END),))
+    )
+    assert result.state is expected
+
+
+def test_default_data_hub_module_matches_real_package_layout(monkeypatch, tmp_path):
+    imported = []
+    module = type("ArchiveDownloader", (), {"download_archive_library": lambda: None})
+
+    def import_module(name):
+        imported.append(name)
+        return module
+
+    monkeypatch.setattr("importlib.import_module", import_module)
+    BinanceDataHubBackend(tmp_path)._downloader()
+    assert imported == ["binance_data_hub.archive_downloader"]
+
+
+def test_initial_validation_error_is_isolated_to_symbol():
+    class ValidationStore(FakeStore):
+        def data_quality_report(self, request, dataset, *, interval):
+            if request.symbol == "S000USDT":
+                raise ValueError("recognized corrupt archive")
+            return super().data_quality_report(request, dataset, interval=interval)
+
+    store = ValidationStore()
+    result = acquire(live_rows(2), store, FakeBackend(store), size=2)
+    assert [item.state for item in result.symbols] == [
+        AcquisitionState.QUALITY_FAILED, AcquisitionState.ACQUIRED
+    ]
+    assert "recognized corrupt archive" in result.symbols[0].detail
+
+
+def test_post_download_validation_error_is_quality_failed():
+    class PostValidationStore(FakeStore):
+        def data_quality_report(self, request, dataset, *, interval):
+            if request.symbol in self.frames:
+                raise ValueError("downloaded archive cannot canonicalize")
+            return super().data_quality_report(request, dataset, interval=interval)
+
+    store = PostValidationStore()
+    item = acquire(live_rows(1), store, FakeBackend(store)).symbols[0]
+    assert item.state is AcquisitionState.QUALITY_FAILED
+    assert "downloaded archive cannot canonicalize" in item.detail

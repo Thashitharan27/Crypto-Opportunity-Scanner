@@ -30,17 +30,20 @@ coverage. Existing corrupt immutable archives therefore produce
 `CandleAcquisitionBackend` is the only acquisition dependency. Tests use an
 in-memory fake. `BinanceDataHubBackend` dynamically imports a configurable
 module and optional project path, then calls its existing
-`download_archive_library`; this repository contains no Binance download or raw
-cache implementation. An unresolved package/function raises a clear backend
+`download_archive_library` from its actual `binance_data_hub.archive_downloader`
+module; this repository contains no Binance download or raw cache implementation.
+An unresolved package/function raises a clear backend
 configuration error. Half-open timestamp gaps are translated to the Data Hub's
-inclusive archive dates. The bridge treats reported missing, failed, or
-cancelled work as unsuccessful rather than trusting a generic return value.
+inclusive archive dates. The bridge reads the downloader's nested `counts`
+summary and preserves missing, failed, and cancelled as distinct typed outcomes.
 
 ## Verification, provenance, and execution policy
 
 Downloader success is provisional. Task 3 refreshes the catalog, reruns the
 same Data Lake validation, loads through `MarketDataStore`, and obtains the
 final `MarketDataStore.source_signature()`. Only then is the state `ACQUIRED`.
+Expected canonicalization/validation `ValueError`s are isolated at each symbol
+boundary and recorded as `QUALITY_FAILED`, both before and after acquisition.
 Results retain rank, interval, research bounds, attempted ranges, row count,
 quality status, and the canonical `SourceSignature` and are always returned in
 shortlist rank order.
