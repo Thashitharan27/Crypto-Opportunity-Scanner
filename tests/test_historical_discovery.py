@@ -38,9 +38,13 @@ class Store:
             DatasetKind.KLINES, self.partitions.get(request.symbol, [f"partition:{request.symbol}"])
         )
 
-    def load_dataset(self, request, dataset, *, interval=None):
+    def load_dataset(self, request, dataset, *, interval=None, available_at_cutoff=None):
         self.calls.append(("load_dataset", request.symbol, dataset, interval))
-        values = list(self.rows.get(request.symbol, []))
+        values = [
+            row for row in self.rows.get(request.symbol, [])
+            if available_at_cutoff is None
+            or pd.Timestamp(row["available_at"]) <= pd.Timestamp(available_at_cutoff)
+        ]
         return pd.DataFrame(values, columns=["symbol", "period_start", "period_end", "available_at",
                                              "open", "high", "low", "close", "quote_volume"])
 
@@ -74,6 +78,14 @@ def test_latest_completed_available_observation_wins():
     values = [candle("AAAUSDT", T - timedelta(days=3), high="999"),
               candle("AAAUSDT", T - timedelta(days=2), high="125")]
     result = discover_historical_universe(Store({"AAAUSDT": values}), ["AAAUSDT"], T)
+    assert result.snapshot.rows[0].period_start == T - timedelta(days=2)
+    assert result.snapshot.rows[0].high == Decimal("125")
+
+
+def test_latest_market_period_wins_over_later_delivery_time():
+    older = candle("AAAUSDT", T - timedelta(days=3), available_at=T, high="999")
+    newer = candle("AAAUSDT", T - timedelta(days=2), available_at=T - timedelta(hours=12), high="125")
+    result = discover_historical_universe(Store({"AAAUSDT": [older, newer]}), ["AAAUSDT"], T)
     assert result.snapshot.rows[0].period_start == T - timedelta(days=2)
     assert result.snapshot.rows[0].high == Decimal("125")
 

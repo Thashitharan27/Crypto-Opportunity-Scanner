@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timezone
 from pathlib import Path
 import json
 
@@ -147,8 +148,24 @@ class MarketDataStore:
         dataset: DatasetKind,
         *,
         interval: str | None = None,
+        available_at_cutoff=None,
     ) -> pd.DataFrame:
-        """Load one canonical dataset for `[request.start, request.end)`."""
+        """Load one canonical dataset for `[request.start, request.end)`.
+
+        When ``available_at_cutoff`` is supplied, unavailable revisions are
+        removed *before* logical-row de-duplication.  This ordering is essential
+        for causal consumers: a later correction for the same logical candle
+        must not hide the version that was observable at the cutoff.  Existing
+        callers retain the prior behavior by leaving the argument unset.
+        """
+
+        if available_at_cutoff is not None:
+            if (
+                getattr(available_at_cutoff, "tzinfo", None) is None
+                or available_at_cutoff.utcoffset() is None
+            ):
+                raise ValueError("available_at_cutoff must be timezone-aware")
+            available_at_cutoff = available_at_cutoff.astimezone(timezone.utc)
 
         records = self.catalog.records_for(self.raw_root, request, dataset, interval)
         if not records:
@@ -168,6 +185,18 @@ class MarketDataStore:
         for column in ("event_time", "period_end", "available_at"):
             if column in frame.columns:
                 frame[column] = pd.to_datetime(frame[column], utc=True)
+        if available_at_cutoff is not None:
+            if "available_at" not in frame.columns:
+                raise ValueError(
+                    f"{dataset.value} has no available_at column for causal loading"
+                )
+            available = frame["available_at"]
+            frame = frame.loc[available.notna() & (available <= available_at_cutoff)].copy()
+            if frame.empty:
+                frame.attrs["canonical_source_identity"] = self.canonical_source_identity(
+                    request, dataset, interval=interval
+                ).cache_identity()
+                return frame.reset_index(drop=True)
         sort_column = "event_time" if "event_time" in frame.columns else "period_start"
 
         if "agg_trade_id" in frame.columns:

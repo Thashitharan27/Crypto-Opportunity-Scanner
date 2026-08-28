@@ -7,6 +7,8 @@ Every selected observation must satisfy both `period_end <= decision_time` and
 `available_at <= decision_time`. Equality is intentional: a candle that becomes
 available exactly at the cutoff can be selected. A later observation cannot be used,
 even when its `period_start` precedes the cutoff.
+The Data Lake applies this cutoff before logical-row de-duplication, so a correction
+published after the decision cannot hide the candle version that was visible then.
 
 ## Completed-day contract
 
@@ -23,6 +25,9 @@ Invalid, non-finite, or nonsensical OHLC/volume values reject the symbol. Missin
 source coverage, missing schema, and absence of a usable completed candle are also
 explicit rejected snapshot states rather than silently ranked symbols. No spread is
 inferred from OHLC.
+The request covers all possible Binance history from the Unix epoch through the
+decision time; there is no hidden freshness window that could discard an older but
+still latest available candle.
 
 Eligible rows use this deterministic completed-day ranking:
 

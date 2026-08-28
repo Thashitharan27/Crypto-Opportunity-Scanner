@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Protocol
 
@@ -36,15 +36,12 @@ class HistoricalDiscoveryConfig:
     """
 
     minimum_quote_volume: Decimal = Decimal("10000000")
-    source_lookback: timedelta = timedelta(days=7)
     listing_age_enforcement: bool = False
 
     def __post_init__(self) -> None:
         minimum = _decimal(self.minimum_quote_volume)
         if minimum is None or minimum < 0:
             raise ValueError("minimum_quote_volume must be finite and non-negative")
-        if self.source_lookback <= timedelta(0):
-            raise ValueError("source_lookback must be positive")
         if self.listing_age_enforcement:
             raise ValueError("historical listing-age metadata is unavailable")
         object.__setattr__(self, "minimum_quote_volume", minimum)
@@ -94,7 +91,10 @@ class HistoricalDiscoveryResult:
 
 
 class HistoricalMarketDataStore(Protocol):
-    def load_dataset(self, request: DataRequest, dataset: DatasetKind, *, interval: str | None = None) -> pd.DataFrame: ...
+    def load_dataset(
+        self, request: DataRequest, dataset: DatasetKind, *,
+        interval: str | None = None, available_at_cutoff: datetime | None = None,
+    ) -> pd.DataFrame: ...
     def source_signature(self, request: DataRequest, dataset: DatasetKind, *, interval: str | None = None) -> SourceSignature: ...
 
 
@@ -137,13 +137,16 @@ def discover_historical_universe(
     rows: list[HistoricalSnapshotRow] = []
     sources: list[HistoricalSource] = []
     for symbol in normalized:
-        request = DataRequest(symbol=symbol, start=decision.value - config.source_lookback,
+        request = DataRequest(symbol=symbol, start=datetime(1970, 1, 1, tzinfo=timezone.utc),
                               end=decision.value, strategy_interval="1d",
                               datasets=(DatasetKind.KLINES,), market=market)
         try:
             signature = store.source_signature(request, DatasetKind.KLINES, interval="1d")
             identity = signature.cache_identity()
-            frame = store.load_dataset(request, DatasetKind.KLINES, interval="1d")
+            frame = store.load_dataset(
+                request, DatasetKind.KLINES, interval="1d",
+                available_at_cutoff=decision.value,
+            )
         except DataNotAvailableError:
             sources.append(HistoricalSource(symbol, request, None))
             rows.append(_missing(symbol, "no_source_coverage"))
@@ -168,8 +171,10 @@ def discover_historical_universe(
         if candidates.empty:
             rows.append(_missing(symbol, "no_completed_candle_available", identity))
             continue
+        # "Latest completed candle" is defined by market period, not by when a
+        # delayed archive/correction happened to become available.
         selected = candidates.sort_values(
-            ["_available_at", "_period_end", "_period_start"], kind="stable"
+            ["_period_end", "_period_start", "_available_at"], kind="stable"
         ).iloc[-1]
         values = {name: _decimal(selected[name]) for name in ("open", "high", "low", "close", "quote_volume")}
         reasons: list[str] = []
