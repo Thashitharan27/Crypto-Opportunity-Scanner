@@ -12,11 +12,13 @@ is authoritative for ATR, ATR %, ADX and absolute DI spread/pressure inputs;
 `PolicyMarketFeatureProvider` supplies signed causal 24-hour momentum and regime.
 Regime is context only and momentum is ranked by absolute magnitude while its
 sign is retained. `OpportunityActivityFeatureProvider` v1 adds only 24-bar
-realized volatility, recent range %, current-range expansion over the preceding
-24-bar median, and the latest/prior 24-bar **quote-volume** ratio. Its effective
+realized volatility, recent range %, current-range expansion over the older
+preceding 24-bar median (`shift(24).rolling(24)`) using the historical
+`1e-9` floor, and the latest/prior 24-bar **quote-volume** ratio. Its effective
 warmup is 49 bars, and absent quote volume remains missing.
 
-`legacy_volatility_v1` weights those measures plus reused ATR % by
+`legacy_volatility_v1` is explicitly limited to 1h strategy candles and weights
+those measures plus reused ATR % by
 30/25/20/10/15 percent. It faithfully assigns ordinal `rank/(N-1)` percentiles,
 including distinct ranks for ties, after discovery-rank/symbol ordering.
 `balanced_activity_v1` uses 20/15/15/10/10/15/15 percent for realized volatility,
@@ -28,7 +30,10 @@ row explicitly `UNSCORABLE`; none are imputed.
 
 ## Evaluation and reports
 
-The default 24-hour evaluator considers candles strictly after the decision. It
+The default 24-hour evaluator uses candle opens in the half-open interval
+`[decision_time, decision_time + 24h)`. It emits no outcome unless every candle
+on the strategy interval's fixed grid is present, so truncated and internally
+gapped windows cannot bias comparisons. It
 reports future high-low range divided by decision close; the larger absolute
 high or low excursion; absolute final-close return; and maximum excursion
 normalized by decision-time ATR. **Future movement is used only to evaluate a

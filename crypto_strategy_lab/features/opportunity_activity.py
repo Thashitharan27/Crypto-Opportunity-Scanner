@@ -27,7 +27,7 @@ class OpportunityActivityFeatureProvider:
         name=OPPORTUNITY_ACTIVITY_FEATURE_NAME,
         version=OPPORTUNITY_ACTIVITY_FEATURE_VERSION,
         required_datasets=(DatasetKind.KLINES,),
-        parameters={"window": ParameterDefinition(int, 24), "denominator_floor": ParameterDefinition(float, 1e-12)},
+        parameters={"window": ParameterDefinition(int, 24), "denominator_floor": ParameterDefinition(float, 1e-9)},
         output_columns=("realized_volatility", "recent_range_pct", "range_expansion", "volume_ratio"),
         warmup_bars=49,
         availability_rule="current_completed_kline_available_at",
@@ -43,7 +43,7 @@ class OpportunityActivityFeatureProvider:
         missing = sorted(required - set(source.columns))
         if missing:
             raise ValueError(f"Canonical kline frame is missing columns: {missing}")
-        n = int(parameters.get("window", 24)); floor = float(parameters.get("denominator_floor", 1e-12))
+        n = int(parameters.get("window", 24)); floor = float(parameters.get("denominator_floor", 1e-9))
         if n <= 0 or floor <= 0:
             raise ValueError("window and denominator_floor must be positive")
         frame = source.sort_values("period_start", kind="stable").drop_duplicates("period_start", keep="last").reset_index(drop=True)
@@ -53,7 +53,9 @@ class OpportunityActivityFeatureProvider:
         rv = returns.rolling(n, min_periods=n).std(ddof=0) * np.sqrt(n)
         recent_range = (high.rolling(n, min_periods=n).max() - low.rolling(n, min_periods=n).min()) / close
         candle_range = (high - low) / close
-        preceding_median = candle_range.shift(1).rolling(n, min_periods=n).median().clip(lower=floor)
+        # Legacy parity: compare the current candle with the *older* preceding
+        # block, not the immediately preceding 24 candles.
+        preceding_median = candle_range.shift(n).rolling(n, min_periods=n).median().clip(lower=floor)
         expansion = candle_range / preceding_median
         if "quote_volume" in frame:
             quote = pd.to_numeric(frame.quote_volume, errors="coerce")
