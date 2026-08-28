@@ -7,6 +7,7 @@ consumer with the same operational contract.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 import json
@@ -24,6 +25,26 @@ from .timing import interval_to_timedelta
 
 VALIDATION_CONTRACT_VERSION = "5"
 QUALITY_CACHE_FORMAT_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class MissingCoverageRange:
+    """A typed, half-open fixed-cadence gap reported by data quality."""
+
+    start: datetime
+    end: datetime
+
+
+_MISSING_COVERAGE_CODES = frozenset(
+    {
+        "DATASET_MISSING",
+        "LEADING_COVERAGE_GAP",
+        "TRAILING_COVERAGE_GAP",
+        "MISSING_INTERNAL_INTERVAL",
+        "LEADING_SOURCE_COVERAGE_GAP",
+        "TRAILING_SOURCE_COVERAGE_GAP",
+    }
+)
 
 
 class DataQualityStatus(str, Enum):
@@ -89,6 +110,64 @@ class DatasetQualityReport:
     def display_key(self) -> str:
         interval = self.interval or "event"
         return f"{self.dataset}:{self.symbol}:{interval}"
+
+    def missing_coverage_ranges(self) -> tuple[MissingCoverageRange, ...]:
+        """Return coalesced ``[start, end)`` gaps using only structured fields.
+
+        This is intentionally part of the quality contract so acquisition and
+        other consumers never infer machine decisions from issue messages.
+        """
+
+        request_start = pd.Timestamp(self.requested_start).to_pydatetime()
+        request_end = pd.Timestamp(self.requested_end).to_pydatetime()
+        if any(issue.code == "DATASET_MISSING" for issue in self.issues):
+            return (MissingCoverageRange(request_start, request_end),)
+
+        delta = interval_to_timedelta(self.interval) if self.interval else None
+        ranges: list[MissingCoverageRange] = []
+        for issue in self.issues:
+            if issue.code not in _MISSING_COVERAGE_CODES:
+                continue
+            for value in issue.details.get("ranges", ()):
+                if delta is None:
+                    continue
+                start = pd.Timestamp(value["start"]).to_pydatetime()
+                # Quality gap ranges store the last missing grid timestamp.
+                end = pd.Timestamp(value["end"]).to_pydatetime() + delta
+                ranges.append(MissingCoverageRange(start, end))
+            if issue.code == "LEADING_SOURCE_COVERAGE_GAP":
+                ranges.append(MissingCoverageRange(
+                    request_start,
+                    pd.Timestamp(issue.details["coverage_start"]).to_pydatetime(),
+                ))
+            elif issue.code == "TRAILING_SOURCE_COVERAGE_GAP":
+                ranges.append(MissingCoverageRange(
+                    pd.Timestamp(issue.details["coverage_end"]).to_pydatetime(),
+                    request_end,
+                ))
+
+        clipped = sorted(
+            MissingCoverageRange(max(item.start, request_start), min(item.end, request_end))
+            for item in ranges
+            if max(item.start, request_start) < min(item.end, request_end)
+        )
+        coalesced: list[MissingCoverageRange] = []
+        for item in clipped:
+            if coalesced and item.start <= coalesced[-1].end:
+                previous = coalesced[-1]
+                coalesced[-1] = MissingCoverageRange(previous.start, max(previous.end, item.end))
+            else:
+                coalesced.append(item)
+        return tuple(coalesced)
+
+    def has_non_missing_errors(self) -> bool:
+        """Whether structural/corruption errors exist beyond coverage gaps."""
+
+        return any(
+            issue.severity is DataQualityStatus.ERROR
+            and issue.code not in _MISSING_COVERAGE_CODES
+            for issue in self.issues
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
