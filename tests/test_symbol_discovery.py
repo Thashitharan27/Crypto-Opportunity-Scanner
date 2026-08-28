@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from crypto_strategy_lab.data.binance.universe import DiscoveryConfig, scan_universe
 
 
@@ -54,6 +56,24 @@ def test_ranking_is_deterministic_and_symbol_breaks_complete_tie():
         ("MIDUSDT", 1), ("AAAUSDT", 2), ("ZZZUSDT", 3)]
 
 
+def test_ranking_prioritizes_daily_impact_before_raw_liquidity():
+    symbols = [market("MOVEUSDT"), market("CHANGEUSDT"), market("LIQUSDT")]
+    tickers = [
+        ticker("MOVEUSDT", volume="20000000", high="130", low="90", change="4"),
+        ticker("CHANGEUSDT", volume="100000000", high="110", low="90", change="12"),
+        ticker("LIQUSDT", volume="900000000", high="110", low="90", change="10"),
+    ]
+    books = [book(x["symbol"]) for x in symbols]
+
+    rows = scan_universe(Client(symbols, tickers, books), config(), now=lambda: NOW)
+
+    assert [(x.symbol, x.preliminary_rank) for x in rows] == [
+        ("MOVEUSDT", 1),
+        ("CHANGEUSDT", 2),
+        ("LIQUSDT", 3),
+    ]
+
+
 def test_all_eligibility_filters_and_reasons_are_auditable_without_klines():
     symbols = [
         market("GOODUSDT"),
@@ -83,14 +103,31 @@ def test_all_eligibility_filters_and_reasons_are_auditable_without_klines():
     assert by_symbol["GOODUSDT"].last_price == Decimal("100")
 
 
-def test_custom_stablecoin_denylist_is_case_insensitive_and_duplicates_fail_closed():
+def test_custom_stablecoin_denylist_is_normalized_and_duplicates_fail_closed():
     client = Client([market("FOOUSDT", base="FOO")], [ticker("FOOUSDT")], [book("FOOUSDT")])
-    custom = DiscoveryConfig(excluded_base_assets=frozenset({"foo"}))
+    custom = DiscoveryConfig(excluded_base_assets=frozenset({" foo "}))
+    assert custom.excluded_base_assets == frozenset({"FOO"})
     assert scan_universe(client, custom, now=lambda: NOW)[0].rejection_reasons == (
         "stablecoin_like_base",)
 
     duplicate = Client([market("BTCUSDT")], [ticker("BTCUSDT"), ticker("BTCUSDT")],
                        [book("BTCUSDT")])
-    import pytest
     with pytest.raises(ValueError, match="duplicate symbol BTCUSDT"):
         scan_universe(duplicate, config(), now=lambda: NOW)
+
+
+def test_non_finite_public_numbers_fail_closed_instead_of_crashing():
+    symbols = [market("NANUSDT"), market("INFUSDT")]
+    tickers = [
+        ticker("NANUSDT", volume="NaN"),
+        ticker("INFUSDT", high="Infinity"),
+    ]
+    books = [book(x["symbol"]) for x in symbols]
+
+    rows = scan_universe(Client(symbols, tickers, books), config(), now=lambda: NOW)
+    by_symbol = {x.symbol: x for x in rows}
+
+    assert "missing_quote_volume" in by_symbol["NANUSDT"].rejection_reasons
+    assert "invalid_or_missing_24h_prices" in by_symbol["INFUSDT"].rejection_reasons
+    assert by_symbol["NANUSDT"].preliminary_rank is None
+    assert by_symbol["INFUSDT"].preliminary_rank is None
