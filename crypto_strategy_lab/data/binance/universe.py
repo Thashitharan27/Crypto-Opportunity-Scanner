@@ -8,7 +8,7 @@ preliminary order is lexicographic: quote volume (descending), 24h range percent
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -17,7 +17,8 @@ from urllib.request import urlopen
 
 
 DEFAULT_STABLECOIN_BASES = frozenset({
-    "BUSD", "DAI", "FDUSD", "PAX", "TUSD", "USDC", "USDP", "USDS", "USDT",
+    "BUSD", "DAI", "FDUSD", "PAX", "PYUSD", "TUSD", "USD1", "USDC", "USDD",
+    "USDP", "USDS", "USDT", "UST", "USTC",
 })
 
 
@@ -78,6 +79,9 @@ class DiscoveryRow:
     price_change_24h_percent: Decimal | None
     preliminary_rank: int | None
     discovery_timestamp: datetime
+    high_24h: Decimal | None = None
+    low_24h: Decimal | None = None
+    last_price: Decimal | None = None
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -85,6 +89,20 @@ def _decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+def _by_symbol(items: Sequence[Mapping[str, Any]], resource: str) -> dict[str, Mapping[str, Any]]:
+    """Index an exchange-wide response without silently accepting ambiguous rows."""
+
+    result: dict[str, Mapping[str, Any]] = {}
+    for item in items:
+        symbol = item.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            raise ValueError(f"{resource} contains a row without a symbol")
+        if symbol in result:
+            raise ValueError(f"{resource} contains duplicate symbol {symbol}")
+        result[symbol] = item
+    return result
 
 
 def scan_universe(
@@ -99,19 +117,30 @@ def scan_universe(
     if timestamp.tzinfo is None:
         raise ValueError("discovery timestamp must be timezone-aware")
     timestamp = timestamp.astimezone(timezone.utc)
-    ticker_by_symbol = {str(x.get("symbol")): x for x in client.tickers_24h()}
-    book_by_symbol = {str(x.get("symbol")): x for x in client.book_tickers()}
+    exchange_info = client.exchange_info()
+    ticker_by_symbol = _by_symbol(client.tickers_24h(), "24h ticker")
+    book_by_symbol = _by_symbol(client.book_tickers(), "book ticker")
     rows: list[DiscoveryRow] = []
 
-    for market in client.exchange_info().get("symbols", []):
+    markets = exchange_info.get("symbols")
+    if not isinstance(markets, list):
+        raise ValueError("exchangeInfo symbols must be a list")
+    seen_markets: set[str] = set()
+    for market in markets:
         symbol = str(market.get("symbol", ""))
+        if not symbol:
+            raise ValueError("exchangeInfo contains a row without a symbol")
+        if symbol in seen_markets:
+            raise ValueError(f"exchangeInfo contains duplicate symbol {symbol}")
+        seen_markets.add(symbol)
         ticker = ticker_by_symbol.get(symbol, {})
         book = book_by_symbol.get(symbol, {})
         reasons: list[str] = []
         if market.get("contractType") != "PERPETUAL": reasons.append("not_perpetual")
         if market.get("status") != "TRADING": reasons.append("not_trading")
         if market.get("quoteAsset") != "USDT": reasons.append("not_usdt_quote")
-        if str(market.get("baseAsset", "")).upper() in config.excluded_base_assets:
+        excluded_bases = {asset.upper() for asset in config.excluded_base_assets}
+        if str(market.get("baseAsset", "")).upper() in excluded_bases:
             reasons.append("stablecoin_like_base")
 
         onboard_ms = _decimal(market.get("onboardDate"))
@@ -144,7 +173,7 @@ def scan_universe(
         change = _decimal(ticker.get("priceChangePercent"))
         if change is None: reasons.append("missing_price_change_percent")
         rows.append(DiscoveryRow(symbol, not reasons, tuple(reasons), listing_age, volume, bid, ask,
-                                 spread, range_percent, change, None, timestamp))
+                                 spread, range_percent, change, None, timestamp, high, low, last))
 
     eligible = sorted((r for r in rows if r.eligible), key=lambda r: (
         -r.quote_volume, -r.range_24h_percent, -abs(r.price_change_24h_percent),
@@ -152,5 +181,4 @@ def scan_universe(
     ))
     ranks = {row.symbol: rank for rank, row in enumerate(eligible, 1)}
     ordered = sorted(rows, key=lambda r: (r.symbol not in ranks, ranks.get(r.symbol, 0), r.symbol))
-    return [DiscoveryRow(**{**row.__dict__, "preliminary_rank": ranks.get(row.symbol)})
-            for row in ordered]
+    return [replace(row, preliminary_rank=ranks.get(row.symbol)) for row in ordered]

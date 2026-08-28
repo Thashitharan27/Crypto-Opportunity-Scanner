@@ -4,12 +4,14 @@ The universe scanner uses only Binance USD-M Futures `exchangeInfo`, exchange-wi
 24-hour ticker, and exchange-wide book-ticker responses. It does not request or
 cache candles. Every `exchangeInfo` symbol produces an immutable, timestamped row,
 including its eligibility, all rejection reasons, listing age, quote volume, bid,
-ask, midpoint spread percentage, 24-hour range percentage, price-change percentage,
+ask, 24-hour high/low/last prices, midpoint spread percentage, 24-hour range percentage, price-change percentage,
 and (for eligible rows) preliminary rank.
 
 Configuration explicitly controls minimum listing age, minimum 24-hour quote
 volume, maximum spread percentage, and the stablecoin-like base-asset denylist.
 Missing or invalid required public fields reject rather than silently admit a symbol.
+Malformed or duplicate exchange-wide rows raise an error instead of being silently
+overwritten, and denylist matching is case-insensitive.
 
 ## Preliminary ranking
 

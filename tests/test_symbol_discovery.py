@@ -79,4 +79,18 @@ def test_all_eligibility_filters_and_reasons_are_auditable_without_klines():
     assert by_symbol["OLDUSDT"].rejection_reasons[:3] == (
         "not_perpetual", "not_trading", "not_usdt_quote")
     assert all(row.preliminary_rank is None for row in rows if not row.eligible)
-    assert client.calls == ["24hr", "bookTicker", "exchangeInfo"]
+    assert client.calls == ["exchangeInfo", "24hr", "bookTicker"]
+    assert by_symbol["GOODUSDT"].last_price == Decimal("100")
+
+
+def test_custom_stablecoin_denylist_is_case_insensitive_and_duplicates_fail_closed():
+    client = Client([market("FOOUSDT", base="FOO")], [ticker("FOOUSDT")], [book("FOOUSDT")])
+    custom = DiscoveryConfig(excluded_base_assets=frozenset({"foo"}))
+    assert scan_universe(client, custom, now=lambda: NOW)[0].rejection_reasons == (
+        "stablecoin_like_base",)
+
+    duplicate = Client([market("BTCUSDT")], [ticker("BTCUSDT"), ticker("BTCUSDT")],
+                       [book("BTCUSDT")])
+    import pytest
+    with pytest.raises(ValueError, match="duplicate symbol BTCUSDT"):
+        scan_universe(duplicate, config(), now=lambda: NOW)
