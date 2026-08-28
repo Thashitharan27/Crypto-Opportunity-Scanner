@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Protocol
 
@@ -29,19 +29,22 @@ class DiscoveryDecisionTime:
 
 @dataclass(frozen=True, slots=True)
 class HistoricalDiscoveryConfig:
-    """Task-2 completed-day eligibility and query-window configuration.
+    """Task-2 completed-day eligibility and bounded query-window configuration.
 
     Listing age is deliberately not enforced: the Data Lake currently has no
     immutable official listing-date dataset. First-candle time is not a proxy.
     """
 
     minimum_quote_volume: Decimal = Decimal("10000000")
+    source_lookback: timedelta = timedelta(days=7)
     listing_age_enforcement: bool = False
 
     def __post_init__(self) -> None:
         minimum = _decimal(self.minimum_quote_volume)
         if minimum is None or minimum < 0:
             raise ValueError("minimum_quote_volume must be finite and non-negative")
+        if self.source_lookback <= timedelta(0):
+            raise ValueError("source_lookback must be positive")
         if self.listing_age_enforcement:
             raise ValueError("historical listing-age metadata is unavailable")
         object.__setattr__(self, "minimum_quote_volume", minimum)
@@ -175,7 +178,7 @@ def discover_historical_universe(
     for symbol in normalized:
         request = DataRequest(
             symbol=symbol,
-            start=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            start=decision.value - config.source_lookback,
             end=decision.value,
             strategy_interval="1d",
             datasets=(DatasetKind.KLINES,),
