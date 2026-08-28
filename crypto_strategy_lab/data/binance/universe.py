@@ -1,9 +1,9 @@
 """Cheap, exchange-wide Binance USD-M futures universe discovery.
 
-This module deliberately has no dependency on strategy or candle-data code.  The
-preliminary order is lexicographic: quote volume (descending), 24h range percent
-(descending), absolute 24h change percent (descending), spread percent
-(ascending), and symbol (ascending).  The symbol key makes all ties stable.
+This module deliberately has no dependency on strategy or candle-data code. The
+preliminary order is lexicographic: 24h range percent (descending), absolute 24h
+change percent (descending), quote volume (descending), spread percent
+(ascending), and symbol (ascending). The symbol key makes all ties stable.
 """
 
 from __future__ import annotations
@@ -63,6 +63,12 @@ class DiscoveryConfig:
             raise ValueError("minimum_listing_age cannot be negative")
         if self.minimum_quote_volume < 0 or self.maximum_spread_percent < 0:
             raise ValueError("volume and spread thresholds cannot be negative")
+        normalized = frozenset(
+            value
+            for asset in self.excluded_base_assets
+            if (value := str(asset).strip().upper())
+        )
+        object.__setattr__(self, "excluded_base_assets", normalized)
 
 
 @dataclass(frozen=True)
@@ -86,9 +92,10 @@ class DiscoveryRow:
 
 def _decimal(value: Any) -> Decimal | None:
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _by_symbol(items: Sequence[Mapping[str, Any]], resource: str) -> dict[str, Mapping[str, Any]]:
@@ -139,8 +146,7 @@ def scan_universe(
         if market.get("contractType") != "PERPETUAL": reasons.append("not_perpetual")
         if market.get("status") != "TRADING": reasons.append("not_trading")
         if market.get("quoteAsset") != "USDT": reasons.append("not_usdt_quote")
-        excluded_bases = {asset.upper() for asset in config.excluded_base_assets}
-        if str(market.get("baseAsset", "")).upper() in excluded_bases:
+        if str(market.get("baseAsset", "")).upper() in config.excluded_base_assets:
             reasons.append("stablecoin_like_base")
 
         onboard_ms = _decimal(market.get("onboardDate"))
@@ -176,7 +182,7 @@ def scan_universe(
                                  spread, range_percent, change, None, timestamp, high, low, last))
 
     eligible = sorted((r for r in rows if r.eligible), key=lambda r: (
-        -r.quote_volume, -r.range_24h_percent, -abs(r.price_change_24h_percent),
+        -r.range_24h_percent, -abs(r.price_change_24h_percent), -r.quote_volume,
         r.spread_percent, r.symbol,
     ))
     ranks = {row.symbol: rank for rank, row in enumerate(eligible, 1)}
