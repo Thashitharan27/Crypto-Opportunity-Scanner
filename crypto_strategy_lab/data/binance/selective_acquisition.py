@@ -93,6 +93,33 @@ class AcquisitionBackendConfigurationError(RuntimeError):
     pass
 
 
+DATA_HUB_DATASET_KEYS = {
+    DatasetKind.KLINES: "klines",
+    DatasetKind.FUTURES_METRICS: "metrics",
+    DatasetKind.FUNDING_RATE: "fundingRate",
+    DatasetKind.MARK_PRICE_KLINES: "markPriceKlines",
+    DatasetKind.INDEX_PRICE_KLINES: "indexPriceKlines",
+    DatasetKind.PREMIUM_INDEX_KLINES: "premiumIndexKlines",
+    DatasetKind.AGG_TRADES: "aggTrades",
+    DatasetKind.TRADES: "trades",
+    DatasetKind.BOOK_DEPTH: "bookDepth",
+    DatasetKind.BOOK_TICKER: "bookTicker",
+}
+
+
+def data_hub_dataset_key(dataset: DatasetKind) -> str:
+    """Translate the canonical Data Lake family at the Data Hub boundary."""
+    return DATA_HUB_DATASET_KEYS[dataset]
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveAcquisitionRequest:
+    data_request: DataRequest
+    dataset: DatasetKind
+    interval: str | None
+    missing_ranges: tuple[MissingCoverageRange, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class SymbolAcquisitionResult:
     symbol: str
@@ -174,14 +201,24 @@ class BinanceDataHubBackend:
             ) from exc
 
     def acquire(self, request: CandleAcquisitionRequest, *, cancelled=None) -> BackendAcquisitionResult:
+        return self.acquire_archive(
+            ArchiveAcquisitionRequest(
+                request.data_request, DatasetKind.KLINES,
+                request.data_request.strategy_interval, request.missing_ranges,
+            ),
+            cancelled=cancelled,
+        )
+
+    def acquire_archive(self, request: ArchiveAcquisitionRequest, *, cancelled=None) -> BackendAcquisitionResult:
+        """Acquire canonical archive gaps without interpreting their contents."""
         downloader = self._downloader()
         for gap in request.missing_ranges:
             if cancelled and cancelled():
                 return BackendAcquisitionResult(AcquisitionState.CANCELLED, "cancelled")
             try:
                 outcome = downloader(
-                    [request.data_request.symbol], [DatasetKind.KLINES.value],
-                    [request.data_request.strategy_interval], self.root,
+                    [request.data_request.symbol], [data_hub_dataset_key(request.dataset)],
+                    [request.interval] if request.interval else [], self.root,
                     start_date=gap.start.date(),
                     # Data Hub's archive-date API is inclusive, whereas the
                     # DataRequest/quality boundary is half open.
