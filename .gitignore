@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local market data and generated reports are large/reproducible.
+data/
+cache/
+output/
+outputs/
+
+# Local Data Lake research configs are user/run-specific and can be created freely.
+# Keep the canonical repository smoke fixture tracked.
+config/data_lake/*.json
+!config/data_lake/BTCUSDT_4H_SMOKE.json
+
+# Atomic Binance downloads can leave a temporary file if the desktop process is terminated.
+data/.*.tmp
