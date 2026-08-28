@@ -1,0 +1,19 @@
+{
+  "config_version": 3,
+  "data": {
+    "strategy_timeframe_minutes": 240,
+    "intrabar_timeframe_minutes": 1,
+    "use_intrabar_data": true
+  },
+  "features": {
+    "market_regime_method": "BTC_STRUCTURAL",
+    "structural_regime_sma_days": 200,
+    "structural_regime_slope_lookback_days": 30
+  },
+  "strategy": {},
+  "execution": {},
+  "reporting": {
+    "run_name": "BTCUSDT_4H_DATA_LAKE_SMOKE",
+    "telemetry_interval_minutes": 240
+  }
+}

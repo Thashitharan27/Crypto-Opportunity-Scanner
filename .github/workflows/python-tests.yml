@@ -1,0 +1,239 @@
+name: Python tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: python-tests-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  gui-ux-phase1-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install Qt runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-qt
+      - name: Run blocking GUI UX Phase 1 and Task-18 acceptance
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: ${{ github.workspace }}
+        run: >-
+          python -m pytest -q
+          tests/test_gui_ux_phase1.py
+          tests/test_strategy_builder_profile_ownership.py
+          tests/test_task18_gui_architecture.py
+          tests/test_stage10_stage1_gui_shim_removed.py
+
+  strategy-profile-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install Qt runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Compile source
+        run: python -m compileall -q crypto_strategy_lab mcp_server tools app.py
+      - name: Run strategy-profile safety tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: ${{ github.workspace }}
+        run: >-
+          python -m pytest -q
+          tests/test_di_direction_pressure_tab.py
+          tests/test_stage2_regime_permissions_removed.py
+          tests/test_di_pressure.py
+          tests/test_strategy_profiles.py
+          tests/test_worker_profile_modes.py
+          tests/test_gui_config_logic.py
+          tests/test_data_lake_gui.py
+          tests/test_single_trade_telemetry.py
+
+  data-lake-v2-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas duckdb openpyxl 'mcp>=2.0,<3' pytest
+      - name: Compile Data Lake path and composition tools
+        run: >-
+          python -m compileall -q
+          crypto_strategy_lab/data
+          crypto_strategy_lab/features
+          crypto_strategy_lab/prepared_backtest.py
+          crypto_strategy_lab/prepared_cache.py
+          crypto_strategy_lab/data_lake_config.py
+          crypto_strategy_lab/data_lake_engine.py
+          crypto_strategy_lab/data_lake_production_engine.py
+          crypto_strategy_lab/research_runner.py
+          crypto_strategy_lab/research_adapters.py
+          crypto_strategy_lab/research_reporting.py
+          crypto_strategy_lab/research_sampling.py
+          crypto_strategy_lab/research_sampling_reporting.py
+          crypto_strategy_lab/run_manifest.py
+          crypto_strategy_lab/feature_research.py
+          crypto_strategy_lab/bayesian_research.py
+          crypto_strategy_lab/bayesian_sampling.py
+          crypto_strategy_lab/bayesian_sampling_reporting.py
+          mcp_server/server.py
+          tools/data_lake_validate.py
+          tools/data_lake_run.py
+          tools/data_lake_benchmark.py
+          tools/data_lake_profile.py
+          tools/data_lake_preparation_profile.py
+          tools/rewrite_config_current.py
+          tools/research_query.py
+      - name: Smoke direct Data Lake tools
+        run: |
+          python tools/data_lake_validate.py --help
+          python tools/data_lake_run.py --help
+          python tools/data_lake_benchmark.py --help
+          python tools/data_lake_profile.py --help
+          python tools/data_lake_preparation_profile.py --help
+          python tools/rewrite_config_current.py --help
+          python tools/research_query.py --help
+      - name: Run Data Lake v2 safety tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: >-
+          python -m pytest -q
+          tests/test_data_lake_v2.py
+          tests/test_execution_kline_projection.py
+          tests/test_causal_data_layer.py
+          tests/test_feature_registry.py
+          tests/test_feature_registry_authority.py
+          tests/test_cache_hierarchy.py
+          tests/test_core_directional_features.py
+          tests/test_market_context_features.py
+          tests/test_production_context_features.py
+          tests/test_support_resistance_features.py
+          tests/test_futures_positioning_features.py
+          tests/test_funding_context_features.py
+          tests/test_taker_flow_context_features.py
+          tests/test_basis_context_features.py
+          tests/test_trade_flow_aggregates.py
+          tests/test_trade_flow_causality.py
+          tests/test_order_book_research.py
+          tests/test_order_book_causality.py
+          tests/test_research_feature_trade_rows.py
+          tests/test_feature_cache.py
+          tests/test_binance_compact_adapters.py
+          tests/test_binance_trade_adapters.py
+          tests/test_saved_run_config_snapshot.py
+          tests/test_data_lake_execution_path.py
+          tests/test_data_lake_native_architecture.py
+          tests/test_data_lake_validate.py
+          tests/test_data_quality.py
+          tests/test_data_quality_integration.py
+          tests/test_feature_causality.py
+          tests/test_data_lake_intrabar_window.py
+          tests/test_intrabar_searchsorted.py
+          tests/test_single_position_data_lake_exits.py
+          tests/test_data_lake_benchmark.py
+          tests/test_data_lake_profile.py
+          tests/test_data_lake_preparation_profile.py
+          tests/test_data_lake_config.py
+          tests/test_task11_research_config.py
+          tests/test_research_runner.py
+          tests/test_feature_research.py
+          tests/test_bayesian_research.py
+          tests/test_bayesian_sampling.py
+          tests/test_research_sampling.py
+          tests/test_task17_reporting.py
+          tests/test_mcp_server.py
+          tests/test_rewrite_config_current.py
+
+  full-suite-observation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install Qt runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-qt
+      - name: Run full suite for visibility
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -q
+
+  windows-smoke-safety:
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-qt
+      - name: Compile source
+        run: python -m compileall -q crypto_strategy_lab mcp_server tools app.py
+      - name: Run Windows smoke tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: ${{ github.workspace }}
+        run: >-
+          python -m pytest -q
+          tests/test_chatgpt_connection.py
+          tests/test_stage16_hidden_pair_management_gui_removed.py
