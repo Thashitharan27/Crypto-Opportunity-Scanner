@@ -21,13 +21,16 @@ fully completed, causally available candle and computes:
 * absolute price-change percent; and
 * quote volume.
 
-Invalid, non-finite, or nonsensical OHLC/volume values reject the symbol. Missing
-source coverage, missing schema, and absence of a usable completed candle are also
-explicit rejected snapshot states rather than silently ranked symbols. No spread is
-inferred from OHLC.
-The request covers all possible Binance history from the Unix epoch through the
-decision time; there is no hidden freshness window that could discard an older but
-still latest available candle.
+Invalid, non-finite, nonsensical, or source-validation-failing OHLC/volume data reject
+only the affected symbol. Missing source coverage, missing schema, and absence of a
+usable completed candle are also explicit rejected snapshot states rather than
+silently ranked symbols. No spread is inferred from OHLC.
+
+Historical discovery uses a bounded configurable source window. The default
+`source_lookback` is seven days, which is intentionally much wider than the single
+completed daily candle normally needed while avoiding an ever-growing full-history
+read on every replay decision. If no usable completed 1D candle exists inside that
+window, the symbol fails closed instead of being ranked from stale history.
 
 Eligible rows use this deterministic completed-day ranking:
 
