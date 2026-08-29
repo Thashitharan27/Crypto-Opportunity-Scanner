@@ -6,10 +6,10 @@ the natural ``(decision_timestamp, symbol)`` key and only aggregates them.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import pandas as pd
 
@@ -47,6 +47,34 @@ class OpportunityValidationResult:
     associations: pd.DataFrame
 
 
+@dataclass(frozen=True, slots=True)
+class StrategyResearchSource:
+    """Existing Strategy Lab facts and their immutable run provenance.
+
+    ``trades`` is the native research/backtest trade frame (``entry_time`` and
+    ``pair_net_r``/``pair_net_pnl``). ``outcomes`` contains Task 4
+    ``OpportunityOutcome`` rows and defines which scan keys were evaluated.
+    """
+
+    run_id: str
+    evaluation_horizon: str
+    trades: pd.DataFrame = field(repr=False, compare=False)
+    outcomes: pd.DataFrame | Sequence[object] = field(repr=False, compare=False)
+    source_identities: tuple[str, ...] = ()
+    symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.run_id.strip():
+            raise ValueError("research run_id must not be empty")
+        horizon = pd.Timedelta(self.evaluation_horizon)
+        if horizon <= pd.Timedelta(0):
+            raise ValueError("research evaluation_horizon must be positive")
+        object.__setattr__(self, "evaluation_horizon", str(horizon))
+        object.__setattr__(self, "source_identities", tuple(sorted(set(self.source_identities))))
+        if self.symbol is not None:
+            object.__setattr__(self, "symbol", self.symbol.strip().upper())
+
+
 def load_scanner_observations(run_directories: Iterable[Path]) -> pd.DataFrame:
     """Load only catalog-verified Task 7 OPPORTUNITY_SCAN artifacts.
 
@@ -66,7 +94,18 @@ def load_scanner_observations(run_directories: Iterable[Path]) -> pd.DataFrame:
         preliminary = pd.read_csv(artifact_path(directory, manifest, "preliminary_candidates"))
         final = pd.read_csv(artifact_path(directory, manifest, "final_candidates"))
         universe["symbol"] = universe["symbol"].astype(str).str.upper()
-        frame = universe[["symbol", "eligible", "discovery_rank", "reference_available_at", "discovery_source_identity"]].copy()
+        base_columns = ["symbol", "eligible", "discovery_rank", "reference_available_at", "discovery_source_identity"]
+        frame = universe[base_columns].copy()
+        discovery_metrics = {
+            "range_percent": "discovery__range_percent",
+            "absolute_price_change_percent": "discovery__absolute_price_change_percent",
+            "quote_volume": "discovery__quote_volume",
+            "spread_percent": "discovery__spread_percent",
+            "listing_age_seconds": "discovery__listing_age_seconds",
+        }
+        for source_name, output_name in discovery_metrics.items():
+            if source_name in universe:
+                frame[output_name] = pd.to_numeric(universe[source_name], errors="coerce")
         if frame.eligible.dtype == object:
             normalized = frame.eligible.astype(str).str.lower().map({"true": True, "false": False})
             if normalized.isna().any():
@@ -95,6 +134,9 @@ def load_scanner_observations(run_directories: Iterable[Path]) -> pd.DataFrame:
                     prefix = f"score__{row.model_name}_v{row.model_version}"
                     frame.loc[mask, prefix] = row.score
                     frame.loc[mask, f"rank__{row.model_name}_v{row.model_version}"] = row.model_rank
+                    if "market_regime" not in frame:
+                        frame["market_regime"] = pd.NA
+                    frame.loc[mask, "market_regime"] = row.market_regime
                     raw = json.loads(row.raw_components) if isinstance(row.raw_components, str) else {}
                     for name, value in raw.items():
                         frame.loc[mask, f"component__{name}"] = value
@@ -110,41 +152,78 @@ def load_scanner_observations(run_directories: Iterable[Path]) -> pd.DataFrame:
     return combined.sort_values(["decision_timestamp", "symbol"], kind="stable").reset_index(drop=True)
 
 
-def join_research_results(scanner: pd.DataFrame, research: pd.DataFrame) -> pd.DataFrame:
-    """Attach authoritative research outcomes without recomputing strategy logic.
+def join_research_results(scanner: pd.DataFrame, source: StrategyResearchSource) -> pd.DataFrame:
+    """Normalize native Task 4 and Strategy Lab outputs onto scanner keys.
 
-    Required research columns are ``decision_timestamp``, ``symbol``,
-    ``valid_entry``, Task 4's canonical ``forward_max_abs_excursion_pct``,
-    ``trade_expectancy_value`` and ``market_regime``. A null expectancy value
-    means no completed trade.
+    A key is entry-observed when Task 4 supplied its canonical outcome. Entry is
+    true iff at least one already-authoritative trade has ``entry_time`` in the
+    half-open post-decision evaluation horizon. No signal or PnL is recomputed.
     """
-    required = {"decision_timestamp", "symbol", "valid_entry", "forward_max_abs_excursion_pct",
-                "trade_expectancy_value", "market_regime"}
-    missing = required - set(research.columns)
+    if isinstance(source.outcomes, pd.DataFrame):
+        outcomes = source.outcomes.copy()
+    else:
+        outcomes = pd.DataFrame(
+            asdict(row) if is_dataclass(row) else dict(row)
+            for row in source.outcomes
+        )
+    required = {"decision_time", "symbol", "forward_max_abs_excursion_pct"}
+    missing = required - set(outcomes.columns)
     if missing:
-        raise ValueError(f"research results missing authoritative columns: {sorted(missing)}")
-    left, right = scanner.copy(), research.copy()
-    for frame in (left, right):
-        frame["decision_timestamp"] = pd.to_datetime(frame.decision_timestamp, utc=True)
-        frame["symbol"] = frame.symbol.astype(str).str.upper()
-    if right.duplicated(["decision_timestamp", "symbol"]).any():
-        raise ValueError("duplicate natural research key in research results")
-    if "entry_timestamp" in right:
-        entry = pd.to_datetime(right.entry_timestamp, utc=True, errors="coerce")
-        if (entry.notna() & (entry < right.decision_timestamp)).any():
-            raise ValueError("strategy entry predates scan decision")
-    if "outcome_available_at" in right:
-        available = pd.to_datetime(right.outcome_available_at, utc=True, errors="coerce")
-        if (available.notna() & (available < right.decision_timestamp)).any():
-            raise ValueError("research outcome predates scan decision")
+        raise ValueError(f"Task 4 outcomes missing columns: {sorted(missing)}")
+    outcomes = outcomes.rename(columns={"decision_time": "decision_timestamp",
+                                        "forward_max_abs_excursion_pct": "absolute_movement"})
+    outcomes["decision_timestamp"] = pd.to_datetime(outcomes.decision_timestamp, utc=True)
+    outcomes["symbol"] = outcomes.symbol.astype(str).str.upper()
+    if outcomes.duplicated(["decision_timestamp", "symbol"]).any():
+        raise ValueError("duplicate natural research key in Task 4 outcomes")
+
+    trades = source.trades.copy()
+    trade_required = {"entry_time", "market_regime"}
+    if trade_required - set(trades):
+        raise ValueError(f"native trades missing columns: {sorted(trade_required-set(trades))}")
+    expectancy_column = "pair_net_r" if "pair_net_r" in trades else "pair_net_pnl" if "pair_net_pnl" in trades else None
+    if expectancy_column is None:
+        raise ValueError("native trades require pair_net_r or pair_net_pnl")
+    if "symbol" not in trades:
+        if source.symbol is None:
+            raise ValueError("native single-symbol trades require source symbol provenance")
+        trades["symbol"] = source.symbol
+    trades["symbol"] = trades.symbol.astype(str).str.upper()
+    trades["entry_time"] = pd.to_datetime(trades.entry_time, utc=True, errors="coerce")
+    trades["_expectancy"] = pd.to_numeric(trades[expectancy_column], errors="coerce")
+
+    normalized=[]
+    horizon = pd.Timedelta(source.evaluation_horizon)
+    for outcome in outcomes.sort_values(["decision_timestamp", "symbol"], kind="stable").itertuples(index=False):
+        end = outcome.decision_timestamp + horizon
+        selected = trades[(trades.symbol == outcome.symbol) & (trades.entry_time >= outcome.decision_timestamp) & (trades.entry_time < end)]
+        completed = selected[selected._expectancy.notna()]
+        regimes = sorted(set(selected.market_regime.dropna().astype(str)))
+        normalized.append({"decision_timestamp": outcome.decision_timestamp, "symbol": outcome.symbol,
+            "valid_entry": bool(len(selected)), "absolute_movement": outcome.absolute_movement,
+            "trade_expectancy_value": completed._expectancy.mean() if len(completed) else None,
+            "trade_won": completed._expectancy.gt(0).mean() if len(completed) else None,
+            "completed_trade_count": len(completed),
+            "trade_expectancy_sum": completed._expectancy.sum() if len(completed) else 0.0,
+            "winning_trade_count": int(completed._expectancy.gt(0).sum()),
+            "research_market_regime": regimes[0] if len(regimes)==1 else getattr(outcome, "market_regime", None),
+            "research_run_id": source.run_id,
+            "research_source_identities": json.dumps(source.source_identities),
+            "evaluation_horizon": source.evaluation_horizon})
+    right = pd.DataFrame(normalized)
+    left = scanner.copy()
+    left["decision_timestamp"] = pd.to_datetime(left.decision_timestamp, utc=True)
+    left["symbol"] = left.symbol.astype(str).str.upper()
     joined = left.merge(right, on=["decision_timestamp", "symbol"], how="left", validate="one_to_one")
-    joined["absolute_movement"] = joined.pop("forward_max_abs_excursion_pct")
+    if "market_regime" in joined:
+        joined["market_regime"] = joined.research_market_regime.combine_first(joined.market_regime)
+    else:
+        joined["market_regime"] = joined.research_market_regime
+    joined = joined.drop(columns="research_market_regime")
     joined["year"] = joined.decision_timestamp.dt.year
     joined["valid_entry"] = joined.valid_entry.astype("boolean")
     joined["absolute_movement"] = pd.to_numeric(joined.absolute_movement, errors="coerce")
     joined["trade_expectancy_value"] = pd.to_numeric(joined.trade_expectancy_value, errors="coerce")
-    if "trade_won" not in joined:
-        joined["trade_won"] = pd.NA
     return joined.sort_values(["decision_timestamp", "symbol"], kind="stable").reset_index(drop=True)
 
 
@@ -162,16 +241,27 @@ def _metrics(selected: pd.DataFrame, baseline: pd.DataFrame, minimum: int) -> di
     denominator = baseline.groupby("decision_timestamp").absolute_movement.sum(min_count=1).sum(min_count=1)
     numerator = observed.absolute_movement.sum(min_count=1)
     capture = None if pd.isna(denominator) or denominator == 0 or pd.isna(numerator) else float(numerator / denominator)
+    if "completed_trade_count" in selected:
+        trade_count = int(pd.to_numeric(selected.completed_trade_count, errors="coerce").fillna(0).sum())
+        expectancy = (float(pd.to_numeric(selected.trade_expectancy_sum, errors="coerce").fillna(0).sum()) / trade_count
+                      if trade_count else None)
+        win_rate = (float(pd.to_numeric(selected.winning_trade_count, errors="coerce").fillna(0).sum()) / trade_count
+                    if trade_count else None)
+    else:
+        trade_count = len(trades)
+        expectancy = float(trades.trade_expectancy_value.mean()) if len(trades) else None
+        win_rate = (float(trades.trade_won.astype("boolean").mean())
+                    if len(trades) and trades.trade_won.notna().any() else None)
     return {
-        "sample_count": int(len(selected)), "movement_sample_count": int(len(observed)),
+        "sample_count": int(len(selected)), "entry_observation_count": int(len(entries)),
+        "movement_sample_count": int(len(observed)),
         "valid_entry_count": int((entries == True).sum()),  # noqa: E712
         "candidate_to_entry_conversion": float(entries.mean()) if len(entries) else None,
         "setup_frequency": float(entries.mean()) if len(entries) else None,
         "mean_absolute_movement": float(observed.absolute_movement.mean()) if len(observed) else None,
         "median_absolute_movement": float(observed.absolute_movement.median()) if len(observed) else None,
-        "opportunity_capture": capture, "trade_count": int(len(trades)),
-        "expectancy": float(trades.trade_expectancy_value.mean()) if len(trades) else None,
-        "win_rate": float(trades.trade_won.astype("boolean").mean()) if len(trades) and trades.trade_won.notna().any() else None,
+        "opportunity_capture": capture, "trade_count": trade_count,
+        "expectancy": expectancy, "win_rate": win_rate,
         "small_sample_warning": bool(len(selected) < minimum),
     }
 
@@ -223,11 +313,15 @@ def validate_opportunities(observations: pd.DataFrame, config: OpportunityValida
         for outcome in ("absolute_movement", "valid_entry", "trade_expectancy_value"):
             n,rho=_spearman(frame[predictor],frame[outcome])
             associations.append({"predictor":predictor,"outcome":outcome,"sample_count":n,"spearman_rho":rho})
-    component_cols=sorted(c for c in frame if c.startswith("component__"))
+    component_cols=sorted(c for c in frame if c.startswith(("component__", "discovery__")))
     component_rows=[]
     for i,left in enumerate(component_cols):
         for right in component_cols[i+1:]:
             n,rho=_spearman(frame[left],frame[right])
-            component_rows.append({"component_a":left.removeprefix("component__"),"component_b":right.removeprefix("component__"),"sample_count":n,"spearman_rho":rho})
+            component_rows.append({"analysis_type":"REDUNDANCY", "component_a":left,"component_b":right,"outcome":None,"sample_count":n,"spearman_rho":rho})
+    for component in component_cols:
+        for outcome in ("absolute_movement", "valid_entry", "trade_expectancy_value"):
+            n,rho=_spearman(frame[component],frame[outcome])
+            component_rows.append({"analysis_type":"OUTCOME_ASSOCIATION", "component_a":component,"component_b":None,"outcome":outcome,"sample_count":n,"spearman_rho":rho})
     return OpportunityValidationResult(config, frame, overall, by_rank, top_k, decay, by_year, by_regime,
                                        pd.DataFrame(component_rows), pd.DataFrame(associations))

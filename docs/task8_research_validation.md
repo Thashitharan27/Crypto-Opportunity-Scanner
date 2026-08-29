@@ -7,6 +7,12 @@ derive market regimes. Scanner facts come from completed historical Task 7
 facts are supplied by existing Strategy Lab research outputs and joined on the
 natural key `(decision_timestamp, symbol)`.
 
+The normalization adapter consumes native `entry_time`, `pair_net_r` (falling
+back to native `pair_net_pnl`), and `market_regime` trade fields plus Task 4
+`OpportunityOutcome` rows. An outcome marks that key as entry-observed; a valid
+entry means at least one authoritative trade entry in the half-open interval
+from the decision through the explicit upstream evaluation horizon.
+
 ## Metric definitions
 
 * **Candidate-to-entry conversion** is the number of authoritative valid-entry
@@ -35,12 +41,15 @@ owned by the upstream historical forward-opportunity evaluator.
 ## Causality and interpretation
 
 The Task 7 loader rejects live scans and scanner facts whose `available_at` is
-after the decision boundary. The research join rejects entries or outcome
-availability timestamps before the decision. Future outcomes may only be attached
-after selection; no outcome column participates in scanner selection or ranking.
+after the decision boundary. The research join only counts native entries inside
+the explicit post-decision horizon; earlier and later trades cannot affect that
+key. Future outcomes may only be attached after selection; no outcome column
+participates in scanner selection or ranking.
 
 Every output reports sample counts. Win rate is secondary to conversion,
 movement, opportunity capture, and expectancy. Top-K rows use `rank <= K`, so a
 run with fewer than K candidates reports only ranks actually present. Component
 and model correlations are descriptive redundancy/association diagnostics and do
 not select a winner or tune production thresholds.
+The summary also records deterministic decision timestamps, Task 7 scan run IDs,
+scanner source identities, research run/source identities, and horizons.

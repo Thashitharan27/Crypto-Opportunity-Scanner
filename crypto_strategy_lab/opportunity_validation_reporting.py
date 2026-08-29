@@ -24,6 +24,14 @@ def write_validation_reports(directory: Path, result: OpportunityValidationResul
     }
     for name, frame in reports.items():
         frame.to_csv(directory / name, index=False, lineterminator="\n")
+    observations = result.observations
+    def values(column: str) -> list[str]:
+        if column not in observations:
+            return []
+        return sorted(set(observations[column].dropna().astype(str)))
+    research_sources: set[str] = set()
+    for encoded in values("research_source_identities"):
+        research_sources.update(json.loads(encoded))
     summary = {
         "contract": "opportunity_validation_v1",
         "config": asdict(result.config),
@@ -36,6 +44,12 @@ def write_validation_reports(directory: Path, result: OpportunityValidationResul
             "rank_correlation": "Spearman ordinal correlation using average ranks and pairwise complete observations",
         },
         "observation_count": len(result.observations),
+        "decision_timestamps": values("decision_timestamp"),
+        "scan_run_ids": values("scan_run_id"),
+        "scanner_source_identities": values("scanner_source_identity"),
+        "research_run_ids": values("research_run_id"),
+        "research_source_identities": sorted(research_sources),
+        "evaluation_horizons": values("evaluation_horizon"),
         "associations": result.associations.where(pd.notna(result.associations), None).to_dict("records"),
     }
     (directory / "validation_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str)+"\n", encoding="utf-8")
