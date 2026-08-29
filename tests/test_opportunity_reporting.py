@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from dataclasses import replace
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -35,7 +36,11 @@ from crypto_strategy_lab.rich_data_acquisition import (
     RichDataAcquisitionResult,
     SymbolRichDataResult,
 )
-from crypto_strategy_lab.run_manifest import artifact_path, load_completed_manifest
+from crypto_strategy_lab.run_manifest import (
+    RunArtifactError,
+    artifact_path,
+    load_completed_manifest,
+)
 
 
 NOW = datetime(2025, 1, 2, tzinfo=timezone.utc)
@@ -166,3 +171,44 @@ def test_task6_dataset_requirement_must_belong_to_its_candidate(tmp_path):
 
     with pytest.raises(ValueError, match="candidate provenance mismatch"):
         publish_opportunity_scan(tmp_path, replace(package, rich_data=rich_data))
+
+
+def test_task3_duplicate_symbols_are_rejected(tmp_path):
+    package = _package()
+    duplicate = replace(
+        package.candle_acquisition,
+        symbols=package.candle_acquisition.symbols * 2,
+    )
+
+    with pytest.raises(ValueError, match="Task 3 symbols must be unique"):
+        publish_opportunity_scan(
+            tmp_path, replace(package, candle_acquisition=duplicate)
+        )
+
+
+def test_manifest_uses_exact_semantic_hash_names_and_all_selected_sources(tmp_path):
+    run_dir = publish_opportunity_scan(tmp_path, _package())
+    manifest = load_completed_manifest(run_dir)
+
+    assert {
+        "discovery_config_hash",
+        "candle_acquisition_config_hash",
+        "scoring_config_hash",
+        "final_candidate_config_hash",
+        "rich_data_config_hash",
+        "feature_config_hash",
+    } <= manifest["hashes"].keys()
+    assert {"dataset": "klines", "interval": "1h"} in (
+        manifest["opportunity_scan"]["selected_datasets"]
+    )
+
+
+def test_completed_loader_rejects_incomplete_scan_catalog(tmp_path):
+    run_dir = publish_opportunity_scan(tmp_path, _package())
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["artifacts"]["final_candidates"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RunArtifactError, match="catalog is incomplete"):
+        load_completed_manifest(run_dir)

@@ -320,6 +320,30 @@ def load_completed_manifest(run_dir: Path) -> dict[str, Any]:
         if (scan.get("artifact_contract") != OPPORTUNITY_SCAN_ARTIFACT_CONTRACT
                 or scan.get("artifact_version") != OPPORTUNITY_SCAN_ARTIFACT_VERSION):
             raise RunArtifactError("incompatible opportunity scan artifact version")
+        required_payload = {
+            "scan_timestamp", "decision_timestamp", "discovery_mode",
+            "discovery_contract", "universe_definition", "counts",
+            "source_identity_digest", "source_identities_artifact",
+        }
+        if not required_payload <= set(scan):
+            raise RunArtifactError("opportunity scan payload is incomplete")
+        artifacts = manifest.get("artifacts")
+        required_artifacts = {
+            "universe_snapshot", "discovery_rejections",
+            "preliminary_candidates", "final_candidates",
+            "final_candidate_exclusions", "rich_data_readiness",
+            "opportunity_summary", "source_identities",
+        }
+        if not isinstance(artifacts, Mapping) or not required_artifacts <= set(artifacts):
+            raise RunArtifactError("opportunity scan artifact catalog is incomplete")
+        for name, entry in artifacts.items():
+            if (not isinstance(entry, Mapping)
+                    or not {"path", "format", "schema_version", "rows", "bytes", "sha256"} <= set(entry)
+                    or not isinstance(entry.get("sha256"), str)
+                    or len(entry["sha256"]) != 64):
+                raise RunArtifactError(f"invalid opportunity scan artifact entry: {name}")
+        if manifest.get("config", {}).get("scoring") is not None and "opportunity_scores" not in artifacts:
+            raise RunArtifactError("scoring-enabled opportunity scan is missing scores")
     return manifest
 
 

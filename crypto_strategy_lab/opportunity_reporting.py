@@ -7,7 +7,7 @@ decision boundary and Data Lake replay specification. No pipeline stage executes
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
@@ -68,6 +68,16 @@ def _signature(sig: Any) -> dict[str, Any] | None:
             "cache_identity": sig.cache_identity()}
 
 
+def _valid_signature(sig: Any, dataset: DatasetKind) -> bool:
+    return (
+        sig is not None
+        and sig.dataset is dataset
+        and bool(sig.digest.strip())
+        and sig.partition_count > 0
+        and bool(sig.cache_identity())
+    )
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
@@ -99,6 +109,11 @@ class OpportunityScanPublisher:
             decision = _utc(result.decision_time.value); mode, contract = "HISTORICAL", result.contract
             discovery_rows = list(result.snapshot.rows)
             source_by_symbol = {s.symbol.upper(): s for s in result.sources}
+            if (len(source_by_symbol) != len(result.sources)
+                    or set(source_by_symbol) != {
+                        row.symbol.strip().upper() for row in discovery_rows
+                    }):
+                raise ValueError("historical discovery sources must match the universe")
         symbols = [str(r.symbol).strip().upper() for r in discovery_rows]
         if not symbols or len(symbols) != len(set(symbols)): raise ValueError("discovery symbols must be unique")
         scan_timestamp = _utc(package.scan_timestamp)
@@ -121,13 +136,17 @@ class OpportunityScanPublisher:
         snapshot.sort(key=lambda x: x["symbol"])
         rank_by = {r["symbol"]: r["discovery_rank"] for r in snapshot}
         acquisition_by = {a.symbol.upper(): a for a in package.candle_acquisition.symbols}
+        if len(acquisition_by) != len(package.candle_acquisition.symbols):
+            raise ValueError("Task 3 symbols must be unique")
         if not set(acquisition_by) <= set(symbols): raise ValueError("Task 3 symbol is absent from discovery")
         prelim = []
         sources = []
         for symbol, a in sorted(acquisition_by.items(), key=lambda x: (x[1].rank, x[0])):
             if a.rank != rank_by[symbol] or a.strategy_interval != package.candle_acquisition_config.strategy_interval: raise ValueError("Task 3 rank/interval mismatch")
             sig = _signature(a.source_signature)
-            if a.state in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED} and (sig is None or a.source_signature.dataset is not DatasetKind.KLINES): raise ValueError("successful Task 3 source must be KLINES")
+            if (a.state in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED}
+                    and not _valid_signature(a.source_signature, DatasetKind.KLINES)):
+                raise ValueError("successful Task 3 source must have a valid KLINES signature")
             if sig: sources.append({"symbol": symbol, "role": "strategy_candles", **sig,
                 "interval": a.strategy_interval, "request_start": _json(a.requested_start), "request_end": _json(a.requested_end)})
             prelim.append({"symbol": symbol, "discovery_rank": a.rank, "strategy_interval": a.strategy_interval,
@@ -159,7 +178,7 @@ class OpportunityScanPublisher:
                     raise ValueError("duplicate Task 4 score row")
                 scores_by_key[score_key] = score
                 score_rows.append(_json(score))
-                sources.append({"symbol": score.symbol.upper(), "role": "opportunity_scoring", "cache_identity": score.source_identity,
+                sources.append({"symbol": score.symbol.upper(), "role": "opportunity_scoring", **_signature(expected.source_signature),
                                 "interval": score.strategy_interval, "request_start": None, "request_end": _json(score.decision_time)})
             selected = package.final_candidates.config.opportunity_model
             if selected and (selected.name, selected.version) not in allowed: raise ValueError("Task 5 selected model does not match scoring config")
@@ -227,8 +246,14 @@ class OpportunityScanPublisher:
                         "Task 6 dataset requirement candidate provenance mismatch"
                     )
                 sig = _signature(d.source_signature)
-                if d.state in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED} and (not sig or d.source_identity != sig["cache_identity"]): raise ValueError("Task 6 source identity mismatch")
-                if sig: sources.append({"symbol": s.symbol.upper(), "role": "rich_data", **sig,
+                if d.state in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED}:
+                    if (not _valid_signature(d.source_signature, d.requirement.dataset)
+                            or d.source_identity != sig["cache_identity"]):
+                        raise ValueError("Task 6 source identity mismatch")
+                elif d.source_identity is not None:
+                    raise ValueError("unavailable Task 6 result cannot claim a source identity")
+                if d.state in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED}:
+                    sources.append({"symbol": s.symbol.upper(), "role": "rich_data", **sig,
                     "interval": d.requirement.interval, "request_start": _json(d.requirement.start), "request_end": _json(d.requirement.end)})
                 for feature, requiredness in sorted(d.requirement.feature_requiredness):
                     rich_rows.append({"symbol": s.symbol.upper(), "final_rank": s.final_rank, "strategy_source_identity": s.strategy_source_identity,
@@ -238,16 +263,33 @@ class OpportunityScanPublisher:
                         "missing_ranges": _json(d.missing_ranges), "rich_source_identity": d.source_identity,
                         "rich_source_signature": sig, "detail": d.detail})
         if not live:
+            historical_rows = {row.symbol.upper(): row for row in discovery_rows}
             for symbol, src in sorted(source_by_symbol.items()):
                 sig = _signature(src.signature)
-                if sig: sources.append({"symbol": symbol, "role": "historical_discovery", **sig,
+                row_identity = historical_rows[symbol].source_identity
+                if src.signature is not None:
+                    if (not _valid_signature(src.signature, DatasetKind.KLINES)
+                            or row_identity != sig["cache_identity"]):
+                        raise ValueError("historical discovery source identity mismatch")
+                    sources.append({"symbol": symbol, "role": "historical_discovery", **sig,
                     "interval": src.request.strategy_interval, "request_start": _json(src.request.start), "request_end": _json(src.request.end)})
+                elif row_identity is not None:
+                    raise ValueError("historical discovery identity has no signature")
         sources.sort(key=canonical_json); source_doc = {"contract": "opportunity_source_identities_v1", "entries": sources}
         source_digest = canonical_sha256(source_doc)
         configs = {"discovery": universe["config"], "candle_acquisition": _json(package.candle_acquisition_config),
                    "scoring": _json(package.scoring_config), "final_candidates": _json(package.final_candidates.config),
                    "rich_data": _json(package.rich_data_config), "features": _json(package.feature_config)}
-        hashes = {"universe_definition_hash": canonical_sha256(universe), **{f"{k}_config_hash": canonical_sha256(v) for k,v in configs.items()}, "source_identity_digest": source_digest}
+        hashes = {
+            "universe_definition_hash": canonical_sha256(universe),
+            "discovery_config_hash": canonical_sha256(configs["discovery"]),
+            "candle_acquisition_config_hash": canonical_sha256(configs["candle_acquisition"]),
+            "scoring_config_hash": canonical_sha256(configs["scoring"]),
+            "final_candidate_config_hash": canonical_sha256(configs["final_candidates"]),
+            "rich_data_config_hash": canonical_sha256(configs["rich_data"]),
+            "feature_config_hash": canonical_sha256(configs["features"]),
+            "source_identity_digest": source_digest,
+        }
         hashes["semantic_input_hash"] = canonical_sha256({"decision_timestamp": decision.isoformat(), "universe": universe, "configs": configs, "sources": source_doc})
         columns = {
           "universe_snapshot": list(snapshot[0].keys()), "discovery_rejections": list(snapshot[0].keys()),
@@ -283,7 +325,7 @@ class OpportunityScanPublisher:
                    "task3_ready_count": sum(r["acquisition_state"] in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED} for r in prelim), "scoring_enabled": package.scoring_result is not None,
                    "scoring_models": [{"name": name, "version": version} for name, version in sorted({(r["model_name"], r["model_version"]) for r in score_rows})], "rich_data_enabled_features": list(package.rich_data_config.enabled_features),
                    "rich_data_readiness_counts": {x: sum(f.readiness.value == x for s in package.rich_data.symbols for f in s.features) for x in ("READY","DEGRADED","UNAVAILABLE")},
-                   "selected_datasets": [{"dataset": dataset, "interval": interval} for dataset, interval in sorted({(r["dataset"].value, r["interval"]) for r in rich_rows}, key=str)], "source_identity_digest": source_digest, "semantic_input_hash": hashes["semantic_input_hash"]}
+                   "selected_datasets": [{"dataset": dataset, "interval": interval} for dataset, interval in sorted({(entry["dataset"], entry.get("interval")) for entry in sources if entry.get("dataset")}, key=str)], "source_identity_digest": source_digest, "semantic_input_hash": hashes["semantic_input_hash"]}
         summary_path = run_dir / "opportunity_summary.json"; atomic_json(summary_path, summary); artifacts["opportunity_summary"] = catalog_entry(summary_path, run_dir, "json")
         replay = None if live else {"discovery_mode": mode, "decision_timestamp": decision.isoformat(), "universe_symbols": sorted(symbols), "exchange": package.exchange, "market": package.market,
              "historical_discovery_contract": contract, "historical_discovery_config": configs["discovery"], "candle_acquisition_config": configs["candle_acquisition"], "scoring_config": configs["scoring"],
