@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,19 @@ class PaperScannerStateStore:
                     raise ValueError("paper entry signal_id is invalid")
                 if not isinstance(signal_timestamp, str) or not signal_timestamp:
                     raise ValueError("paper entry signal timestamp is invalid")
+                try:
+                    parsed_timestamp = datetime.fromisoformat(
+                        signal_timestamp.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise ValueError("paper entry signal timestamp is invalid") from exc
+                if (
+                    parsed_timestamp.tzinfo is None
+                    or parsed_timestamp.utcoffset() is None
+                ):
+                    raise ValueError(
+                        "paper entry signal timestamp must be timezone-aware"
+                    )
                 entry_ids.append(signal_id)
             # The ledger and duplicate index are one atomic invariant.  Loading
             # mismatched collections could either suppress a signal without a

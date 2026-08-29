@@ -471,7 +471,11 @@ class PaperScannerRunner:
             entries,
             status,
         )
-        self.state.last_completed_cycle = asdict(result)
+        cycle_state = asdict(result)
+        # Keep the on-disk schema independent of Enum.__str__ implementation
+        # details ("COMPLETED", never "CycleStatus.COMPLETED").
+        cycle_state["status"] = result.status.value
+        self.state.last_completed_cycle = cycle_state
         if status is CycleStatus.COMPLETED:
             self.state.last_successful_scan_run_id = run_id
         self.store.save(self.state)

@@ -143,6 +143,12 @@ def test_fresh_verified_scan_emits_paper_entry_and_duplicate_survives_restart(tm
     assert (
         app.state.paper_entries[0]["scanner_decision_timestamp"] == DECISION.isoformat()
     )
+    assert (
+        json.loads((tmp_path / "state.json").read_text())["last_completed_cycle"][
+            "status"
+        ]
+        == "COMPLETED"
+    )
     reloaded, _ = runner(tmp_path, scan=Scanner(completed(run_id="run-2")))
     second = reloaded.run_once()
     assert second.duplicate_signals_suppressed == 1
@@ -294,6 +300,30 @@ def test_state_rejects_ledger_duplicate_index_mismatch(tmp_path, ids, entries):
         PaperScannerStateStore(path).load()
 
 
+@pytest.mark.parametrize("timestamp", ["not-a-time", "2026-01-01T00:00:00"])
+def test_state_rejects_invalid_or_naive_signal_timestamp(tmp_path, timestamp):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "emitted_signal_ids": ["one"],
+                "paper_entries": [
+                    {
+                        "record_type": "PAPER_ENTRY",
+                        "signal_id": "one",
+                        "signal_candle_timestamp": timestamp,
+                    }
+                ],
+                "last_completed_cycle": None,
+                "last_successful_scan_run_id": None,
+            }
+        )
+    )
+    with pytest.raises(PaperScannerStateError, match="corrupt"):
+        PaperScannerStateStore(path).load()
+
+
 def test_scheduler_waits_and_stops_without_order_api(tmp_path):
     app, scan = runner(tmp_path)
 
@@ -333,7 +363,7 @@ def test_scheduler_propagates_stop_callback_into_active_scan(tmp_path):
     app, scanner = runner(tmp_path, scan=CancellingScanner())
     app.run_forever(stop)
     assert scanner.calls == 1
-    assert app.state.last_completed_cycle["status"] is CycleStatus.CANCELLED
+    assert app.state.last_completed_cycle["status"] == CycleStatus.CANCELLED.value
     assert "SCAN_CANCELLED" in events(tmp_path / "audit.jsonl")
 
 
@@ -351,7 +381,7 @@ def test_scheduler_stop_interrupts_retry_backoff(tmp_path):
     app, scanner = runner(tmp_path, scan=FailingScanner(), retries=3)
     app.run_forever(stop)
     assert scanner.calls == 1
-    assert app.state.last_completed_cycle["status"] is CycleStatus.CANCELLED
+    assert app.state.last_completed_cycle["status"] == CycleStatus.CANCELLED.value
     audit_events = events(tmp_path / "audit.jsonl")
     assert "SCAN_RETRY" in audit_events
     assert "SCAN_CANCELLED" in audit_events
