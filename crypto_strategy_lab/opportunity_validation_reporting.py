@@ -32,6 +32,12 @@ def write_validation_reports(directory: Path, result: OpportunityValidationResul
     research_sources: set[str] = set()
     for encoded in values("research_source_identities"):
         research_sources.update(json.loads(encoded))
+    associations = []
+    for record in result.associations.to_dict("records"):
+        associations.append({
+            key: None if pd.isna(value) else value.item() if hasattr(value, "item") else value
+            for key, value in record.items()
+        })
     summary = {
         "contract": "opportunity_validation_v1",
         "config": asdict(result.config),
@@ -50,6 +56,9 @@ def write_validation_reports(directory: Path, result: OpportunityValidationResul
         "research_run_ids": values("research_run_id"),
         "research_source_identities": sorted(research_sources),
         "evaluation_horizons": values("evaluation_horizon"),
-        "associations": result.associations.where(pd.notna(result.associations), None).to_dict("records"),
+        "associations": associations,
     }
-    (directory / "validation_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str)+"\n", encoding="utf-8")
+    (directory / "validation_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, default=str, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )

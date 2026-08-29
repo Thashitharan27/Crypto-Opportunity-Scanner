@@ -250,8 +250,9 @@ def _metrics(selected: pd.DataFrame, baseline: pd.DataFrame, minimum: int) -> di
     else:
         trade_count = len(trades)
         expectancy = float(trades.trade_expectancy_value.mean()) if len(trades) else None
-        win_rate = (float(trades.trade_won.astype("boolean").mean())
-                    if len(trades) and trades.trade_won.notna().any() else None)
+        wins = trades["trade_won"] if "trade_won" in trades else pd.Series(dtype="boolean")
+        win_rate = (float(wins.astype("boolean").mean())
+                    if len(wins) and wins.notna().any() else None)
     return {
         "sample_count": int(len(selected)), "entry_observation_count": int(len(entries)),
         "movement_sample_count": int(len(observed)),

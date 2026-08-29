@@ -137,3 +137,25 @@ def test_constant_or_insufficient_association_is_explicit_null():
     one=_observations().iloc[:1].copy()
     result=validate_opportunities(one)
     assert result.associations.spearman_rho.isna().all()
+
+
+def test_required_only_observations_do_not_require_optional_trade_won():
+    observations=_observations().drop(columns=["trade_won"])
+    result=validate_opportunities(observations)
+    assert result.overall.trade_count.sum()>0
+    assert result.overall.win_rate.isna().all()
+
+
+def test_summary_serializes_real_and_missing_correlations_as_strict_json(tmp_path):
+    observations=_observations()
+    observations["rank__constant_v1"]=1.0
+    result=validate_opportunities(observations)
+    assert result.associations.spearman_rho.notna().any()
+    assert result.associations.spearman_rho.isna().any()
+    write_validation_reports(tmp_path,result)
+    raw=(tmp_path/"validation_summary.json").read_text()
+    parsed=json.loads(raw)
+    correlations=[row["spearman_rho"] for row in parsed["associations"]]
+    assert "NaN" not in raw and "null" in raw
+    assert any(value is None for value in correlations)
+    assert any(isinstance(value,float) for value in correlations)
