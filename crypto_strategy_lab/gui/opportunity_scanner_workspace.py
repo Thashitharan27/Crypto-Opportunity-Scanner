@@ -15,7 +15,7 @@ from crypto_strategy_lab.data.binance.universe import DiscoveryConfig
 from crypto_strategy_lab.final_candidates import FinalCandidateBoundaryConfig
 from crypto_strategy_lab.features import production_feature_registry
 from crypto_strategy_lab.opportunity_scoring import SCORING_MODELS
-from .opportunity_scanner_controller import build_request
+from .opportunity_scanner_controller import OpportunityScanCancelled, build_request
 
 NATIVE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
 RICH_FEATURES = ("funding_context", "basis_context", "futures_positioning",
@@ -25,12 +25,16 @@ RICH_FEATURES = ("funding_context", "basis_context", "futures_positioning",
 class _ScanWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
     def __init__(self, service, request, cancelled):
-        super().__init__(); self.service = service; self.request = request; self.cancelled = cancelled
+        super().__init__(); self.service = service; self.request = request; self._is_cancelled = cancelled
     @Slot()
     def run(self):
-        try: self.finished.emit(self.service.run(self.request, self.cancelled))
-        except Exception as exc: self.failed.emit(str(exc))
+        try: self.finished.emit(self.service.run(self.request, self._is_cancelled))
+        except OpportunityScanCancelled: self.cancelled.emit()
+        except Exception as exc:
+            if self._is_cancelled(): self.cancelled.emit()
+            else: self.failed.emit(str(exc))
 
 
 class OpportunityScannerWorkspace(QWidget):
@@ -87,16 +91,21 @@ class OpportunityScannerWorkspace(QWidget):
         try: request=self.request()
         except Exception as exc: self.status.setText(str(exc)); return
         self._cancel.clear(); self.run_button.setEnabled(False); self.cancel_button.setEnabled(True); self.status.setText("Scanning…")
-        thread=QThread(self); worker=_ScanWorker(self.service,request,self._cancel.is_set); worker.moveToThread(thread); thread.started.connect(worker.run); worker.finished.connect(self._completed); worker.failed.connect(self._failed); worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); thread.finished.connect(self._thread_finished)
+        thread=QThread(self); worker=_ScanWorker(self.service,request,self._cancel.is_set); worker.moveToThread(thread); thread.started.connect(worker.run); worker.finished.connect(self._completed); worker.failed.connect(self._failed); worker.cancelled.connect(self._cancelled); worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.cancelled.connect(thread.quit); thread.finished.connect(self._thread_finished)
         self._thread=thread; self._worker=worker; thread.start()
 
     def cancel_scan(self): self._cancel.set(); self.status.setText("Cancelling…")
-    def _completed(self,result): self.render(result); self.status.setText("Completed")
+    def _completed(self,result):
+        if self._cancel.is_set():
+            self.status.setText("Cancelled")
+            return
+        self.render(result); self.status.setText("Completed")
+    def _cancelled(self): self.status.setText("Cancelled")
     def _failed(self,message): self.status.setText(f"Failed: {message}")
     def _thread_finished(self):
         self._thread.deleteLater(); self._thread=None; self._worker=None; self.run_button.setEnabled(True); self.cancel_button.setEnabled(False)
 
-    def closeEvent(self, event):
+    def shutdown(self):
         """Cooperatively stop backend work before Qt destroys its QThread."""
         thread = self._thread
         if thread is not None and thread.isRunning():
@@ -104,6 +113,9 @@ class OpportunityScannerWorkspace(QWidget):
             self.status.setText("Cancelling…")
             thread.quit()
             thread.wait()
+
+    def closeEvent(self, event):
+        self.shutdown()
         super().closeEvent(event)
 
     @staticmethod
@@ -117,6 +129,6 @@ class OpportunityScannerWorkspace(QWidget):
     def render(self,result):
         s=result.summary; m=result.manifest; scan=m.get("opportunity_scan",{}); hashes=m.get("hashes",{})
         self.summary.setText(" | ".join((f"Run ID: {m.get('run_id','—')}",f"Scan: {s.get('scan_timestamp','—')}",f"Decision: {s.get('decision_timestamp','—')}",f"Mode: {s.get('discovery_mode','—')}",f"Eligible: {s.get('discovery_eligible_count',0)}",f"Rejected: {s.get('discovery_rejected_count',0)}",f"Preliminary: {s.get('preliminary_candidate_count',0)}",f"Final: {s.get('final_candidate_count',0)}",f"Commit: {m.get('code_commit','—')}",f"Semantic: {hashes.get('semantic_input_hash','—')}",f"Sources: {scan.get('source_identity_digest','—')}",f"Folder: {result.run_dir}")))
-        self._fill(self.preliminary_table,result.preliminary,("discovery_rank","symbol","range_percent","absolute_price_change_percent","quote_volume","spread_percent","model_rank","score"))
+        self._fill(self.preliminary_table,result.preliminary,("discovery_rank","symbol","range_percent","absolute_price_change_percent","quote_volume","spread_percent","model_rank","score","acquisition_state","quality_status","detail"))
         self._fill(self.final_table,result.final,("final_rank","symbol","discovery_rank","opportunity_model_name","opportunity_model_version","opportunity_model_rank","opportunity_score","strategy_interval","quality_status","acquisition_state"))
         self._fill(self.readiness_table,result.readiness,("symbol","feature_name","dataset","feature_readiness","acquisition_state","requiredness_for_feature","quality_status","detail"))

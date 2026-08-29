@@ -30,6 +30,7 @@ from crypto_strategy_lab.data.query import DataRequest
 from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
 from crypto_strategy_lab.data.store import MarketDataStore
 from crypto_strategy_lab.data.timing import interval_to_timedelta
+from crypto_strategy_lab.data.timing import normalize_binance_interval
 from crypto_strategy_lab.features import production_feature_registry
 from crypto_strategy_lab.final_candidates import (
     FinalCandidateBoundaryConfig, OpportunityModelRef, build_final_candidate_set,
@@ -118,22 +119,24 @@ class OpportunityScanResultReader:
                 .get("final_candidates", {})
                 .get("opportunity_model")
             )
-            selected = scores
             if isinstance(selected_model, dict):
+                selected = scores
                 selected = selected.loc[
                     (selected["model_name"] == selected_model.get("name"))
                     & (selected["model_version"].astype(str)
                        == str(selected_model.get("version")))
                 ]
-            # A valid Task-7 package has at most one selected-model score per
-            # symbol.  Enforce that boundary rather than multiplying GUI rows
-            # when the Task-4 artifact also contains comparison models.
-            if selected["symbol"].duplicated().any():
-                raise ValueError("selected opportunity model has duplicate symbol scores")
-            preliminary = preliminary.merge(
-                selected[["symbol", "model_rank", "score"]],
-                on="symbol", how="left",
-            )
+                # A valid Task-7 package has at most one selected-model score
+                # per symbol. Enforce the Task-5 boundary rather than
+                # multiplying rows with Task-4 comparison models.
+                if selected["symbol"].duplicated().any():
+                    raise ValueError(
+                        "selected opportunity model has duplicate symbol scores"
+                    )
+                preliminary = preliminary.merge(
+                    selected[["symbol", "model_rank", "score"]],
+                    on="symbol", how="left",
+                )
         return CompletedOpportunityScan(directory, manifest, summary, universe, preliminary,
                                         csv("final_candidates"), csv("rich_data_readiness"), scores)
 
@@ -148,6 +151,10 @@ class OpportunityScannerApplicationService:
 
     def run(self, request: OpportunityScanRequest, cancelled: Callable[[], bool]) -> CompletedOpportunityScan:
         return self.reader.read(self._run_once(request, cancelled))
+
+
+class OpportunityScanCancelled(RuntimeError):
+    """Cooperative cancellation before an authoritative Task-7 publication."""
 
 
 class UnconfiguredOpportunityScannerService(OpportunityScannerApplicationService):
@@ -193,15 +200,20 @@ class Task1To7OpportunityScanner:
             )
             discovery_config = None
 
-        interval = interval_to_timedelta(request.candle_acquisition.strategy_interval)
+        self._raise_if_cancelled(cancelled)
+
         required_bars = max(
             1, self.registry.effective_warmup(self.SCORING_FEATURES)
         )
-        candle_start = decision - interval * (required_bars + 1)
+        candle_start, candle_end = self._candle_bounds(
+            decision, request.candle_acquisition.strategy_interval,
+            required_bars + 1,
+        )
         candles = SelectiveCandleAcquirer(
             self.store, self.backend, request.candle_acquisition
-        ).acquire(discovery, candle_start, decision, cancelled=cancelled)
+        ).acquire(discovery, candle_start, candle_end, cancelled=cancelled)
 
+        self._raise_if_cancelled(cancelled)
         scoring = self._score(request, candles, decision) if request.scoring else None
         final = build_final_candidate_set(
             discovery, candles, scoring, request.final_candidates
@@ -209,6 +221,9 @@ class Task1To7OpportunityScanner:
         rich = SelectiveRichDataAcquirer(
             self.store, self.backend, request.rich_data, self.registry
         ).acquire(final, cancelled=cancelled)
+        # Task 7 has no cancellation contract and writes an immutable completed
+        # marker.  Never enter publication after a cooperative cancellation.
+        self._raise_if_cancelled(cancelled)
         package = OpportunityScanPublicationInput(
             scan_timestamp=self.now(), discovery=discovery,
             discovery_config=discovery_config, candle_acquisition=candles,
@@ -218,6 +233,24 @@ class Task1To7OpportunityScanner:
             rich_data_config=request.rich_data,
         )
         return publish_opportunity_scan(self.output_root, package)
+
+    @staticmethod
+    def _raise_if_cancelled(cancelled: Callable[[], bool]) -> None:
+        if cancelled():
+            raise OpportunityScanCancelled("opportunity scan cancelled")
+
+    @staticmethod
+    def _candle_bounds(decision: datetime, strategy_interval: str,
+                       candle_count: int) -> tuple[datetime, datetime]:
+        """Return a fixed-grid Task-3 window without changing the decision."""
+        interval = interval_to_timedelta(strategy_interval)
+        utc = decision.astimezone(timezone.utc)
+        step = int(interval.total_seconds())
+        epoch_seconds = int(utc.timestamp())
+        end = datetime.fromtimestamp(
+            epoch_seconds - (epoch_seconds % step), tz=timezone.utc
+        )
+        return end - interval * candle_count, end
 
     @staticmethod
     def _live_decision(discovery) -> datetime:
@@ -283,13 +316,20 @@ def build_request(*, mode: str, decision_time: datetime | None,
                   model: OpportunityScoringModelDefinition | None,
                   enabled_features: tuple[str, ...]) -> OpportunityScanRequest:
     """Explicit GUI-to-native configuration mapping (no scanner semantics)."""
+    normalized_interval = normalize_binance_interval(strategy_interval)
+    if (model is not None and model.supported_intervals is not None
+            and normalized_interval not in model.supported_intervals):
+        supported = ", ".join(model.supported_intervals)
+        raise ValueError(
+            f"{model.name} v{model.version} supports only {supported}"
+        )
     live = DiscoveryConfig(timedelta(days=minimum_listing_age_days), minimum_quote_volume,
                            maximum_spread_percent)
     historical = HistoricalDiscoveryConfig(minimum_quote_volume=minimum_quote_volume)
-    candles = SelectiveCandleAcquisitionConfig(preliminary_size, strategy_interval)
-    scoring = None if model is None else OpportunityScoringConfig(strategy_interval, (model,))
+    candles = SelectiveCandleAcquisitionConfig(preliminary_size, normalized_interval)
+    scoring = None if model is None else OpportunityScoringConfig(normalized_interval, (model,))
     model_ref = None if model is None else OpportunityModelRef(model.name, model.version)
-    final = FinalCandidateBoundaryConfig(strategy_interval, final_size, model_ref)
+    final = FinalCandidateBoundaryConfig(normalized_interval, final_size, model_ref)
     rich = RichDataAcquisitionConfig(enabled_features=enabled_features)
     return OpportunityScanRequest(MarketKind.FUTURES_UM, mode, decision_time, live,
                                   historical, candles, scoring, final, rich)
