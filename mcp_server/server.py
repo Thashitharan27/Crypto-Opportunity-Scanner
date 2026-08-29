@@ -14,6 +14,7 @@ import duckdb
 from openpyxl import load_workbook
 
 from crypto_strategy_lab.run_manifest import (
+    RunType,
     RunArtifactError,
     artifact_path,
     load_completed_manifest,
@@ -108,10 +109,22 @@ class BacktestReports:
 
     @staticmethod
     def _metadata(run: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        run_type = manifest.get("run_type", RunType.BACKTEST.value)
+        if run_type == RunType.OPPORTUNITY_SCAN.value:
+            scan = manifest["opportunity_scan"]
+            counts = scan["counts"]
+            return {"folder_name": run.name, "run_type": run_type,
+                    "run_id": manifest["run_id"], "run_started_at": manifest["run_started_at"],
+                    "run_completed_at": manifest["run_completed_at"], "scan_timestamp": scan["scan_timestamp"],
+                    "decision_timestamp": scan["decision_timestamp"], "discovery_mode": scan["discovery_mode"],
+                    **counts, "semantic_input_hash": manifest["hashes"]["semantic_input_hash"],
+                    "code_commit": manifest.get("code_commit"),
+                    "reproducibility_status": manifest.get("reproducibility_status")}
         request = manifest["request"]
         hashes = manifest["hashes"]
         return {
             "folder_name": run.name,
+            "run_type": RunType.BACKTEST.value,
             "run_id": manifest["run_id"],
             "run_started_at": manifest["run_started_at"],
             "run_completed_at": manifest["run_completed_at"],
@@ -127,9 +140,12 @@ class BacktestReports:
             "reproducibility_status": manifest.get("reproducibility_status"),
         }
 
-    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 50, run_type: str | None = None) -> list[dict[str, Any]]:
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
+        if run_type is not None:
+            try: run_type = RunType(run_type).value
+            except ValueError as exc: raise ValueError(f"unknown run type: {run_type}") from exc
         runs: list[dict[str, Any]] = []
         for path in self.root.iterdir():
             if not path.is_dir() or path.is_symlink():
@@ -138,14 +154,15 @@ class BacktestReports:
                 manifest = load_completed_manifest(path)
             except RunArtifactError:
                 continue
-            runs.append(self._metadata(path, manifest))
+            metadata = self._metadata(path, manifest)
+            if run_type is None or metadata["run_type"] == run_type: runs.append(metadata)
         runs.sort(key=lambda item: item["run_started_at"], reverse=True)
         return runs[:limit]
 
-    def latest_run(self) -> dict[str, Any]:
-        runs = self.list_runs(1)
+    def latest_run(self, run_type: str | None = None) -> dict[str, Any]:
+        runs = self.list_runs(1, run_type)
         if not runs:
-            raise ValueError("No completed backtest runs were found")
+            raise ValueError("No completed runs were found")
         run = self.resolve_run(runs[0]["folder_name"])
         manifest = load_completed_manifest(run)
         result = {
@@ -153,8 +170,13 @@ class BacktestReports:
             "path": run.name,
             "artifact_availability": {name: True for name in manifest["artifacts"]},
         }
-        result["summary"] = self._load_json(artifact_path(run, manifest, "summary"))
+        summary_name = "opportunity_summary" if runs[0]["run_type"] == RunType.OPPORTUNITY_SCAN.value else "summary"
+        result["summary"] = self._load_json(artifact_path(run, manifest, summary_name))
         return result
+
+    def _require_backtest(self, run: str) -> None:
+        if load_completed_manifest(self.resolve_run(run)).get("run_type", RunType.BACKTEST.value) != RunType.BACKTEST.value:
+            raise ValueError("operation requires BACKTEST run")
 
     def get_run_manifest(self, run: str) -> dict[str, Any]:
         return load_completed_manifest(self.resolve_run(run))
@@ -341,12 +363,15 @@ class BacktestReports:
         return self._query_parquet_path(path, relation, sql)
 
     def query_trades(self, run: str, sql: str) -> dict[str, Any]:
+        self._require_backtest(run)
         return self._query_artifact_parquet(run, "trades", "trades", sql)
 
     def query_signals(self, run: str, sql: str) -> dict[str, Any]:
+        self._require_backtest(run)
         return self._query_artifact_parquet(run, "signals", "signals", sql)
 
     def query_feature_context(self, run: str, sql: str) -> dict[str, Any]:
+        self._require_backtest(run)
         return self._query_artifact_parquet(run, "feature_context", "feature_context", sql)
 
     def query_parquet(self, run: str, filename: str, sql: str) -> dict[str, Any]:
@@ -356,6 +381,7 @@ class BacktestReports:
         return self._query_parquet_path(path, "data", sql)
 
     def research_aggregate(self, run: str, spec: dict[str, Any]) -> dict[str, Any]:
+        self._require_backtest(run)
         from crypto_strategy_lab.feature_research import ResearchQueryService
 
         with ResearchQueryService(self.resolve_run(run)) as service:
@@ -379,6 +405,7 @@ class BacktestReports:
         result: list[dict[str, Any]] = []
         manifests: list[dict[str, Any]] = []
         for name in runs:
+            self._require_backtest(name)
             folder = self.resolve_run(name)
             manifest = load_completed_manifest(folder)
             manifests.append(manifest)
@@ -442,14 +469,14 @@ def create_server(reports: BacktestReports):
     server = MCPServer("Crypto Strategy Lab Reports")
 
     @server.tool()
-    def list_runs(limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(limit: int = 50, run_type: str | None = None) -> list[dict[str, Any]]:
         LOGGER.info("MCP tool called: list_runs")
-        return reports.list_runs(limit)
+        return reports.list_runs(limit, run_type)
 
     @server.tool()
-    def latest_run() -> dict[str, Any]:
+    def latest_run(run_type: str | None = None) -> dict[str, Any]:
         LOGGER.info("MCP tool called: latest_run")
-        return reports.latest_run()
+        return reports.latest_run(run_type)
 
     @server.tool()
     def get_run_manifest(run: str) -> dict[str, Any]:
