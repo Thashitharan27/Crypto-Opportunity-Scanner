@@ -32,7 +32,7 @@ from .run_manifest import (
     capture_code_provenance,
     config_hashes,
     config_snapshot,
-    file_sha256,
+    catalog_entry,
     new_run_identity,
     runtime_provenance,
     selected_source_snapshot,
@@ -48,15 +48,7 @@ def _catalog_entry(
     schema_version: int = 1,
     **extra: Any,
 ) -> dict[str, Any]:
-    return {
-        "path": path.relative_to(run_dir).as_posix(),
-        "format": fmt,
-        "schema_version": schema_version,
-        "rows": rows,
-        "bytes": path.stat().st_size,
-        "sha256": file_sha256(path),
-        **extra,
-    }
+    return catalog_entry(path, run_dir, fmt, rows, schema_version, **extra)
 
 
 def _validate_research_artifacts(

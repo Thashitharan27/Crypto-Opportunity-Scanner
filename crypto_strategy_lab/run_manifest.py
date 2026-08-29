@@ -14,6 +14,7 @@ import sys
 import tempfile
 from typing import Any, Mapping
 import uuid
+from enum import Enum
 
 RUN_MANIFEST_CONTRACT = "crypto_strategy_lab_run_v1"
 RUN_MANIFEST_VERSION = 1
@@ -21,11 +22,18 @@ CATALOG_SNAPSHOT_CONTRACT = "selected_source_catalog_v1"
 PREPARED_CACHE_CONTRACT = "prepared_backtest_frame_v1"
 FEATURE_RESEARCH_ARTIFACT_CONTRACT = "feature_research_v1"
 FEATURE_RESEARCH_ARTIFACT_VERSION = 1
+OPPORTUNITY_SCAN_ARTIFACT_CONTRACT = "opportunity_scan_v1"
+OPPORTUNITY_SCAN_ARTIFACT_VERSION = 1
 _CREATE_NO_WINDOW = 0x08000000
 
 
 class RunArtifactError(ValueError):
     """A completed run or cataloged immutable artifact is invalid."""
+
+
+class RunType(str, Enum):
+    BACKTEST = "BACKTEST"
+    OPPORTUNITY_SCAN = "OPPORTUNITY_SCAN"
 
 
 def canonical_json(value: Any) -> str:
@@ -48,6 +56,14 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def catalog_entry(path: Path, run_dir: Path, fmt: str, rows: int | None = None,
+                  schema_version: int = 1, **extra: Any) -> dict[str, Any]:
+    """Catalog one immutable artifact using the common run SHA-256 contract."""
+    return {"path": path.relative_to(run_dir).as_posix(), "format": fmt,
+            "schema_version": schema_version, "rows": rows,
+            "bytes": path.stat().st_size, "sha256": file_sha256(path), **extra}
 
 
 def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -285,14 +301,49 @@ def load_completed_manifest(run_dir: Path) -> dict[str, Any]:
         or manifest.get("run_status") != "COMPLETED"
     ):
         raise RunArtifactError("incompatible or incomplete run manifest")
-    research = manifest.get("research")
-    if not isinstance(research, Mapping):
-        raise RunArtifactError("completed run research contract is missing")
-    if (
-        research.get("artifact_contract") != FEATURE_RESEARCH_ARTIFACT_CONTRACT
-        or research.get("artifact_version") != FEATURE_RESEARCH_ARTIFACT_VERSION
-    ):
-        raise RunArtifactError("incompatible feature research artifact version")
+    raw_type = manifest.get("run_type", RunType.BACKTEST.value)
+    try:
+        run_type = RunType(raw_type)
+    except ValueError as exc:
+        raise RunArtifactError(f"unknown run type: {raw_type}") from exc
+    if run_type is RunType.BACKTEST:
+        research = manifest.get("research")
+        if not isinstance(research, Mapping):
+            raise RunArtifactError("completed run research contract is missing")
+        if (research.get("artifact_contract") != FEATURE_RESEARCH_ARTIFACT_CONTRACT
+                or research.get("artifact_version") != FEATURE_RESEARCH_ARTIFACT_VERSION):
+            raise RunArtifactError("incompatible feature research artifact version")
+    else:
+        scan = manifest.get("opportunity_scan")
+        if not isinstance(scan, Mapping):
+            raise RunArtifactError("completed opportunity scan contract is missing")
+        if (scan.get("artifact_contract") != OPPORTUNITY_SCAN_ARTIFACT_CONTRACT
+                or scan.get("artifact_version") != OPPORTUNITY_SCAN_ARTIFACT_VERSION):
+            raise RunArtifactError("incompatible opportunity scan artifact version")
+        required_payload = {
+            "scan_timestamp", "decision_timestamp", "discovery_mode",
+            "discovery_contract", "universe_definition", "counts",
+            "source_identity_digest", "source_identities_artifact",
+        }
+        if not required_payload <= set(scan):
+            raise RunArtifactError("opportunity scan payload is incomplete")
+        artifacts = manifest.get("artifacts")
+        required_artifacts = {
+            "universe_snapshot", "discovery_rejections",
+            "preliminary_candidates", "final_candidates",
+            "final_candidate_exclusions", "rich_data_readiness",
+            "opportunity_summary", "source_identities",
+        }
+        if not isinstance(artifacts, Mapping) or not required_artifacts <= set(artifacts):
+            raise RunArtifactError("opportunity scan artifact catalog is incomplete")
+        for name, entry in artifacts.items():
+            if (not isinstance(entry, Mapping)
+                    or not {"path", "format", "schema_version", "rows", "bytes", "sha256"} <= set(entry)
+                    or not isinstance(entry.get("sha256"), str)
+                    or len(entry["sha256"]) != 64):
+                raise RunArtifactError(f"invalid opportunity scan artifact entry: {name}")
+        if manifest.get("config", {}).get("scoring") is not None and "opportunity_scores" not in artifacts:
+            raise RunArtifactError("scoring-enabled opportunity scan is missing scores")
     return manifest
 
 
