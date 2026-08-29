@@ -197,6 +197,9 @@ def test_off_grid_native_adapter_selects_latest_available_completed_row():
     )
 
     class Engine:
+        def required_entry_research_features(self, index):
+            return frozenset()
+
         def evaluate_prepared_entry(self, index):
             assert index == 0
             return SimpleNamespace(
@@ -225,16 +228,20 @@ def test_native_adapter_excludes_row_with_post_decision_research_value():
         strategy_interval=pd.Timedelta(hours=1),
         research=(
             SimpleNamespace(
+                name="required",
                 available_at=np.array(
                     ["2026-01-02T13:00", "2026-01-02T14:45"],
                     dtype="datetime64[ns]",
-                )
+                ),
             ),
         ),
         close=np.array([10.0, 20.0]),
     )
 
     class Engine:
+        def required_entry_research_features(self, index):
+            return frozenset({"required"})
+
         def evaluate_prepared_entry(self, index):
             assert index == 0
             return SimpleNamespace(
@@ -262,6 +269,9 @@ def test_native_adapter_uses_candle_close_as_minimum_availability():
     )
 
     class Engine:
+        def required_entry_research_features(self, index):
+            return frozenset()
+
         def evaluate_prepared_entry(self, index):
             return SimpleNamespace(
                 accepted=True,
@@ -274,6 +284,40 @@ def test_native_adapter_uses_candle_close_as_minimum_availability():
     result = LatestNativeStrategyEvaluator(
         lambda candidate: (prepared, Engine())
     ).evaluate({}, DECISION, timedelta(hours=1))
+    assert result.decision_available_at == datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
+
+
+def test_native_adapter_ignores_unrelated_late_research_block():
+    prepared = SimpleNamespace(
+        timestamp=np.array(["2026-01-02T13:00"], dtype="datetime64[ns]"),
+        decision_available_at=np.array(["2026-01-02T14:00"], dtype="datetime64[ns]"),
+        strategy_interval=pd.Timedelta(hours=1),
+        research=(
+            SimpleNamespace(
+                name="unused",
+                available_at=np.array(["2026-01-02T14:45"], dtype="datetime64[ns]"),
+            ),
+        ),
+        close=np.array([10.0]),
+    )
+
+    class Engine:
+        def required_entry_research_features(self, index):
+            return frozenset()
+
+        def evaluate_prepared_entry(self, index):
+            return SimpleNamespace(
+                accepted=True,
+                strategy_profile_key="BULL_LONG",
+                side="LONG",
+                reference_price=10.0,
+                detail="passed",
+            )
+
+    result = LatestNativeStrategyEvaluator(
+        lambda candidate: (prepared, Engine())
+    ).evaluate({}, DECISION, timedelta(hours=1))
+    assert result.accepted
     assert result.decision_available_at == datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
 
 

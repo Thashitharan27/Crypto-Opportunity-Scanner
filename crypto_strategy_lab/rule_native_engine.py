@@ -141,6 +141,23 @@ class NativeLatestEntryDecision:
 class RuleAwareDataLakeProductionBacktestEngine(DataLakeProductionBacktestEngine):
     """Current native runtime with prepared research evidence available to rules."""
 
+    def required_entry_research_features(self, index: int) -> frozenset[str]:
+        """Return prepared research blocks read by Entry/Veto at this row."""
+        context = self._profile_context(index)
+        if context is None:
+            return frozenset()
+        profile = context[3]
+        required: set[str] = set()
+        for rule in profile.entry_rules:
+            indicator = rule.get("indicator")
+            if indicator in _SR_RULE_INDICATORS:
+                required.add("support_resistance")
+            elif indicator in _RESEARCH_NUMERIC_FIELDS:
+                required.add(_RESEARCH_NUMERIC_FIELDS[indicator][0])
+            elif indicator in _RESEARCH_CATEGORICAL_FIELDS:
+                required.add(_RESEARCH_CATEGORICAL_FIELDS[indicator][0])
+        return frozenset(required)
+
     def evaluate_prepared_entry(self, index: int) -> NativeLatestEntryDecision:
         """Evaluate Entry/Veto semantics at one already-causal prepared row.
 

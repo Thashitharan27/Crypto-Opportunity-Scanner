@@ -153,3 +153,16 @@ def test_public_entry_decision_reports_native_post_flip_side():
     assert decision.strategy_profile_key == "BULL_LONG"
     assert decision.side == "SHORT"
     assert decision.reference_price == 100.0
+
+
+def test_public_entry_research_requirements_follow_active_profile_rules():
+    engine = _engine()
+    profile = SimpleNamespace(entry_rules=(
+        {"indicator": "OI_CHANGE_PCT_1H"},
+        {"indicator": "SR_NEAR_SUPPORT"},
+        {"indicator": "ADX"},
+    ))
+    engine._profile_context = lambda index: ("BULL", "LONG", "BULL_LONG", profile)
+    assert engine.required_entry_research_features(0) == frozenset({
+        "futures_positioning", "support_resistance",
+    })

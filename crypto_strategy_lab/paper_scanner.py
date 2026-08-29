@@ -118,18 +118,34 @@ class LatestNativeStrategyEvaluator:
         effective_available_at = np.maximum(
             prepared.decision_available_at, completed_at
         )
-        for research in prepared.research:
-            if len(research.available_at) != len(effective_available_at):
+        research_by_name = {research.name: research for research in prepared.research}
+        if len(research_by_name) != len(prepared.research):
+            raise ValueError("prepared research block names are not unique")
+        for research in research_by_name.values():
+            if len(research.available_at) != len(prepared.timestamp):
                 raise ValueError(
                     "research availability is not aligned to strategy rows"
                 )
-            effective_available_at = np.maximum(
-                effective_available_at, research.available_at
-            )
-        causal = np.flatnonzero(effective_available_at <= decision64)
-        if not len(causal):
+        base_causal = np.flatnonzero(effective_available_at <= decision64)
+        index = None
+        for candidate_index in reversed(base_causal.tolist()):
+            required = engine.required_entry_research_features(candidate_index)
+            missing = required - research_by_name.keys()
+            if missing:
+                raise ValueError(
+                    f"required prepared research blocks are missing: {sorted(missing)}"
+                )
+            row_available = effective_available_at[candidate_index]
+            for name in required:
+                row_available = np.maximum(
+                    row_available, research_by_name[name].available_at[candidate_index]
+                )
+            if row_available <= decision64:
+                index = candidate_index
+                effective_available_at[candidate_index] = row_available
+                break
+        if index is None:
             raise ValueError("no completed causal strategy candle")
-        index = int(causal[-1])
         available = _from_np(effective_available_at[index])
         candle = _from_np(prepared.timestamp[index])
         if available > _utc(decision_time):
