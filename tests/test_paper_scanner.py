@@ -252,6 +252,31 @@ def test_native_adapter_excludes_row_with_post_decision_research_value():
     assert result.decision_available_at == datetime(2026, 1, 2, 13, 0, tzinfo=UTC)
 
 
+def test_native_adapter_uses_candle_close_as_minimum_availability():
+    prepared = SimpleNamespace(
+        timestamp=np.array(["2026-01-02T13:00"], dtype="datetime64[ns]"),
+        decision_available_at=np.array(["2026-01-02T13:00"], dtype="datetime64[ns]"),
+        strategy_interval=pd.Timedelta(hours=1),
+        research=(),
+        close=np.array([10.0]),
+    )
+
+    class Engine:
+        def evaluate_prepared_entry(self, index):
+            return SimpleNamespace(
+                accepted=True,
+                strategy_profile_key="BULL_LONG",
+                side="LONG",
+                reference_price=10.0,
+                detail="passed",
+            )
+
+    result = LatestNativeStrategyEvaluator(
+        lambda candidate: (prepared, Engine())
+    ).evaluate({}, DECISION, timedelta(hours=1))
+    assert result.decision_available_at == datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
+
+
 def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
     sleeps = []
     app, scan = runner(

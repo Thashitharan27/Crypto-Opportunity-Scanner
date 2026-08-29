@@ -113,7 +113,11 @@ class LatestNativeStrategyEvaluator:
         decision64 = np.datetime64(_utc(decision_time).replace(tzinfo=None), "ns")
         interval64 = pd.Timedelta(prepared.strategy_interval).to_timedelta64()
         completed_at = prepared.timestamp + interval64
-        effective_available_at = prepared.decision_available_at.copy()
+        # A decision can never be available before its candle is complete, even
+        # if every underlying feature advertises an earlier source timestamp.
+        effective_available_at = np.maximum(
+            prepared.decision_available_at, completed_at
+        )
         for research in prepared.research:
             if len(research.available_at) != len(effective_available_at):
                 raise ValueError(
@@ -122,9 +126,7 @@ class LatestNativeStrategyEvaluator:
             effective_available_at = np.maximum(
                 effective_available_at, research.available_at
             )
-        causal = np.flatnonzero(
-            (completed_at <= decision64) & (effective_available_at <= decision64)
-        )
+        causal = np.flatnonzero(effective_available_at <= decision64)
         if not len(causal):
             raise ValueError("no completed causal strategy candle")
         index = int(causal[-1])
