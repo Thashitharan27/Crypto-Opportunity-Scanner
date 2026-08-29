@@ -223,3 +223,21 @@ def test_discovery_ranks_must_be_unique_and_contiguous(tmp_path):
         publish_opportunity_scan(
             tmp_path, replace(package, discovery=invalid_discovery)
         )
+
+
+def test_task5_request_boundaries_must_match_task3(tmp_path):
+    package = _package()
+    candidate = package.final_candidates.candidates[0]
+    foreign_request = replace(
+        candidate.strategy_data_request,
+        end=candidate.strategy_data_request.end - timedelta(hours=1),
+    )
+    candidates = replace(
+        package.final_candidates,
+        candidates=(replace(candidate, strategy_data_request=foreign_request),),
+    )
+
+    with pytest.raises(ValueError, match="Task 5 provenance mismatch"):
+        publish_opportunity_scan(
+            tmp_path, replace(package, final_candidates=candidates)
+        )

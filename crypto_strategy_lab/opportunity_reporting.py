@@ -172,6 +172,7 @@ class OpportunityScanPublisher:
                 "reference_available_at": r.available_at if historical else None, "discovery_source_identity": r.source_identity if historical else None})
         snapshot.sort(key=lambda x: x["symbol"])
         rank_by = {r["symbol"]: r["discovery_rank"] for r in snapshot}
+        snapshot_by = {r["symbol"]: r for r in snapshot}
         acquisition_by = {a.symbol.upper(): a for a in package.candle_acquisition.symbols}
         if len(acquisition_by) != len(package.candle_acquisition.symbols):
             raise ValueError("Task 3 symbols must be unique")
@@ -225,7 +226,26 @@ class OpportunityScanPublisher:
         final_rows = []
         for c in finals:
             a = acquisition_by[c.symbol.upper()]
-            if c.discovery_timestamp != decision or c.discovery_rank != rank_by[c.symbol.upper()] or c.strategy_source_identity != (a.source_signature.cache_identity() if a.source_signature else None) or c.discovery_mode.value != mode or c.discovery_contract != contract: raise ValueError("Task 5 provenance mismatch")
+            request = c.strategy_data_request
+            if (c.discovery_timestamp != decision
+                    or c.discovery_rank != rank_by[c.symbol.upper()]
+                    or c.discovery_source_identity
+                    != snapshot_by[c.symbol.upper()]["discovery_source_identity"]
+                    or c.strategy_interval != a.strategy_interval
+                    or request.strategy_interval != a.strategy_interval
+                    or request.start != a.requested_start
+                    or request.end != a.requested_end
+                    or request.symbol.strip().upper() != c.symbol.upper()
+                    or request.exchange.lower() != package.exchange.lower()
+                    or request.market.value != package.market.lower()
+                    or request.datasets != (DatasetKind.KLINES,)
+                    or c.strategy_source_signature != a.source_signature
+                    or c.strategy_source_identity
+                    != (a.source_signature.cache_identity()
+                        if a.source_signature else None)
+                    or c.discovery_mode.value != mode
+                    or c.discovery_contract != contract):
+                raise ValueError("Task 5 provenance mismatch")
             selected_model = package.final_candidates.config.opportunity_model
             candidate_model = (
                 c.opportunity_model_name,
@@ -252,8 +272,8 @@ class OpportunityScanPublisher:
                         or _utc(score.decision_time) != decision
                         or score.source_identity != c.strategy_source_identity):
                     raise ValueError("Task 5 selected score disagrees with Task 4")
-            flat = c.serializable(); metrics = flat.pop("impact_metrics"); request = flat.pop("strategy_data_request")
-            final_rows.append({**flat, **{f"impact_{k}": v for k,v in metrics.items()}, **{f"strategy_request_{k}": v for k,v in request.items()}})
+            flat = c.serializable(); metrics = flat.pop("impact_metrics"); request_row = flat.pop("strategy_data_request")
+            final_rows.append({**flat, **{f"impact_{k}": v for k,v in metrics.items()}, **{f"strategy_request_{k}": v for k,v in request_row.items()}})
         final_symbols = {c.symbol.upper() for c in finals}
         rich_symbols = {s.symbol.upper(): s for s in package.rich_data.symbols}
         if len(rich_symbols) != len(package.rich_data.symbols):
