@@ -47,6 +47,7 @@ class PaperScannerConfig:
     state_path: Path
     audit_log_path: Path
     max_signal_history: int = 10_000
+    signal_history_retention: timedelta = timedelta(days=365)
 
     def __post_init__(self) -> None:
         if self.scan_interval <= timedelta(0):
@@ -61,6 +62,8 @@ class PaperScannerConfig:
             raise ValueError("retry_backoff must be between zero and one hour")
         if self.max_signal_history <= 0:
             raise ValueError("max_signal_history must be positive")
+        if self.signal_history_retention <= self.stale_strategy_candle_limit:
+            raise ValueError("signal_history_retention must exceed strategy staleness")
         object.__setattr__(self, "state_path", Path(self.state_path))
         object.__setattr__(self, "audit_log_path", Path(self.audit_log_path))
 
@@ -243,6 +246,10 @@ class PaperScannerRunner:
                 len(completed.final),
                 status=CycleStatus.STALE_DISCOVERY,
             )
+        # Retention is based on the authoritative signal-candle time.  It is
+        # strictly longer than the strategy staleness window, so an identity is
+        # never removed while the corresponding signal could still be emitted.
+        self._prune_expired_signal_history(decision)
         evaluated = fresh = stale = signals = duplicates = entries = 0
         for row in completed.final.sort_values("final_rank").to_dict("records"):
             symbol = str(row["symbol"])
@@ -297,6 +304,30 @@ class PaperScannerRunner:
                     signal_id=signal.signal_id,
                 )
                 continue
+            if len(self.state.emitted_signal_ids) >= self.config.max_signal_history:
+                # Never evict a still-live duplicate key just to satisfy the
+                # bound.  Fail this cycle closed and preserve the prior ledger.
+                self.audit.append(
+                    "STATE_CAPACITY_REACHED",
+                    cycle,
+                    scan_run_id=run_id,
+                    symbol=symbol,
+                    signal_id=signal.signal_id,
+                    detail=f"max_signal_history={self.config.max_signal_history}",
+                )
+                return self._finish(
+                    cycle,
+                    run_id,
+                    decision,
+                    len(completed.final),
+                    evaluated,
+                    fresh,
+                    stale,
+                    signals,
+                    duplicates,
+                    entries,
+                    status=CycleStatus.FAILED,
+                )
             self.audit.append(
                 "SIGNAL_PENDING",
                 cycle,
@@ -308,12 +339,6 @@ class PaperScannerRunner:
             self.state.paper_entries.append(
                 {"record_type": "PAPER_ENTRY", **asdict(signal)}
             )
-            if len(self.state.emitted_signal_ids) > self.config.max_signal_history:
-                drop = (
-                    len(self.state.emitted_signal_ids) - self.config.max_signal_history
-                )
-                del self.state.emitted_signal_ids[:drop]
-                del self.state.paper_entries[:drop]
             self.store.save(self.state)
             entries += 1
             self.audit.append(
@@ -342,6 +367,21 @@ class PaperScannerRunner:
             duplicates,
             entries,
         )
+
+    def _prune_expired_signal_history(self, decision: datetime) -> None:
+        cutoff = decision - self.config.signal_history_retention
+        retained_entries = [
+            entry
+            for entry in self.state.paper_entries
+            if _parse(entry["signal_candle_timestamp"]) >= cutoff
+        ]
+        if len(retained_entries) == len(self.state.paper_entries):
+            return
+        self.state.paper_entries[:] = retained_entries
+        self.state.emitted_signal_ids[:] = [
+            str(entry["signal_id"]) for entry in retained_entries
+        ]
+        self.store.save(self.state)
 
     def _signal(self, completed, row, evaluation, decision):
         interval = normalize_binance_interval(str(row["strategy_interval"]))

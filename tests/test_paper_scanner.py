@@ -95,6 +95,8 @@ def runner(
     stale_market=timedelta(minutes=5),
     stale_strategy=timedelta(hours=2),
     sleeps=None,
+    max_history=10_000,
+    retention=timedelta(days=365),
 ):
     config = PaperScannerConfig(
         timedelta(seconds=1),
@@ -104,6 +106,8 @@ def runner(
         timedelta(seconds=2),
         tmp_path / "state.json",
         tmp_path / "audit.jsonl",
+        max_history,
+        retention,
     )
     scan = scan or Scanner(completed())
     return PaperScannerRunner(
@@ -256,3 +260,29 @@ def test_non_entry_is_audited_without_ledger_record(tmp_path):
     app, _ = runner(tmp_path, evaluator=Evaluator(accepted=False))
     assert app.run_once().new_paper_entries == 0
     assert "NO_STRATEGY_ENTRY" in events(tmp_path / "audit.jsonl")
+
+
+def test_history_bound_fails_closed_without_evicting_live_duplicate_key(tmp_path):
+    app, _ = runner(tmp_path, max_history=1)
+    assert app.run_once().new_paper_entries == 1
+    original_id = app.state.emitted_signal_ids[0]
+    app.evaluator.candle = datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
+    result = app.run_once()
+    assert result.status is CycleStatus.FAILED
+    assert app.state.emitted_signal_ids == [original_id]
+    assert len(app.state.paper_entries) == 1
+    assert "STATE_CAPACITY_REACHED" in events(tmp_path / "audit.jsonl")
+
+
+def test_retention_can_only_prune_keys_older_than_stale_window(tmp_path):
+    with pytest.raises(ValueError, match="must exceed strategy staleness"):
+        PaperScannerConfig(
+            timedelta(seconds=1),
+            timedelta(minutes=1),
+            timedelta(hours=2),
+            0,
+            timedelta(0),
+            tmp_path / "state",
+            tmp_path / "audit",
+            signal_history_retention=timedelta(hours=2),
+        )
