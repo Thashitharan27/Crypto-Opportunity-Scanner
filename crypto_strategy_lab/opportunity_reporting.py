@@ -202,8 +202,22 @@ class OpportunityScanPublisher:
         artifacts = {}
         for name, rows in csv_rows.items():
             path = run_dir / f"{name}.csv"; _write_csv(path, columns[name], rows); artifacts[name] = catalog_entry(path, run_dir, "csv", len(rows))
-        if score_rows:
-            path = run_dir / "opportunity_scores.csv"; _write_csv(path, list(score_rows[0]), score_rows); artifacts["opportunity_scores"] = catalog_entry(path, run_dir, "csv", len(score_rows))
+        if package.scoring_result is not None:
+            score_columns = list(score_rows[0]) if score_rows else [
+                    "symbol", "discovery_rank", "decision_time", "strategy_interval",
+                    "feature_timestamp", "available_at", "raw_components",
+                    "normalized_components", "component_weights", "model_name",
+                    "model_version", "score", "model_rank", "atr", "atr_pct", "adx",
+                    "di_spread", "previous_di_spread", "di_pressure_delta",
+                    "di_pressure_state", "signed_momentum_24h", "absolute_momentum_24h",
+                    "market_regime", "source_identity", "feature_versions", "status",
+                    "unscorable_reason",
+                ]
+            path = run_dir / "opportunity_scores.csv"
+            _write_csv(path, score_columns, score_rows)
+            artifacts["opportunity_scores"] = catalog_entry(
+                path, run_dir, "csv", len(score_rows)
+            )
         source_path = provenance / "source_identities.json"; atomic_json(source_path, source_doc); artifacts["source_identities"] = catalog_entry(source_path, run_dir, "json", len(sources))
         counts = {"universe_count": len(snapshot), "discovery_eligible_count": sum(bool(r["eligible"]) for r in snapshot), "discovery_rejected_count": sum(not r["eligible"] for r in snapshot), "preliminary_candidate_count": len(prelim), "final_candidate_count": len(finals)}
         summary = {"run_type": RunType.OPPORTUNITY_SCAN.value, "discovery_mode": mode, "scan_timestamp": scan_timestamp.isoformat(), "decision_timestamp": decision.isoformat(), **counts,
