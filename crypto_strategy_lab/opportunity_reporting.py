@@ -140,6 +140,8 @@ class OpportunityScanPublisher:
             if package.final_candidates.config.opportunity_model is not None: raise ValueError("selected model requires explicit scoring")
         else:
             if package.scoring_config is None: raise ValueError("scoring result requires explicit scoring config")
+            if _utc(package.scoring_result.decision_time) != decision:
+                raise ValueError("Task 4 result decision time must match discovery")
             allowed = {(m.name, m.version) for m in package.scoring_config.models}
             for score in package.scoring_result.rows:
                 if _utc(score.decision_time) != decision or score.strategy_interval != package.scoring_config.strategy_interval or (score.model_name, score.model_version) not in allowed: raise ValueError("Task 4 decision/interval/model mismatch")
@@ -159,8 +161,23 @@ class OpportunityScanPublisher:
             if c.discovery_timestamp != decision or c.discovery_rank != rank_by[c.symbol.upper()] or c.strategy_source_identity != (a.source_signature.cache_identity() if a.source_signature else None) or c.discovery_mode.value != mode or c.discovery_contract != contract: raise ValueError("Task 5 provenance mismatch")
             flat = c.serializable(); metrics = flat.pop("impact_metrics"); request = flat.pop("strategy_data_request")
             final_rows.append({**flat, **{f"impact_{k}": v for k,v in metrics.items()}, **{f"strategy_request_{k}": v for k,v in request.items()}})
+        final_symbols = {c.symbol.upper() for c in finals}
         rich_symbols = {s.symbol.upper(): s for s in package.rich_data.symbols}
-        if set(rich_symbols) != {c.symbol.upper() for c in finals}: raise ValueError("Task 6 symbol set must equal final candidates")
+        if len(rich_symbols) != len(package.rich_data.symbols):
+            raise ValueError("Task 6 symbols must be unique")
+        if set(rich_symbols) != final_symbols:
+            raise ValueError("Task 6 symbol set must equal final candidates")
+        plan_symbols = {
+            requirement.symbol.strip().upper()
+            for requirement in package.rich_data.plan.requirements
+        }
+        for feature_plan in package.rich_data.plan.features:
+            plan_symbols.update(
+                requirement.symbol.strip().upper()
+                for requirement in feature_plan.requirements
+            )
+        if not plan_symbols <= final_symbols:
+            raise ValueError("Task 6 plan contains a non-final candidate symbol")
         rich_rows = []
         for c in finals:
             s = rich_symbols[c.symbol.upper()]

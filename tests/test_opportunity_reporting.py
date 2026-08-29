@@ -1,5 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
 
 from crypto_strategy_lab.data.binance.selective_acquisition import (
     AcquisitionState,
@@ -62,3 +66,26 @@ def test_executed_scoring_publishes_artifact_even_when_it_has_no_rows(tmp_path):
     assert manifest["artifacts"]["opportunity_scores"]["rows"] == 0
     path = artifact_path(run_dir, manifest, "opportunity_scores")
     assert path.read_text(encoding="utf-8").startswith("symbol,discovery_rank,")
+
+
+def test_scoring_result_boundary_must_match_discovery(tmp_path):
+    package = _package()
+    package = replace(
+        package,
+        scoring_result=OpportunityScoringResult(NOW - timedelta(hours=1), ()),
+    )
+
+    with pytest.raises(ValueError, match="Task 4 result decision time"):
+        publish_opportunity_scan(tmp_path, package)
+
+
+def test_task6_plan_cannot_reference_a_non_final_symbol(tmp_path):
+    package = _package()
+    foreign = SimpleNamespace(symbol="ETHUSDT")
+    rich_data = replace(
+        package.rich_data,
+        plan=RichDataAcquisitionPlan((foreign,), ()),
+    )
+
+    with pytest.raises(ValueError, match="non-final candidate symbol"):
+        publish_opportunity_scan(tmp_path, replace(package, rich_data=rich_data))
