@@ -221,6 +221,11 @@ class OpportunityScanPublisher:
             if s.final_rank != c.final_rank or s.strategy_source_identity != c.strategy_source_identity: raise ValueError("Task 6 candidate provenance mismatch")
             readiness = {f.feature_name: f.readiness for f in s.features}
             for d in sorted(s.datasets, key=lambda x: (x.requirement.dataset.value, x.requirement.interval or "")):
+                if (d.requirement.symbol.strip().upper() != s.symbol.upper()
+                        or d.requirement.final_rank != s.final_rank):
+                    raise ValueError(
+                        "Task 6 dataset requirement candidate provenance mismatch"
+                    )
                 sig = _signature(d.source_signature)
                 if d.state in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED} and (not sig or d.source_identity != sig["cache_identity"]): raise ValueError("Task 6 source identity mismatch")
                 if sig: sources.append({"symbol": s.symbol.upper(), "role": "rich_data", **sig,

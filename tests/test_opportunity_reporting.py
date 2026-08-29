@@ -147,3 +147,22 @@ def test_selected_model_cannot_be_omitted_from_task5_candidate(tmp_path):
 
     with pytest.raises(ValueError, match="candidate model disagrees"):
         publish_opportunity_scan(tmp_path, package)
+
+
+def test_task6_dataset_requirement_must_belong_to_its_candidate(tmp_path):
+    package = _package()
+    symbol_result = package.rich_data.symbols[0]
+    foreign_requirement = SimpleNamespace(
+        symbol="ETHUSDT",
+        final_rank=symbol_result.final_rank,
+        dataset=DatasetKind.KLINES,
+        interval="1h",
+    )
+    foreign_dataset = SimpleNamespace(requirement=foreign_requirement)
+    rich_data = replace(
+        package.rich_data,
+        symbols=(replace(symbol_result, datasets=(foreign_dataset,)),),
+    )
+
+    with pytest.raises(ValueError, match="candidate provenance mismatch"):
+        publish_opportunity_scan(tmp_path, replace(package, rich_data=rich_data))
