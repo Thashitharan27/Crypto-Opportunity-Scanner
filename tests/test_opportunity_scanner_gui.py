@@ -80,16 +80,29 @@ def test_completed_scan_is_loaded_only_through_verified_catalog(tmp_path):
 def test_scored_preliminary_rows_join_published_model_rank_and_score(tmp_path):
     _published_run(tmp_path)
     scores=tmp_path/"opportunity_scores.csv"
-    scores.write_text("symbol,model_rank,score\nBTCUSDT,2,0.75\n")
+    scores.write_text(
+        "symbol,model_name,model_version,model_rank,score\n"
+        "BTCUSDT,legacy_volatility,1,1,0.99\n"
+        "BTCUSDT,balanced_activity,1,2,0.75\n"
+    )
     manifest=json.loads((tmp_path/"run_manifest.json").read_text())
     manifest["artifacts"]["opportunity_scores"]={
-        "path":scores.name,"format":"csv","schema_version":1,"rows":1,
+        "path":scores.name,"format":"csv","schema_version":1,"rows":2,
         "bytes":scores.stat().st_size,"sha256":file_sha256(scores),
     }
-    manifest["config"]={"scoring":{"models":[{"name":"balanced_activity","version":"1"}]}}
+    manifest["config"]={
+        "scoring":{"models":[
+            {"name":"legacy_volatility","version":"1"},
+            {"name":"balanced_activity","version":"1"},
+        ]},
+        "final_candidates":{"opportunity_model":{
+            "name":"balanced_activity","version":"1",
+        }},
+    }
     (tmp_path/"run_manifest.json").write_text(json.dumps(manifest))
     row=OpportunityScanResultReader().read(tmp_path).preliminary.iloc[0]
     assert row["model_rank"] == 2 and row["score"] == .75
+    assert len(OpportunityScanResultReader().read(tmp_path).preliminary) == 1
 
 
 def test_application_service_invokes_pipeline_once_then_reads_publication(tmp_path):

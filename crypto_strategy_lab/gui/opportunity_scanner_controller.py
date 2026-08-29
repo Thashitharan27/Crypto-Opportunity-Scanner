@@ -113,8 +113,27 @@ class OpportunityScanResultReader:
                                     "quote_volume", "spread_percent") if c in universe]
             preliminary = preliminary.merge(universe[metrics], on="symbol", how="left")
         if not preliminary.empty and not scores.empty:
-            selected = scores[["symbol", "model_rank", "score"]]
-            preliminary = preliminary.merge(selected, on="symbol", how="left")
+            selected_model = (
+                manifest.get("config", {})
+                .get("final_candidates", {})
+                .get("opportunity_model")
+            )
+            selected = scores
+            if isinstance(selected_model, dict):
+                selected = selected.loc[
+                    (selected["model_name"] == selected_model.get("name"))
+                    & (selected["model_version"].astype(str)
+                       == str(selected_model.get("version")))
+                ]
+            # A valid Task-7 package has at most one selected-model score per
+            # symbol.  Enforce that boundary rather than multiplying GUI rows
+            # when the Task-4 artifact also contains comparison models.
+            if selected["symbol"].duplicated().any():
+                raise ValueError("selected opportunity model has duplicate symbol scores")
+            preliminary = preliminary.merge(
+                selected[["symbol", "model_rank", "score"]],
+                on="symbol", how="left",
+            )
         return CompletedOpportunityScan(directory, manifest, summary, universe, preliminary,
                                         csv("final_candidates"), csv("rich_data_readiness"), scores)
 
