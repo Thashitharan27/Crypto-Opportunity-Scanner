@@ -11,18 +11,39 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
-from threading import Event
 from typing import Callable
 
 import pandas as pd
 
 from crypto_strategy_lab.data.binance.historical_discovery import HistoricalDiscoveryConfig
-from crypto_strategy_lab.data.binance.selective_acquisition import SelectiveCandleAcquisitionConfig
-from crypto_strategy_lab.data.binance.universe import DiscoveryConfig
-from crypto_strategy_lab.data.schemas import MarketKind
-from crypto_strategy_lab.final_candidates import FinalCandidateBoundaryConfig, OpportunityModelRef
-from crypto_strategy_lab.opportunity_scoring import OpportunityScoringConfig, OpportunityScoringModelDefinition
-from crypto_strategy_lab.rich_data_acquisition import RichDataAcquisitionConfig
+from crypto_strategy_lab.data.binance.historical_discovery import (
+    DiscoveryDecisionTime, discover_historical_universe,
+)
+from crypto_strategy_lab.data.binance.selective_acquisition import (
+    AcquisitionState, BinanceDataHubBackend, SelectiveCandleAcquirer,
+    SelectiveCandleAcquisitionConfig,
+)
+from crypto_strategy_lab.data.binance.universe import (
+    BinanceUsdMDiscoveryClient, DiscoveryConfig, scan_universe,
+)
+from crypto_strategy_lab.data.query import DataRequest
+from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
+from crypto_strategy_lab.data.store import MarketDataStore
+from crypto_strategy_lab.data.timing import interval_to_timedelta
+from crypto_strategy_lab.features import production_feature_registry
+from crypto_strategy_lab.final_candidates import (
+    FinalCandidateBoundaryConfig, OpportunityModelRef, build_final_candidate_set,
+)
+from crypto_strategy_lab.opportunity_reporting import (
+    OpportunityScanPublicationInput, publish_opportunity_scan,
+)
+from crypto_strategy_lab.opportunity_scoring import (
+    OpportunityScoringConfig, OpportunityScoringModelDefinition,
+    score_opportunities, snapshot_from_registry_features,
+)
+from crypto_strategy_lab.rich_data_acquisition import (
+    RichDataAcquisitionConfig, SelectiveRichDataAcquirer,
+)
 from crypto_strategy_lab.run_manifest import artifact_path, load_completed_manifest
 
 
@@ -91,6 +112,9 @@ class OpportunityScanResultReader:
             metrics = [c for c in ("symbol", "range_percent", "absolute_price_change_percent",
                                     "quote_volume", "spread_percent") if c in universe]
             preliminary = preliminary.merge(universe[metrics], on="symbol", how="left")
+        if not preliminary.empty and not scores.empty:
+            selected = scores[["symbol", "model_rank", "score"]]
+            preliminary = preliminary.merge(selected, on="symbol", how="left")
         return CompletedOpportunityScan(directory, manifest, summary, universe, preliminary,
                                         csv("final_candidates"), csv("rich_data_readiness"), scores)
 
@@ -114,6 +138,123 @@ class UnconfiguredOpportunityScannerService(OpportunityScannerApplicationService
         def unavailable(_request, _cancelled):
             raise RuntimeError("Opportunity scanner pipeline service is not configured")
         super().__init__(unavailable)
+
+
+class Task1To7OpportunityScanner:
+    """Small orchestration facade over the existing Task 1--7 contracts."""
+
+    SCORING_FEATURES = (
+        "core_directional", "policy_market_context", "opportunity_activity",
+    )
+
+    def __init__(self, store: MarketDataStore, backend: BinanceDataHubBackend,
+                 output_root: Path, *, live_client=None, registry=None,
+                 now: Callable[[], datetime] | None = None):
+        self.store = store
+        self.backend = backend
+        self.output_root = Path(output_root)
+        self.live_client = live_client or BinanceUsdMDiscoveryClient()
+        self.registry = registry or production_feature_registry()
+        self.now = now or (lambda: datetime.now(timezone.utc))
+
+    def __call__(self, request: OpportunityScanRequest,
+                 cancelled: Callable[[], bool]) -> Path:
+        if request.mode == "LIVE":
+            discovery = scan_universe(
+                self.live_client, request.live_discovery, now=self.now
+            )
+            discovery_config = request.live_discovery
+            decision = self._live_decision(discovery)
+        else:
+            decision = request.decision_time
+            discovery = discover_historical_universe(
+                self.store, self._historical_symbols(),
+                DiscoveryDecisionTime(decision), request.historical_discovery,
+                market=request.market,
+            )
+            discovery_config = None
+
+        interval = interval_to_timedelta(request.candle_acquisition.strategy_interval)
+        required_bars = max(
+            1, self.registry.effective_warmup(self.SCORING_FEATURES)
+        )
+        candle_start = decision - interval * (required_bars + 1)
+        candles = SelectiveCandleAcquirer(
+            self.store, self.backend, request.candle_acquisition
+        ).acquire(discovery, candle_start, decision, cancelled=cancelled)
+
+        scoring = self._score(request, candles, decision) if request.scoring else None
+        final = build_final_candidate_set(
+            discovery, candles, scoring, request.final_candidates
+        )
+        rich = SelectiveRichDataAcquirer(
+            self.store, self.backend, request.rich_data, self.registry
+        ).acquire(final, cancelled=cancelled)
+        package = OpportunityScanPublicationInput(
+            scan_timestamp=self.now(), discovery=discovery,
+            discovery_config=discovery_config, candle_acquisition=candles,
+            candle_acquisition_config=request.candle_acquisition,
+            scoring_result=scoring, scoring_config=request.scoring,
+            final_candidates=final, rich_data=rich,
+            rich_data_config=request.rich_data,
+        )
+        return publish_opportunity_scan(self.output_root, package)
+
+    @staticmethod
+    def _live_decision(discovery) -> datetime:
+        timestamps = {row.discovery_timestamp for row in discovery}
+        if len(timestamps) != 1:
+            raise ValueError("live discovery did not produce one decision timestamp")
+        return next(iter(timestamps))
+
+    def _historical_symbols(self) -> tuple[str, ...]:
+        rows = self.store.catalog.inventory(
+            self.store.raw_root, market=MarketKind.FUTURES_UM
+        )
+        return tuple(sorted({
+            str(row["symbol"]).strip().upper() for row in rows
+            if row.get("symbol")
+        }))
+
+    def _score(self, request, candles, decision):
+        snapshots = []
+        for acquired in candles.symbols:
+            if acquired.state not in {AcquisitionState.REUSED, AcquisitionState.ACQUIRED}:
+                continue
+            data_request = DataRequest(
+                acquired.symbol, acquired.requested_start, acquired.requested_end,
+                acquired.strategy_interval, datasets=(DatasetKind.KLINES,),
+                market=request.market,
+            )
+            frame = self.store.load_dataset(
+                data_request, DatasetKind.KLINES,
+                interval=acquired.strategy_interval,
+            )
+            frames = self.registry.execute(
+                self.SCORING_FEATURES, data_request,
+                {DatasetKind.KLINES: frame},
+                source_identities={
+                    DatasetKind.KLINES: acquired.source_signature.cache_identity()
+                },
+            )
+            snapshot = snapshot_from_registry_features(
+                acquired.symbol, acquired.rank, decision,
+                acquired.strategy_interval, frames, acquired.source_signature,
+            )
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return score_opportunities(snapshots, decision, request.scoring)
+
+
+def create_opportunity_scanner_service(raw_root: Path, cache_root: Path,
+                                       output_root: Path, **pipeline_options):
+    """Construct the runnable production Task 1--7 GUI service."""
+    store = MarketDataStore(Path(raw_root), Path(cache_root))
+    backend = BinanceDataHubBackend(Path(raw_root))
+    pipeline = Task1To7OpportunityScanner(
+        store, backend, Path(output_root), **pipeline_options
+    )
+    return OpportunityScannerApplicationService(pipeline)
 
 
 def build_request(*, mode: str, decision_time: datetime | None,

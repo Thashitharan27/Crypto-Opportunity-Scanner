@@ -15,7 +15,8 @@ from crypto_strategy_lab.run_manifest import (OPPORTUNITY_SCAN_ARTIFACT_CONTRACT
     OPPORTUNITY_SCAN_ARTIFACT_VERSION, RUN_MANIFEST_CONTRACT, RUN_MANIFEST_VERSION,
     RunArtifactError, file_sha256)
 from crypto_strategy_lab.gui.opportunity_scanner_controller import (
-    OpportunityScanResultReader, OpportunityScannerApplicationService, build_request)
+    OpportunityScanResultReader, OpportunityScannerApplicationService,
+    Task1To7OpportunityScanner, build_request, create_opportunity_scanner_service)
 
 
 def test_gui_values_map_to_native_task_configs():
@@ -76,6 +77,21 @@ def test_completed_scan_is_loaded_only_through_verified_catalog(tmp_path):
         OpportunityScanResultReader().read(tmp_path)
 
 
+def test_scored_preliminary_rows_join_published_model_rank_and_score(tmp_path):
+    _published_run(tmp_path)
+    scores=tmp_path/"opportunity_scores.csv"
+    scores.write_text("symbol,model_rank,score\nBTCUSDT,2,0.75\n")
+    manifest=json.loads((tmp_path/"run_manifest.json").read_text())
+    manifest["artifacts"]["opportunity_scores"]={
+        "path":scores.name,"format":"csv","schema_version":1,"rows":1,
+        "bytes":scores.stat().st_size,"sha256":file_sha256(scores),
+    }
+    manifest["config"]={"scoring":{"models":[{"name":"balanced_activity","version":"1"}]}}
+    (tmp_path/"run_manifest.json").write_text(json.dumps(manifest))
+    row=OpportunityScanResultReader().read(tmp_path).preliminary.iloc[0]
+    assert row["model_rank"] == 2 and row["score"] == .75
+
+
 def test_application_service_invokes_pipeline_once_then_reads_publication(tmp_path):
     calls=[]
     service=OpportunityScannerApplicationService(lambda request,cancelled:(calls.append(request) or _published_run(tmp_path)))
@@ -84,6 +100,11 @@ def test_application_service_invokes_pipeline_once_then_reads_publication(tmp_pa
         final_size=1,strategy_interval="1h",model=None,enabled_features=())
     assert service.run(request,lambda:False).manifest["run_id"] == "scan-1"
     assert calls == [request]
+
+
+def test_normal_service_factory_installs_real_task_1_to_7_pipeline(tmp_path):
+    service=create_opportunity_scanner_service(tmp_path/"raw",tmp_path/"cache",tmp_path/"runs")
+    assert isinstance(service._run_once,Task1To7OpportunityScanner)
 
 
 def test_workspace_constructs_and_mode_controls_utc_timestamp():
@@ -96,6 +117,15 @@ def test_workspace_constructs_and_mode_controls_utc_timestamp():
         assert not workspace.decision_time.isEnabled()
         workspace.mode.setCurrentIndex(1)
         assert workspace.decision_time.isEnabled()
+        assert not workspace.listing_age.isEnabled()
+        assert not workspace.spread.isEnabled()
+        assert workspace.volume.isEnabled()
         assert workspace.request().decision_time.tzinfo is not None
         assert [workspace.model.itemData(i) for i in range(1,workspace.model.count())] == list(SCORING_MODELS)
     finally: workspace.close()
+
+
+def test_workspace_uses_code_commit_and_has_shutdown_wait_contract():
+    source=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_workspace.py").read_text()
+    assert "m.get('code_commit','—')" in source
+    assert "def closeEvent" in source and "thread.wait()" in source

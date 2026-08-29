@@ -1,13 +1,13 @@
 """Focused Opportunity Scanner QWidget for the active GUI shell."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import timezone
 from decimal import Decimal
 from threading import Event
 
 from PySide6.QtCore import QDateTime, QObject, QThread, Signal, Slot, Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDateTimeEdit, QDoubleSpinBox,
-    QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from crypto_strategy_lab.data.binance.selective_acquisition import SelectiveCandleAcquisitionConfig
@@ -51,7 +51,7 @@ class OpportunityScannerWorkspace(QWidget):
         self.model = QComboBox(); self.model.addItem("Discovery Order / No Opportunity Model", None)
         for definition in SCORING_MODELS: self.model.addItem(f"{definition.name} v{definition.version}", definition)
         self.timeframe = QComboBox(); self.timeframe.addItems(NATIVE_INTERVALS); self.timeframe.setCurrentText(candle_defaults.strategy_interval)
-        for label, widget in (("Market",self.market),("Scan mode",self.mode),("Decision timestamp",self.decision_time),("Minimum listing age (days)",self.listing_age),("Minimum quote volume",self.volume),("Maximum spread (%)",self.spread),("Preliminary shortlist size",self.preliminary_size),("Final candidate size",self.final_size),("Scoring model",self.model),("Strategy timeframe",self.timeframe)): form.addRow(label,widget)
+        for label, widget in (("Market",self.market),("Scan mode",self.mode),("Decision timestamp",self.decision_time),("Minimum listing age (days, Live only)",self.listing_age),("Minimum quote volume",self.volume),("Maximum spread (%, Live only)",self.spread),("Preliminary shortlist size",self.preliminary_size),("Final candidate size",self.final_size),("Scoring model",self.model),("Strategy timeframe",self.timeframe)): form.addRow(label,widget)
         rich = QWidget(); rich_layout = QHBoxLayout(rich); rich_layout.setContentsMargins(0,0,0,0); self.feature_checks = {}
         available = set(production_feature_registry().names())
         for name in RICH_FEATURES:
@@ -63,7 +63,16 @@ class OpportunityScannerWorkspace(QWidget):
         self.summary=QLabel("No completed scan loaded."); self.summary.setWordWrap(True); root.addWidget(self.summary)
         self.tabs=QTabWidget(); self.preliminary_table=QTableWidget(); self.final_table=QTableWidget(); self.readiness_table=QTableWidget()
         self.tabs.addTab(self.preliminary_table,"Preliminary Candidates"); self.tabs.addTab(self.final_table,"Final Candidates"); self.tabs.addTab(self.readiness_table,"Data Readiness"); root.addWidget(self.tabs,1)
-        self.mode.currentIndexChanged.connect(lambda: self.decision_time.setEnabled(self.mode.currentData()=="HISTORICAL")); self.run_button.clicked.connect(self.start_scan); self.cancel_button.clicked.connect(self.cancel_scan)
+        self.mode.currentIndexChanged.connect(self._mode_changed); self.run_button.clicked.connect(self.start_scan); self.cancel_button.clicked.connect(self.cancel_scan)
+        self._mode_changed()
+
+    def _mode_changed(self):
+        historical = self.mode.currentData() == "HISTORICAL"
+        self.decision_time.setEnabled(historical)
+        self.listing_age.setEnabled(not historical)
+        self.spread.setEnabled(not historical)
+        self.listing_age.setToolTip("Live discovery only; Task 2 has no historical listing-date source.")
+        self.spread.setToolTip("Live discovery only; Task 2 uses completed daily candles, not live books.")
 
     def request(self):
         decision = self.decision_time.dateTime().toPython().replace(tzinfo=timezone.utc) if self.mode.currentData()=="HISTORICAL" else None
@@ -87,6 +96,16 @@ class OpportunityScannerWorkspace(QWidget):
     def _thread_finished(self):
         self._thread.deleteLater(); self._thread=None; self._worker=None; self.run_button.setEnabled(True); self.cancel_button.setEnabled(False)
 
+    def closeEvent(self, event):
+        """Cooperatively stop backend work before Qt destroys its QThread."""
+        thread = self._thread
+        if thread is not None and thread.isRunning():
+            self._cancel.set()
+            self.status.setText("Cancelling…")
+            thread.quit()
+            thread.wait()
+        super().closeEvent(event)
+
     @staticmethod
     def _fill(table, frame, columns):
         shown=[c for c in columns if c in frame.columns]; table.clear(); table.setColumnCount(len(shown)); table.setHorizontalHeaderLabels([c.replace("_"," ").title() for c in shown]); table.setRowCount(len(frame))
@@ -97,7 +116,7 @@ class OpportunityScannerWorkspace(QWidget):
 
     def render(self,result):
         s=result.summary; m=result.manifest; scan=m.get("opportunity_scan",{}); hashes=m.get("hashes",{})
-        self.summary.setText(" | ".join((f"Run ID: {m.get('run_id','—')}",f"Scan: {s.get('scan_timestamp','—')}",f"Decision: {s.get('decision_timestamp','—')}",f"Mode: {s.get('discovery_mode','—')}",f"Eligible: {s.get('discovery_eligible_count',0)}",f"Rejected: {s.get('discovery_rejected_count',0)}",f"Preliminary: {s.get('preliminary_candidate_count',0)}",f"Final: {s.get('final_candidate_count',0)}",f"Commit: {m.get('code_commit_sha',m.get('git_commit','—'))}",f"Semantic: {hashes.get('semantic_input_hash','—')}",f"Sources: {scan.get('source_identity_digest','—')}",f"Folder: {result.run_dir}")))
+        self.summary.setText(" | ".join((f"Run ID: {m.get('run_id','—')}",f"Scan: {s.get('scan_timestamp','—')}",f"Decision: {s.get('decision_timestamp','—')}",f"Mode: {s.get('discovery_mode','—')}",f"Eligible: {s.get('discovery_eligible_count',0)}",f"Rejected: {s.get('discovery_rejected_count',0)}",f"Preliminary: {s.get('preliminary_candidate_count',0)}",f"Final: {s.get('final_candidate_count',0)}",f"Commit: {m.get('code_commit','—')}",f"Semantic: {hashes.get('semantic_input_hash','—')}",f"Sources: {scan.get('source_identity_digest','—')}",f"Folder: {result.run_dir}")))
         self._fill(self.preliminary_table,result.preliminary,("discovery_rank","symbol","range_percent","absolute_price_change_percent","quote_volume","spread_percent","model_rank","score"))
         self._fill(self.final_table,result.final,("final_rank","symbol","discovery_rank","opportunity_model_name","opportunity_model_version","opportunity_model_rank","opportunity_score","strategy_interval","quality_status","acquisition_state"))
         self._fill(self.readiness_table,result.readiness,("symbol","feature_name","dataset","feature_readiness","acquisition_state","requiredness_for_feature","quality_status","detail"))
