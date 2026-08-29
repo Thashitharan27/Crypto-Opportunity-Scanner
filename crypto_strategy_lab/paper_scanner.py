@@ -34,6 +34,7 @@ from crypto_strategy_lab.paper_scanner_state import (
 class CycleStatus(str, Enum):
     COMPLETED = "COMPLETED"
     STALE_DISCOVERY = "STALE_DISCOVERY"
+    STALE_STRATEGY_DATA = "STALE_STRATEGY_DATA"
     FAILED = "FAILED"
 
 
@@ -355,6 +356,11 @@ class PaperScannerRunner:
                 symbol=symbol,
                 signal_id=signal.signal_id,
             )
+        status = (
+            CycleStatus.STALE_STRATEGY_DATA
+            if stale and not fresh
+            else CycleStatus.COMPLETED
+        )
         return self._finish(
             cycle,
             run_id,
@@ -366,6 +372,7 @@ class PaperScannerRunner:
             signals,
             duplicates,
             entries,
+            status=status,
         )
 
     def _prune_expired_signal_history(self, decision: datetime) -> None:

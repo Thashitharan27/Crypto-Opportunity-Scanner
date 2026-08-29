@@ -169,6 +169,7 @@ def test_stale_discovery_and_strategy_do_not_emit_or_evaluate_in_wrong_order(tmp
     )
     result = strategy_app.run_once()
     assert (result.stale_candidates, result.new_paper_entries) == (1, 0)
+    assert result.status is CycleStatus.STALE_STRATEGY_DATA
     assert "STALE_STRATEGY_DATA" in events(tmp_path / "strategy" / "audit.jsonl")
 
 
