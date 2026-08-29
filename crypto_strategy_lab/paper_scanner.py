@@ -22,6 +22,7 @@ import pandas as pd
 
 from crypto_strategy_lab.data.timing import normalize_binance_interval
 from crypto_strategy_lab.gui.opportunity_scanner_controller import (
+    OpportunityScanCancelled,
     OpportunityScanRequest,
     OpportunityScannerApplicationService,
 )
@@ -35,6 +36,7 @@ class CycleStatus(str, Enum):
     COMPLETED = "COMPLETED"
     STALE_DISCOVERY = "STALE_DISCOVERY"
     STALE_STRATEGY_DATA = "STALE_STRATEGY_DATA"
+    CANCELLED = "CANCELLED"
     FAILED = "FAILED"
 
 
@@ -203,17 +205,26 @@ class PaperScannerRunner:
             detail=f"version=1 entries={len(self.state.paper_entries)}",
         )
 
-    def run_once(self) -> PaperScanCycleResult:
+    def run_once(
+        self, cancelled: Callable[[], bool] | None = None
+    ) -> PaperScanCycleResult:
+        cancellation_requested = cancelled or (lambda: False)
         cycle = uuid.uuid4().hex
         self.audit.append("SCAN_STARTED", cycle)
         completed = None
         for attempt in range(self.config.api_retry_count + 1):
+            if cancellation_requested():
+                self.audit.append("SCAN_CANCELLED", cycle)
+                return self._finish(cycle, None, None, status=CycleStatus.CANCELLED)
             try:
                 request = self.request_factory()
                 if request.mode != "LIVE":
                     raise ValueError("paper scanner supports LIVE requests only")
-                completed = self.scanner.run(request, lambda: False)
+                completed = self.scanner.run(request, cancellation_requested)
                 break
+            except OpportunityScanCancelled:
+                self.audit.append("SCAN_CANCELLED", cycle)
+                return self._finish(cycle, None, None, status=CycleStatus.CANCELLED)
             except Exception as exc:
                 if attempt >= self.config.api_retry_count or not self.transient_error(
                     exc
@@ -463,7 +474,9 @@ class PaperScannerRunner:
         self.audit.append("RUNTIME_STARTED", "runtime")
         try:
             while not stop_event.is_set():
-                self.run_once()
+                self.run_once(stop_event.is_set)
+                if stop_event.is_set():
+                    break
                 if stop_event.wait(self.config.scan_interval.total_seconds()):
                     break
         finally:

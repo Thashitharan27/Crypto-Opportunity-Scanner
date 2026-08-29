@@ -1,11 +1,15 @@
 from datetime import datetime, timedelta, timezone
 import json
+from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from crypto_strategy_lab.gui.opportunity_scanner_controller import (
+    OpportunityScanCancelled,
+)
 from crypto_strategy_lab.paper_scanner import (
     CycleStatus,
     LatestNativeStrategyEvaluator,
@@ -309,6 +313,25 @@ def test_scheduler_waits_and_stops_without_order_api(tmp_path):
     assert {"RUNTIME_STARTED", "RUNTIME_STOPPED"} <= set(
         events(tmp_path / "audit.jsonl")
     )
+
+
+def test_scheduler_propagates_stop_callback_into_active_scan(tmp_path):
+    stop = Event()
+
+    class CancellingScanner:
+        calls = 0
+
+        def run(self, request, cancelled):
+            self.calls += 1
+            stop.set()
+            assert cancelled()
+            raise OpportunityScanCancelled("stopped")
+
+    app, scanner = runner(tmp_path, scan=CancellingScanner())
+    app.run_forever(stop)
+    assert scanner.calls == 1
+    assert app.state.last_completed_cycle["status"] is CycleStatus.CANCELLED
+    assert "SCAN_CANCELLED" in events(tmp_path / "audit.jsonl")
 
 
 def test_non_entry_is_audited_without_ledger_record(tmp_path):
