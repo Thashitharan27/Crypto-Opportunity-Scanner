@@ -111,11 +111,24 @@ class LatestNativeStrategyEvaluator:
     ) -> StrategyEvaluation:
         prepared, engine = self.engine_builder(candidate)
         decision64 = np.datetime64(_utc(decision_time).replace(tzinfo=None), "ns")
-        causal = np.flatnonzero(prepared.decision_available_at <= decision64)
+        interval64 = pd.Timedelta(prepared.strategy_interval).to_timedelta64()
+        completed_at = prepared.timestamp + interval64
+        effective_available_at = prepared.decision_available_at.copy()
+        for research in prepared.research:
+            if len(research.available_at) != len(effective_available_at):
+                raise ValueError(
+                    "research availability is not aligned to strategy rows"
+                )
+            effective_available_at = np.maximum(
+                effective_available_at, research.available_at
+            )
+        causal = np.flatnonzero(
+            (completed_at <= decision64) & (effective_available_at <= decision64)
+        )
         if not len(causal):
             raise ValueError("no completed causal strategy candle")
         index = int(causal[-1])
-        available = _from_np(prepared.decision_available_at[index])
+        available = _from_np(effective_available_at[index])
         candle = _from_np(prepared.timestamp[index])
         if available > _utc(decision_time):
             raise ValueError("strategy decision is not causal")

@@ -189,8 +189,10 @@ def test_off_grid_native_adapter_selects_latest_available_completed_row():
             ["2026-01-02T13:00", "2026-01-02T14:00"], dtype="datetime64[ns]"
         ),
         decision_available_at=np.array(
-            ["2026-01-02T14:00", "2026-01-02T15:00"], dtype="datetime64[ns]"
+            ["2026-01-02T14:00", "2026-01-02T14:00"], dtype="datetime64[ns]"
         ),
+        strategy_interval=pd.Timedelta(hours=1),
+        research=(),
         close=np.array([10.0, 20.0]),
     )
 
@@ -210,6 +212,44 @@ def test_off_grid_native_adapter_selects_latest_available_completed_row():
     ).evaluate({}, DECISION, timedelta(hours=2))
     assert result.signal_candle_timestamp == datetime(2026, 1, 2, 13, 0, tzinfo=UTC)
     assert result.decision_available_at == datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
+
+
+def test_native_adapter_excludes_row_with_post_decision_research_value():
+    prepared = SimpleNamespace(
+        timestamp=np.array(
+            ["2026-01-02T12:00", "2026-01-02T13:00"], dtype="datetime64[ns]"
+        ),
+        decision_available_at=np.array(
+            ["2026-01-02T13:00", "2026-01-02T14:00"], dtype="datetime64[ns]"
+        ),
+        strategy_interval=pd.Timedelta(hours=1),
+        research=(
+            SimpleNamespace(
+                available_at=np.array(
+                    ["2026-01-02T13:00", "2026-01-02T14:45"],
+                    dtype="datetime64[ns]",
+                )
+            ),
+        ),
+        close=np.array([10.0, 20.0]),
+    )
+
+    class Engine:
+        def evaluate_prepared_entry(self, index):
+            assert index == 0
+            return SimpleNamespace(
+                accepted=True,
+                strategy_profile_key="BULL_LONG",
+                side="LONG",
+                reference_price=10.0,
+                detail="passed",
+            )
+
+    result = LatestNativeStrategyEvaluator(
+        lambda candidate: (prepared, Engine())
+    ).evaluate({}, DECISION, timedelta(hours=2))
+    assert result.signal_candle_timestamp == datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+    assert result.decision_available_at == datetime(2026, 1, 2, 13, 0, tzinfo=UTC)
 
 
 def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
