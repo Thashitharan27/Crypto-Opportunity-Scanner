@@ -40,6 +40,10 @@ class CycleStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class StaleStrategyDataError(ValueError):
+    """No completed causal strategy row is currently available."""
+
+
 @dataclass(frozen=True, slots=True)
 class PaperScannerConfig:
     scan_interval: timedelta
@@ -145,7 +149,7 @@ class LatestNativeStrategyEvaluator:
                 effective_available_at[candidate_index] = row_available
                 break
         if index is None:
-            raise ValueError("no completed causal strategy candle")
+            raise StaleStrategyDataError("no completed causal strategy candle")
         available = _from_np(effective_available_at[index])
         candle = _from_np(prepared.timestamp[index])
         if available > _utc(decision_time):
@@ -306,9 +310,41 @@ class PaperScannerRunner:
         evaluated = fresh = stale = signals = duplicates = entries = 0
         for row in completed.final.sort_values("final_rank").to_dict("records"):
             symbol = str(row["symbol"])
-            evaluation = self.evaluator.evaluate(
-                row, decision, self.config.stale_strategy_candle_limit
-            )
+            try:
+                evaluation = self.evaluator.evaluate(
+                    row, decision, self.config.stale_strategy_candle_limit
+                )
+            except StaleStrategyDataError as exc:
+                stale += 1
+                self.audit.append(
+                    "STALE_STRATEGY_DATA",
+                    cycle,
+                    scan_run_id=run_id,
+                    symbol=symbol,
+                    detail=str(exc),
+                )
+                continue
+            except (ValueError, IndexError, KeyError, TypeError) as exc:
+                self.audit.append(
+                    "STRATEGY_EVALUATION_FAILED",
+                    cycle,
+                    scan_run_id=run_id,
+                    symbol=symbol,
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+                return self._finish(
+                    cycle,
+                    run_id,
+                    decision,
+                    len(completed.final),
+                    evaluated,
+                    fresh,
+                    stale,
+                    signals,
+                    duplicates,
+                    entries,
+                    status=CycleStatus.FAILED,
+                )
             evaluated += 1
             strategy_age = decision - _utc(evaluation.decision_available_at)
             if (

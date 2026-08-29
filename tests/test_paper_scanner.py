@@ -321,6 +321,38 @@ def test_native_adapter_ignores_unrelated_late_research_block():
     assert result.decision_available_at == datetime(2026, 1, 2, 14, 0, tzinfo=UTC)
 
 
+def test_no_completed_causal_row_is_audited_as_stale_not_runtime_error(tmp_path):
+    class NoCausalEvaluator:
+        def evaluate(self, candidate, decision, stale_limit):
+            from crypto_strategy_lab.paper_scanner import StaleStrategyDataError
+
+            raise StaleStrategyDataError("no completed causal strategy candle")
+
+    app, _ = runner(tmp_path, evaluator=NoCausalEvaluator())
+    result = app.run_once()
+    assert result.status is CycleStatus.STALE_STRATEGY_DATA
+    assert (result.stale_candidates, result.new_paper_entries) == (1, 0)
+    assert "STALE_STRATEGY_DATA" in events(tmp_path / "audit.jsonl")
+
+
+def test_strategy_integrity_error_fails_cycle_without_killing_runner(tmp_path):
+    class BrokenEvaluator:
+        broken = True
+
+        def evaluate(self, candidate, decision, stale_limit):
+            if self.broken:
+                raise ValueError("prepared research is misaligned")
+            return Evaluator().evaluate(candidate, decision, stale_limit)
+
+    evaluator = BrokenEvaluator()
+    app, _ = runner(tmp_path, evaluator=evaluator)
+    assert app.run_once().status is CycleStatus.FAILED
+    assert not app.state.paper_entries
+    evaluator.broken = False
+    assert app.run_once().new_paper_entries == 1
+    assert "STRATEGY_EVALUATION_FAILED" in events(tmp_path / "audit.jsonl")
+
+
 def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
     sleeps = []
     app, scan = runner(
