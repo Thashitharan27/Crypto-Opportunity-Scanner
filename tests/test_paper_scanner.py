@@ -353,6 +353,31 @@ def test_strategy_integrity_error_fails_cycle_without_killing_runner(tmp_path):
     assert "STRATEGY_EVALUATION_FAILED" in events(tmp_path / "audit.jsonl")
 
 
+def test_signal_state_failure_does_not_install_uncommitted_duplicate_key(tmp_path):
+    app, _ = runner(tmp_path)
+    original_save = app.store.save
+    failed = False
+
+    def fail_once(state):
+        nonlocal failed
+        if state.paper_entries and not failed:
+            failed = True
+            raise OSError("disk unavailable")
+        original_save(state)
+
+    app.store.save = fail_once
+    result = app.run_once()
+    assert result.status is CycleStatus.FAILED
+    assert not app.state.emitted_signal_ids
+    assert not app.state.paper_entries
+    assert not (tmp_path / "state.json").exists()
+    assert "STATE_PERSIST_FAILED" in events(tmp_path / "audit.jsonl")
+
+    # The failed in-memory attempt does not suppress a later durable emission.
+    assert app.run_once().new_paper_entries == 1
+    assert len(app.state.paper_entries) == 1
+
+
 def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
     sleeps = []
     app, scan = runner(

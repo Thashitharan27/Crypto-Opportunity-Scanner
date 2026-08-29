@@ -28,6 +28,7 @@ from crypto_strategy_lab.gui.opportunity_scanner_controller import (
 )
 from crypto_strategy_lab.paper_scanner_reporting import PaperScannerAuditLog
 from crypto_strategy_lab.paper_scanner_state import (
+    PaperScannerState,
     PaperScannerStateStore,
 )
 
@@ -424,11 +425,53 @@ class PaperScannerRunner:
                 symbol=symbol,
                 signal_id=signal.signal_id,
             )
-            self.state.emitted_signal_ids.append(signal.signal_id)
-            self.state.paper_entries.append(
-                {"record_type": "PAPER_ENTRY", **asdict(signal)}
+            next_state = PaperScannerState(
+                emitted_signal_ids=[
+                    *self.state.emitted_signal_ids,
+                    signal.signal_id,
+                ],
+                paper_entries=[
+                    *self.state.paper_entries,
+                    {"record_type": "PAPER_ENTRY", **asdict(signal)},
+                ],
+                last_completed_cycle=self.state.last_completed_cycle,
+                last_successful_scan_run_id=self.state.last_successful_scan_run_id,
             )
-            self.store.save(self.state)
+            try:
+                self.store.save(next_state)
+            except OSError as exc:
+                # Do not install an uncommitted identity in memory.  The prior
+                # durable state remains authoritative and a later cycle can
+                # safely retry once storage is healthy.
+                self.audit.append(
+                    "STATE_PERSIST_FAILED",
+                    cycle,
+                    scan_run_id=run_id,
+                    symbol=symbol,
+                    signal_id=signal.signal_id,
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+                result = PaperScanCycleResult(
+                    cycle,
+                    run_id,
+                    decision.isoformat(),
+                    len(completed.final),
+                    evaluated,
+                    fresh,
+                    stale,
+                    signals,
+                    duplicates,
+                    entries,
+                    CycleStatus.FAILED,
+                )
+                self.audit.append(
+                    "CYCLE_COMPLETED",
+                    cycle,
+                    scan_run_id=run_id,
+                    detail=CycleStatus.FAILED.value,
+                )
+                return result
+            self.state = next_state
             entries += 1
             self.audit.append(
                 "SIGNAL_EMITTED",
