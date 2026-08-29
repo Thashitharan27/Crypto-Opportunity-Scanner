@@ -170,7 +170,19 @@ class OpportunityScanPublisher:
         for c in finals:
             a = acquisition_by[c.symbol.upper()]
             if c.discovery_timestamp != decision or c.discovery_rank != rank_by[c.symbol.upper()] or c.strategy_source_identity != (a.source_signature.cache_identity() if a.source_signature else None) or c.discovery_mode.value != mode or c.discovery_contract != contract: raise ValueError("Task 5 provenance mismatch")
-            if c.opportunity_model_name is not None:
+            selected_model = package.final_candidates.config.opportunity_model
+            candidate_model = (
+                c.opportunity_model_name,
+                c.opportunity_model_version,
+            )
+            if selected_model is None:
+                if (candidate_model != (None, None)
+                        or c.opportunity_score is not None
+                        or c.opportunity_model_rank is not None):
+                    raise ValueError("Task 5 candidate has an unconfigured score")
+            else:
+                if candidate_model != (selected_model.name, selected_model.version):
+                    raise ValueError("Task 5 candidate model disagrees with its config")
                 score = scores_by_key.get((
                     c.symbol.upper(), c.opportunity_model_name,
                     c.opportunity_model_version,

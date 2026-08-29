@@ -14,7 +14,11 @@ from crypto_strategy_lab.data.binance.selective_acquisition import (
 from crypto_strategy_lab.data.binance.universe import DiscoveryConfig, DiscoveryRow
 from crypto_strategy_lab.data.schemas import DatasetKind
 from crypto_strategy_lab.data.source_identity import SourceSignature
-from crypto_strategy_lab.final_candidates import build_final_candidate_set
+from crypto_strategy_lab.final_candidates import (
+    FinalCandidateBoundaryConfig,
+    OpportunityModelRef,
+    build_final_candidate_set,
+)
 from crypto_strategy_lab.opportunity_reporting import (
     OpportunityScanPublicationInput,
     publish_opportunity_scan,
@@ -107,4 +111,39 @@ def test_task4_score_cannot_reference_symbol_absent_from_task3(tmp_path):
     )
 
     with pytest.raises(ValueError, match="absent from Task 3"):
+        publish_opportunity_scan(tmp_path, package)
+
+
+def test_selected_model_cannot_be_omitted_from_task5_candidate(tmp_path):
+    package = _package()
+    acquisition = package.candle_acquisition.symbols[0]
+    score = OpportunityScoreRow(
+        "BTCUSDT", 1, NOW, "1h", NOW - timedelta(hours=1),
+        NOW - timedelta(hours=1), {}, {}, {}, "balanced_activity", "1", 1.0,
+        1, None, None, None, None, None, None, "UNKNOWN", None, None, None,
+        acquisition.source_signature.cache_identity(), {}, ScoreStatus.SCORABLE, None,
+    )
+    scoring = OpportunityScoringResult(NOW, (score,))
+    candidates = build_final_candidate_set(
+        package.discovery,
+        package.candle_acquisition,
+        scoring,
+        FinalCandidateBoundaryConfig(
+            opportunity_model=OpportunityModelRef("balanced_activity", "1")
+        ),
+    )
+    candidate = replace(
+        candidates.candidates[0],
+        opportunity_model_name=None,
+        opportunity_model_version=None,
+        opportunity_score=None,
+        opportunity_model_rank=None,
+    )
+    package = replace(
+        package,
+        scoring_result=scoring,
+        final_candidates=replace(candidates, candidates=(candidate,)),
+    )
+
+    with pytest.raises(ValueError, match="candidate model disagrees"):
         publish_opportunity_scan(tmp_path, package)
