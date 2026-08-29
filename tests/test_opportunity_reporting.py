@@ -20,8 +20,10 @@ from crypto_strategy_lab.opportunity_reporting import (
     publish_opportunity_scan,
 )
 from crypto_strategy_lab.opportunity_scoring import (
+    OpportunityScoreRow,
     OpportunityScoringConfig,
     OpportunityScoringResult,
+    ScoreStatus,
 )
 from crypto_strategy_lab.rich_data_acquisition import (
     RichDataAcquisitionConfig,
@@ -89,3 +91,20 @@ def test_task6_plan_cannot_reference_a_non_final_symbol(tmp_path):
 
     with pytest.raises(ValueError, match="non-final candidate symbol"):
         publish_opportunity_scan(tmp_path, replace(package, rich_data=rich_data))
+
+
+def test_task4_score_cannot_reference_symbol_absent_from_task3(tmp_path):
+    package = _package()
+    score = OpportunityScoreRow(
+        "ETHUSDT", 1, NOW, "1h", NOW - timedelta(hours=1),
+        NOW - timedelta(hours=1), {}, {}, {}, "balanced_activity", "1", 1.0,
+        1, None, None, None, None, None, None, "UNKNOWN", None, None, None,
+        "foreign-source", {}, ScoreStatus.SCORABLE, None,
+    )
+    package = replace(
+        package,
+        scoring_result=OpportunityScoringResult(NOW, (score,)),
+    )
+
+    with pytest.raises(ValueError, match="absent from Task 3"):
+        publish_opportunity_scan(tmp_path, package)

@@ -135,6 +135,7 @@ class OpportunityScanPublisher:
                 "acquisition_ranges": _json(a.acquisition_ranges), "quality_status": a.quality_status, "row_count": a.row_count,
                 "strategy_source_identity": sig and sig["cache_identity"], "strategy_source_signature": sig, "detail": a.detail})
         score_rows = []
+        scores_by_key = {}
         if package.scoring_result is None:
             if package.scoring_config is not None: raise ValueError("scoring config supplied without scoring result")
             if package.final_candidates.config.opportunity_model is not None: raise ValueError("selected model requires explicit scoring")
@@ -146,7 +147,17 @@ class OpportunityScanPublisher:
             for score in package.scoring_result.rows:
                 if _utc(score.decision_time) != decision or score.strategy_interval != package.scoring_config.strategy_interval or (score.model_name, score.model_version) not in allowed: raise ValueError("Task 4 decision/interval/model mismatch")
                 expected = acquisition_by.get(score.symbol.upper())
-                if expected and expected.source_signature and score.source_identity != expected.source_signature.cache_identity(): raise ValueError("Task 4 source identity mismatch")
+                if expected is None:
+                    raise ValueError("Task 4 score symbol is absent from Task 3")
+                if (expected.source_signature is None
+                        or score.source_identity != expected.source_signature.cache_identity()):
+                    raise ValueError("Task 4 source identity mismatch")
+                score_key = (
+                    score.symbol.upper(), score.model_name, score.model_version
+                )
+                if score_key in scores_by_key:
+                    raise ValueError("duplicate Task 4 score row")
+                scores_by_key[score_key] = score
                 score_rows.append(_json(score))
                 sources.append({"symbol": score.symbol.upper(), "role": "opportunity_scoring", "cache_identity": score.source_identity,
                                 "interval": score.strategy_interval, "request_start": None, "request_end": _json(score.decision_time)})
@@ -159,6 +170,20 @@ class OpportunityScanPublisher:
         for c in finals:
             a = acquisition_by[c.symbol.upper()]
             if c.discovery_timestamp != decision or c.discovery_rank != rank_by[c.symbol.upper()] or c.strategy_source_identity != (a.source_signature.cache_identity() if a.source_signature else None) or c.discovery_mode.value != mode or c.discovery_contract != contract: raise ValueError("Task 5 provenance mismatch")
+            if c.opportunity_model_name is not None:
+                score = scores_by_key.get((
+                    c.symbol.upper(), c.opportunity_model_name,
+                    c.opportunity_model_version,
+                ))
+                if score is None:
+                    raise ValueError("Task 5 selected score is absent from Task 4")
+                if (score.score != c.opportunity_score
+                        or score.model_rank != c.opportunity_model_rank
+                        or score.discovery_rank != c.discovery_rank
+                        or score.strategy_interval != c.strategy_interval
+                        or _utc(score.decision_time) != decision
+                        or score.source_identity != c.strategy_source_identity):
+                    raise ValueError("Task 5 selected score disagrees with Task 4")
             flat = c.serializable(); metrics = flat.pop("impact_metrics"); request = flat.pop("strategy_data_request")
             final_rows.append({**flat, **{f"impact_{k}": v for k,v in metrics.items()}, **{f"strategy_request_{k}": v for k,v in request.items()}})
         final_symbols = {c.symbol.upper() for c in finals}
