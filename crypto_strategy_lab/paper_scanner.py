@@ -123,20 +123,15 @@ class LatestNativeStrategyEvaluator:
             return StrategyEvaluation(
                 False, candle, available, detail="stale strategy decision row"
             )
-        passed, detail = engine._strategy_profile_filter_result(
-            index
-        )  # native Entry/Veto boundary
-        context = engine._profile_context(index)
-        side = context[1] if context else None
-        profile = context[2] if context else None
+        native = engine.evaluate_prepared_entry(index)
         return StrategyEvaluation(
-            bool(passed),
+            native.accepted,
             candle,
             available,
-            profile,
-            side,
-            float(prepared.close[index]),
-            str(detail),
+            native.strategy_profile_key,
+            native.side,
+            native.reference_price,
+            native.detail,
         )
 
 
@@ -206,7 +201,9 @@ class PaperScannerRunner:
         )
 
     def run_once(
-        self, cancelled: Callable[[], bool] | None = None
+        self,
+        cancelled: Callable[[], bool] | None = None,
+        cancellation_wait: Callable[[float], bool] | None = None,
     ) -> PaperScanCycleResult:
         cancellation_requested = cancelled or (lambda: False)
         cycle = uuid.uuid4().hex
@@ -238,7 +235,20 @@ class PaperScannerRunner:
                     cycle,
                     detail=f"attempt={attempt + 1} {type(exc).__name__}",
                 )
-                self.sleeper(self.config.retry_backoff.total_seconds())
+                backoff = self.config.retry_backoff.total_seconds()
+                if cancellation_wait is not None:
+                    if cancellation_wait(backoff):
+                        self.audit.append("SCAN_CANCELLED", cycle)
+                        return self._finish(
+                            cycle, None, None, status=CycleStatus.CANCELLED
+                        )
+                else:
+                    self.sleeper(backoff)
+                    if cancellation_requested():
+                        self.audit.append("SCAN_CANCELLED", cycle)
+                        return self._finish(
+                            cycle, None, None, status=CycleStatus.CANCELLED
+                        )
         assert completed is not None
         run_id = str(completed.manifest["run_id"])
         decision = _parse(completed.summary["decision_timestamp"])
@@ -474,7 +484,7 @@ class PaperScannerRunner:
         self.audit.append("RUNTIME_STARTED", "runtime")
         try:
             while not stop_event.is_set():
-                self.run_once(stop_event.is_set)
+                self.run_once(stop_event.is_set, stop_event.wait)
                 if stop_event.is_set():
                     break
                 if stop_event.wait(self.config.scan_interval.total_seconds()):

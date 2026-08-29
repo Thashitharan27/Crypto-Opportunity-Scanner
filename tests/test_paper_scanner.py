@@ -189,12 +189,15 @@ def test_off_grid_native_adapter_selects_latest_available_completed_row():
     )
 
     class Engine:
-        def _strategy_profile_filter_result(self, index):
+        def evaluate_prepared_entry(self, index):
             assert index == 0
-            return True, "passed"
-
-        def _profile_context(self, index):
-            return "BULL", "LONG", "BULL_LONG", object()
+            return SimpleNamespace(
+                accepted=True,
+                strategy_profile_key="BULL_LONG",
+                side="LONG",
+                reference_price=10.0,
+                detail="passed",
+            )
 
     result = LatestNativeStrategyEvaluator(
         lambda candidate: (prepared, Engine())
@@ -332,6 +335,26 @@ def test_scheduler_propagates_stop_callback_into_active_scan(tmp_path):
     assert scanner.calls == 1
     assert app.state.last_completed_cycle["status"] is CycleStatus.CANCELLED
     assert "SCAN_CANCELLED" in events(tmp_path / "audit.jsonl")
+
+
+def test_scheduler_stop_interrupts_retry_backoff(tmp_path):
+    stop = Event()
+
+    class FailingScanner:
+        calls = 0
+
+        def run(self, request, cancelled):
+            self.calls += 1
+            stop.set()
+            raise ConnectionError("temporary failure")
+
+    app, scanner = runner(tmp_path, scan=FailingScanner(), retries=3)
+    app.run_forever(stop)
+    assert scanner.calls == 1
+    assert app.state.last_completed_cycle["status"] is CycleStatus.CANCELLED
+    audit_events = events(tmp_path / "audit.jsonl")
+    assert "SCAN_RETRY" in audit_events
+    assert "SCAN_CANCELLED" in audit_events
 
 
 def test_non_entry_is_audited_without_ledger_record(tmp_path):
