@@ -289,9 +289,9 @@ def test_workspace_constructs_and_mode_controls_utc_timestamp():
 
 
 def test_workspace_uses_code_commit_and_has_shutdown_wait_contract():
-    source=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_workspace.py").read_text()
+    source=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_workspace.py").read_text(encoding="utf-8")
     assert "m.get('code_commit','—')" in source
     assert "def shutdown" in source and "thread.wait()" in source
     assert '"acquisition_state","quality_status","detail"' in source
-    installer=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_install.py").read_text()
+    installer=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_install.py").read_text(encoding="utf-8")
     assert "application.aboutToQuit.connect(workspace.shutdown)" in installer
