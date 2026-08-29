@@ -27,6 +27,7 @@ from crypto_strategy_lab.gui.chatgpt_autostart_install import (
     apply_chatgpt_autostart,
 )
 from crypto_strategy_lab.gui.github_sync_install import apply_github_sync_safety
+from crypto_strategy_lab.gui.opportunity_scanner_install import apply_opportunity_scanner_workspace
 from crypto_strategy_lab.gui.desktop_style import (
     apply_application_style,
     apply_shell_style,
@@ -79,6 +80,7 @@ def main() -> int:
         apply_review_run_workspace(window)
         apply_results_dashboard_workspace(window)
         apply_data_library_workspace(window)
+        apply_opportunity_scanner_workspace(window)
         apply_chatgpt_autostart(window)
         apply_github_sync_safety(window)
         apply_shell_style(window)
