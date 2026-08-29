@@ -212,3 +212,14 @@ def test_completed_loader_rejects_incomplete_scan_catalog(tmp_path):
 
     with pytest.raises(RunArtifactError, match="catalog is incomplete"):
         load_completed_manifest(run_dir)
+
+
+def test_discovery_ranks_must_be_unique_and_contiguous(tmp_path):
+    package = _package()
+    second = replace(package.discovery[0], symbol="ETHUSDT")
+    invalid_discovery = (package.discovery[0], second)
+
+    with pytest.raises(ValueError, match="unique, contiguous"):
+        publish_opportunity_scan(
+            tmp_path, replace(package, discovery=invalid_discovery)
+        )

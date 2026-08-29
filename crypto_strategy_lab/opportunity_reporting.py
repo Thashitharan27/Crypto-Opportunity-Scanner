@@ -116,6 +116,43 @@ class OpportunityScanPublisher:
                 raise ValueError("historical discovery sources must match the universe")
         symbols = [str(r.symbol).strip().upper() for r in discovery_rows]
         if not symbols or len(symbols) != len(set(symbols)): raise ValueError("discovery symbols must be unique")
+        discovery_ranks = [
+            row.rank if not live else row.preliminary_rank
+            for row in discovery_rows
+            if row.eligible
+        ]
+        if (any(rank is None for rank in discovery_ranks)
+                or sorted(discovery_ranks) != list(range(1, len(discovery_ranks) + 1))
+                or any(
+                    (row.rank if not live else row.preliminary_rank) is not None
+                    for row in discovery_rows
+                    if not row.eligible
+                )):
+            raise ValueError(
+                "discovery ranks must be unique, contiguous, and eligible-only"
+            )
+        if not live:
+            snapshot_eligible = sorted(
+                (
+                    row.symbol.strip().upper(),
+                    row.rank,
+                    row.source_identity,
+                )
+                for row in discovery_rows
+                if row.eligible
+            )
+            result_eligible = sorted(
+                (
+                    row.symbol.strip().upper(),
+                    row.rank,
+                    row.source_identity,
+                )
+                for row in package.discovery.eligible_candidates
+            )
+            if result_eligible != snapshot_eligible:
+                raise ValueError(
+                    "historical eligible candidates disagree with the snapshot"
+                )
         scan_timestamp = _utc(package.scan_timestamp)
         universe = {"exchange": package.exchange.lower(), "market": package.market.lower(),
                     "discovery_contract": contract, "symbols": sorted(symbols),
