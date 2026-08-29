@@ -151,10 +151,13 @@ class RuleAwareDataLakeProductionBacktestEngine(DataLakeProductionBacktestEngine
             raise IndexError("prepared strategy row is out of range")
         accepted, detail = self._strategy_profile_filter_result(index)
         context = self._profile_context(index)
+        side = None
+        if context is not None:
+            _, side = self._resolved_profile_direction(index, context)
         return NativeLatestEntryDecision(
             accepted=bool(accepted),
             strategy_profile_key=context[2] if context else None,
-            side=context[1] if context else None,
+            side=side,
             reference_price=float(self.close[index]),
             detail=str(detail),
         )

@@ -140,3 +140,16 @@ def test_global_pressure_allow_list_is_retired_in_current_native_runtime():
 def test_legacy_sr_preset_filter_is_retired_in_current_native_runtime():
     engine = _engine()
     assert engine._should_reject_for_sr(0, "LONG", _sr_context()) == (False, None)
+
+
+def test_public_entry_decision_reports_native_post_flip_side():
+    engine = _engine()
+    engine.close = np.array([100.0])
+    profile = SimpleNamespace(flip_direction=True, entry_rules=(), flip_rule_match_mode="ALL")
+    engine._strategy_profile_filter_result = lambda index: (True, "passed")
+    engine._profile_context = lambda index: ("BULL", "LONG", "BULL_LONG", profile)
+    decision = engine.evaluate_prepared_entry(0)
+    assert decision.accepted
+    assert decision.strategy_profile_key == "BULL_LONG"
+    assert decision.side == "SHORT"
+    assert decision.reference_price == 100.0
