@@ -54,6 +54,24 @@ class PaperScannerStateStore:
                 raise ValueError("emitted_signal_ids is invalid")
             if len(ids) != len(set(ids)) or not isinstance(entries, list):
                 raise ValueError("paper scanner ledger is invalid")
+            entry_ids: list[str] = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("paper entry must be an object")
+                if entry.get("record_type") != "PAPER_ENTRY":
+                    raise ValueError("paper entry record_type is invalid")
+                signal_id = entry.get("signal_id")
+                signal_timestamp = entry.get("signal_candle_timestamp")
+                if not isinstance(signal_id, str) or not signal_id:
+                    raise ValueError("paper entry signal_id is invalid")
+                if not isinstance(signal_timestamp, str) or not signal_timestamp:
+                    raise ValueError("paper entry signal timestamp is invalid")
+                entry_ids.append(signal_id)
+            # The ledger and duplicate index are one atomic invariant.  Loading
+            # mismatched collections could either suppress a signal without a
+            # durable paper record or, worse, re-emit an existing paper entry.
+            if entry_ids != ids:
+                raise ValueError("paper entry ledger and duplicate index disagree")
             return PaperScannerState(
                 ids,
                 entries,

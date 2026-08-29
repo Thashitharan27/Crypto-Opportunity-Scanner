@@ -225,11 +225,65 @@ def test_state_is_versioned_atomic_and_corruption_fails_closed(tmp_path, monkeyp
             original(source, target),
         )[1],
     )
-    store.save(PaperScannerState(["one"], [{"signal_id": "one"}]))
+    store.save(
+        PaperScannerState(
+            ["one"],
+            [
+                {
+                    "record_type": "PAPER_ENTRY",
+                    "signal_id": "one",
+                    "signal_candle_timestamp": DECISION.isoformat(),
+                }
+            ],
+        )
+    )
     assert replaced and json.loads(path.read_text())["version"] == 1
     path.write_text("not json")
     with pytest.raises(PaperScannerStateError):
         store.load()
+
+
+@pytest.mark.parametrize(
+    "ids,entries",
+    [
+        (["one"], []),
+        (
+            [],
+            [
+                {
+                    "record_type": "PAPER_ENTRY",
+                    "signal_id": "one",
+                    "signal_candle_timestamp": "2026-01-01T00:00:00+00:00",
+                }
+            ],
+        ),
+        (
+            ["one"],
+            [
+                {
+                    "record_type": "PAPER_ENTRY",
+                    "signal_id": "two",
+                    "signal_candle_timestamp": "2026-01-01T00:00:00+00:00",
+                }
+            ],
+        ),
+    ],
+)
+def test_state_rejects_ledger_duplicate_index_mismatch(tmp_path, ids, entries):
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "emitted_signal_ids": ids,
+                "paper_entries": entries,
+                "last_completed_cycle": None,
+                "last_successful_scan_run_id": None,
+            }
+        )
+    )
+    with pytest.raises(PaperScannerStateError, match="corrupt"):
+        PaperScannerStateStore(path).load()
 
 
 def test_scheduler_waits_and_stops_without_order_api(tmp_path):
