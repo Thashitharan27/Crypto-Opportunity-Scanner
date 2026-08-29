@@ -27,10 +27,13 @@ from crypto_strategy_lab.gui.chatgpt_autostart_install import (
     apply_chatgpt_autostart,
 )
 from crypto_strategy_lab.gui.github_sync_install import apply_github_sync_safety
+from crypto_strategy_lab.gui.opportunity_scanner_install import apply_opportunity_scanner_workspace
+from crypto_strategy_lab.gui.opportunity_scanner_controller import create_opportunity_scanner_service
 from crypto_strategy_lab.gui.desktop_style import (
     apply_application_style,
     apply_shell_style,
 )
+from crypto_strategy_lab.paths import CACHE_DIR, MARKET_DATA_ROOT, OUTPUT_DIR
 # The active researcher window layers run-faithful readiness over the compact
 # Setup workspace while keeping the proven v2 data/results shell.
 from crypto_strategy_lab.gui.v2_main_window import MainWindow as StableGuiShell
@@ -79,6 +82,10 @@ def main() -> int:
         apply_review_run_workspace(window)
         apply_results_dashboard_workspace(window)
         apply_data_library_workspace(window)
+        scanner_service = create_opportunity_scanner_service(
+            MARKET_DATA_ROOT, CACHE_DIR, OUTPUT_DIR / "opportunity_scans"
+        )
+        apply_opportunity_scanner_workspace(window, scanner_service)
         apply_chatgpt_autostart(window)
         apply_github_sync_safety(window)
         apply_shell_style(window)
