@@ -321,6 +321,7 @@ class PaperScannerRunner:
         try:
             lifecycle = apply_candidate_lifecycle(
                 self.state.candidate_lifecycle,
+                self.state.lifecycle_cursor,
                 completed.final.to_dict("records"),
                 decision,
                 run_id,
@@ -345,6 +346,7 @@ class PaperScannerRunner:
             last_successful_scan_run_id=self.state.last_successful_scan_run_id,
             lifecycle_policy=self.lifecycle_policy,
             candidate_lifecycle=list(lifecycle.state),
+            lifecycle_cursor=lifecycle.cursor,
         )
         try:
             self.store.save(lifecycle_state)
@@ -521,6 +523,7 @@ class PaperScannerRunner:
                 last_successful_scan_run_id=self.state.last_successful_scan_run_id,
                 lifecycle_policy=self.state.lifecycle_policy,
                 candidate_lifecycle=list(self.state.candidate_lifecycle),
+                lifecycle_cursor=self.state.lifecycle_cursor,
             )
             try:
                 self.store.save(next_state)

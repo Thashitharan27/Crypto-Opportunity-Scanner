@@ -209,6 +209,27 @@ def test_out_of_order_paper_scan_fails_without_changing_durable_state(tmp_path):
     assert reloaded.candidate_lifecycle == lifecycle_before
 
 
+def test_empty_cursor_survives_restart_and_rejects_older_nonempty_scan(tmp_path):
+    empty = completed(decision=DECISION, run_id="empty-newer")
+    empty.final = empty.final.iloc[0:0]
+    app, _ = runner(tmp_path, scan=Scanner(empty))
+    assert app.run_once().status is CycleStatus.COMPLETED
+    assert not app.state.candidate_lifecycle
+    assert app.state.lifecycle_cursor.decision_timestamp == DECISION.isoformat()
+    durable_before = (tmp_path / "state.json").read_bytes()
+
+    older_decision = DECISION - timedelta(minutes=1)
+    restarted, _ = runner(
+        tmp_path,
+        scan=Scanner(completed(decision=older_decision, run_id="older-present")),
+        now=DECISION,
+    )
+    assert restarted.state.lifecycle_cursor == app.state.lifecycle_cursor
+    assert restarted.run_once().status is CycleStatus.FAILED
+    assert (tmp_path / "state.json").read_bytes() == durable_before
+    assert not PaperScannerStateStore(tmp_path / "state.json").load().candidate_lifecycle
+
+
 def test_default_lifecycle_preserves_task10_candidate_and_signal_parity(tmp_path):
     scan_result = completed()
     scan_result.final = pd.DataFrame([

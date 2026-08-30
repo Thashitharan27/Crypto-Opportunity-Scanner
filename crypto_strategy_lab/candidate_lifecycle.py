@@ -115,14 +115,41 @@ class CandidateTransition:
 
 
 @dataclass(frozen=True, slots=True)
+class LifecycleCursor:
+    """Durable identity of the latest successfully applied completed snapshot."""
+
+    decision_timestamp: str
+    scanner_run_id: str
+    snapshot_identity: str
+
+    def __post_init__(self) -> None:
+        _parse_timestamp(self.decision_timestamp)
+        if not self.scanner_run_id or not self.snapshot_identity.startswith("sha256:"):
+            raise ValueError("candidate lifecycle cursor is invalid")
+
+    def serializable(self) -> dict[str, str]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "LifecycleCursor":
+        return cls(
+            str(value["decision_timestamp"]),
+            str(value["scanner_run_id"]),
+            str(value["snapshot_identity"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LifecycleResult:
     state: tuple[CandidateLifecycleRecord, ...]
+    cursor: LifecycleCursor
     transitions: tuple[CandidateTransition, ...]
     active_rows: tuple[dict[str, Any], ...]
 
 
 def apply_candidate_lifecycle(
     previous_state: Sequence[CandidateLifecycleRecord],
+    previous_cursor: LifecycleCursor | None,
     current_snapshot: Iterable[Mapping[str, Any]],
     decision_timestamp: datetime,
     scanner_run_id: str,
@@ -143,18 +170,22 @@ def apply_candidate_lifecycle(
     if len(symbols) != len(set(symbols)):
         raise ValueError("candidate snapshot symbols must be unique")
 
-    authoritative_time = _latest_lifecycle_time(previous_state)
+    snapshot_identity = _snapshot_identity(rows)
+    if previous_cursor is not None:
+        authoritative_time = _parse_timestamp(previous_cursor.decision_timestamp)
+    else:
+        authoritative_time = None
     if authoritative_time is not None and decision_time <= authoritative_time:
         if (
             decision_time == authoritative_time
-            and _is_exact_scan_replay(
-                previous_state, rows, scanner_run_id, authoritative_time
-            )
+            and previous_cursor.scanner_run_id == scanner_run_id
+            and previous_cursor.snapshot_identity == snapshot_identity
         ):
-            return LifecycleResult(tuple(previous_state), (), tuple(rows))
+            return LifecycleResult(previous_state, previous_cursor, (), tuple(rows))
         raise ValueError(
             "candidate lifecycle decision must be later than prior lifecycle state"
         )
+    cursor = LifecycleCursor(decision, scanner_run_id, snapshot_identity)
 
     records: dict[str, CandidateLifecycleRecord] = dict(previous)
     transitions: list[CandidateTransition] = []
@@ -207,6 +238,7 @@ def apply_candidate_lifecycle(
     transitions.sort(key=lambda item: (item.symbol, item.transition.value))
     return LifecycleResult(
         tuple(records[symbol] for symbol in sorted(records)),
+        cursor,
         tuple(transitions),
         tuple(rows),
     )
@@ -225,21 +257,16 @@ def replay_candidate_lifecycle(
 ) -> tuple[LifecycleResult, ...]:
     """Causal Historical adapter over the exact Paper transition function."""
     state: tuple[CandidateLifecycleRecord, ...] = ()
+    cursor: LifecycleCursor | None = None
     results: list[LifecycleResult] = []
-    prior_time: datetime | None = None
-    run_ids: set[str] = set()
     for snapshot in snapshots:
         current_time = _aware(snapshot.decision_timestamp)
-        if prior_time is not None and current_time <= prior_time:
-            raise ValueError("historical snapshots must be in strictly increasing decision-time order")
-        if snapshot.scanner_run_id in run_ids:
-            raise ValueError("historical scanner run IDs must be unique")
         result = apply_candidate_lifecycle(
-            state, snapshot.final_candidates, current_time, snapshot.scanner_run_id, policy
+            state, cursor, snapshot.final_candidates, current_time,
+            snapshot.scanner_run_id, policy
         )
         results.append(result)
-        state, prior_time = result.state, current_time
-        run_ids.add(snapshot.scanner_run_id)
+        state, cursor = result.state, result.cursor
     return tuple(results)
 
 
@@ -253,51 +280,17 @@ def _parse_timestamp(value: str) -> datetime:
     return _aware(datetime.fromisoformat(value.replace("Z", "+00:00")))
 
 
-def _latest_lifecycle_time(
-    state: Sequence[CandidateLifecycleRecord],
-) -> datetime | None:
-    timestamps: list[datetime] = []
-    for record in state:
-        timestamps.extend((
-            _parse_timestamp(record.last_seen_decision_timestamp),
-            _parse_timestamp(record.activated_timestamp),
-        ))
-        if record.removed_timestamp is not None:
-            timestamps.append(_parse_timestamp(record.removed_timestamp))
-    return max(timestamps) if timestamps else None
-
-
-def _is_exact_scan_replay(
-    state: Sequence[CandidateLifecycleRecord],
-    rows: Sequence[Mapping[str, Any]],
-    scanner_run_id: str,
-    authoritative_time: datetime,
-) -> bool:
-    authoritative_records = [
-        record for record in state
-        if authoritative_time in {
-            _parse_timestamp(record.last_seen_decision_timestamp),
-            _parse_timestamp(record.activated_timestamp),
-            *(
-                [_parse_timestamp(record.removed_timestamp)]
-                if record.removed_timestamp is not None else []
-            ),
+def _snapshot_identity(rows: Sequence[Mapping[str, Any]]) -> str:
+    membership = [
+        {
+            "symbol": str(row["symbol"]).upper(),
+            "final_rank": _rank(row["final_rank"]),
+            "discovery_rank": _rank(row.get("discovery_rank"), optional=True),
         }
-    ]
-    if not authoritative_records or any(
-        record.last_scanner_run_id != scanner_run_id
-        for record in authoritative_records
-    ):
-        return False
-    active = {record.symbol: record for record in state if record.status is LifecycleStatus.ACTIVE}
-    if set(active) != {str(row["symbol"]).upper() for row in rows}:
-        return False
-    return all(
-        active[str(row["symbol"]).upper()].final_rank == _rank(row["final_rank"])
-        and active[str(row["symbol"]).upper()].discovery_rank
-        == _rank(row.get("discovery_rank"), optional=True)
         for row in rows
-    )
+    ]
+    canonical = json.dumps(membership, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _rank(value: Any, optional: bool = False) -> int | None:

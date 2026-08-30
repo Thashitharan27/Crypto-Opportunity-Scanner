@@ -12,6 +12,7 @@ from crypto_strategy_lab.candidate_lifecycle import (
     CandidateLifecycleRecord,
     CandidateLifecyclePolicy,
     DEFAULT_LIFECYCLE_POLICY,
+    LifecycleCursor,
 )
 from crypto_strategy_lab.run_manifest import atomic_json
 
@@ -31,6 +32,7 @@ class PaperScannerState:
     last_successful_scan_run_id: str | None = None
     lifecycle_policy: CandidateLifecyclePolicy = DEFAULT_LIFECYCLE_POLICY
     candidate_lifecycle: list[CandidateLifecycleRecord] = field(default_factory=list)
+    lifecycle_cursor: LifecycleCursor | None = None
 
     def serializable(self) -> dict[str, Any]:
         return {
@@ -44,6 +46,9 @@ class PaperScannerState:
                 "config": json.loads(self.lifecycle_policy.canonical_json()),
             },
             "candidate_lifecycle": [item.serializable() for item in self.candidate_lifecycle],
+            "lifecycle_cursor": (
+                self.lifecycle_cursor.serializable() if self.lifecycle_cursor else None
+            ),
         }
 
 
@@ -101,6 +106,7 @@ class PaperScannerStateStore:
                 raise ValueError("paper entry ledger and duplicate index disagree")
             lifecycle_policy = DEFAULT_LIFECYCLE_POLICY
             lifecycle: list[CandidateLifecycleRecord] = []
+            lifecycle_cursor: LifecycleCursor | None = None
             if version == STATE_VERSION:
                 policy_value = value["lifecycle_policy"]
                 lifecycle_policy = CandidateLifecyclePolicy(**policy_value["config"])
@@ -113,6 +119,11 @@ class PaperScannerStateStore:
                 ]
                 if len({item.symbol for item in lifecycle}) != len(lifecycle):
                     raise ValueError("candidate lifecycle symbols are not unique")
+                cursor_value = value["lifecycle_cursor"]
+                lifecycle_cursor = (
+                    LifecycleCursor.from_dict(cursor_value)
+                    if cursor_value is not None else None
+                )
             # v1 migration intentionally starts with no inferred membership: v1
             # did not durably retain the last candidate snapshot.
             return PaperScannerState(
@@ -122,6 +133,7 @@ class PaperScannerStateStore:
                 value.get("last_successful_scan_run_id"),
                 lifecycle_policy,
                 lifecycle,
+                lifecycle_cursor,
             )
         except PaperScannerStateError:
             raise
