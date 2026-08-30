@@ -35,7 +35,7 @@ regime, pressure-state, and DI-spread-change performance tables.
 On Windows, double-click the normal no-console launcher:
 
 ```text
-Crypto Strategy Lab.vbs
+Crypto Opportunity Scanner.vbs
 ```
 
 It starts `.venv\Scripts\pythonw.exe` from the project directory, including when
@@ -96,7 +96,7 @@ docs/                     Implementation and design documentation
 mcp_server/               Read-only report MCP server
 tests/                    Automated regression suite
 tools/                    Offline import and maintenance utilities
-Crypto Strategy Lab.vbs   Normal no-console Windows launcher
+Crypto Opportunity Scanner.vbs   Normal no-console Windows launcher
 Debug Launcher.bat        Console launcher for debugging only
 app.py                    Desktop application entry point
 cli.py                    Optional command-line backtest entry point

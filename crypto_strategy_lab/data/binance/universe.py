@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 import json
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.request import urlopen
+from urllib.error import HTTPError
 
 
 DEFAULT_STABLECOIN_BASES = frozenset({
@@ -33,13 +34,32 @@ class DiscoveryClient(Protocol):
 class BinanceUsdMDiscoveryClient:
     """Minimal adapter for Binance's public USD-M Futures REST API."""
 
-    def __init__(self, base_url: str = "https://fapi.binance.com", timeout: float = 10.0):
+    def __init__(self, base_url: str = "https://fapi.binance.com", timeout: float = 10.0,
+                 *, transport: Callable[..., Any] = urlopen,
+                 telemetry: Callable[[Mapping[str, Any]], None] | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.transport = transport
+        self.telemetry = telemetry or (lambda _fields: None)
 
     def _get(self, path: str) -> Any:
-        with urlopen(f"{self.base_url}{path}", timeout=self.timeout) as response:
-            return json.load(response)
+        try:
+            with self.transport(f"{self.base_url}{path}", timeout=self.timeout) as response:
+                headers = response.headers
+                self.telemetry(self._telemetry(path, getattr(response, "status", None), headers))
+                return json.load(response)
+        except HTTPError as exc:
+            self.telemetry(self._telemetry(path, exc.code, exc.headers))
+            raise
+
+    @staticmethod
+    def _telemetry(path: str, status: int | None, headers: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "endpoint": path,
+            "http_status": status,
+            "retry_after_seconds": headers.get("Retry-After"),
+            "used_weight": headers.get("X-MBX-USED-WEIGHT-1M"),
+        }
 
     def exchange_info(self) -> Mapping[str, Any]:
         return self._get("/fapi/v1/exchangeInfo")

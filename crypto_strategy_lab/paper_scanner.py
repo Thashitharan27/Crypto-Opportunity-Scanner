@@ -14,8 +14,9 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 import uuid
+import time
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,11 @@ from crypto_strategy_lab.paper_scanner_reporting import PaperScannerAuditLog
 from crypto_strategy_lab.paper_scanner_state import (
     PaperScannerState,
     PaperScannerStateStore,
+)
+from crypto_strategy_lab.scanner_operations import (
+    DiskMonitor, HealthReporter, HealthStatus, ScannerHealthSnapshot,
+    ScannerOperationalConfig, aggregate_acquisition_metrics,
+    retry_delay_seconds, retryable_exception,
 )
 
 
@@ -62,6 +68,7 @@ class PaperScannerConfig:
     audit_log_path: Path
     max_signal_history: int = 10_000
     signal_history_retention: timedelta = timedelta(days=365)
+    operational: ScannerOperationalConfig = ScannerOperationalConfig()
 
     def __post_init__(self) -> None:
         if self.scan_interval <= timedelta(0):
@@ -210,6 +217,7 @@ class PaperScanCycleResult:
     duplicate_signals_suppressed: int
     new_paper_entries: int
     status: CycleStatus
+    metrics: dict[str, Any] | None = None
 
 
 class PaperScannerRunner:
@@ -224,16 +232,16 @@ class PaperScannerRunner:
         sleeper: Callable[[float], None] | None = None,
         transient_error: Callable[[Exception], bool] | None = None,
         lifecycle_policy: CandidateLifecyclePolicy = DEFAULT_LIFECYCLE_POLICY,
+        monotonic: Callable[[], float] | None = None,
+        http_telemetry: list[Mapping[str, Any]] | None = None,
     ):
         self.config, self.scanner = config, scanner
         self.request_factory, self.evaluator = request_factory, evaluator
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        import time
-
         self.sleeper = sleeper or time.sleep
-        self.transient_error = transient_error or (
-            lambda exc: isinstance(exc, (ConnectionError, TimeoutError))
-        )
+        self.monotonic = monotonic or time.monotonic
+        self.transient_error = transient_error or retryable_exception
+        self.http_telemetry = http_telemetry
         self.store = PaperScannerStateStore(config.state_path)
         self.audit = PaperScannerAuditLog(config.audit_log_path, self.clock)
         self.state = self.store.load()  # corrupt state fails closed before runtime
@@ -241,6 +249,13 @@ class PaperScannerRunner:
         if self.state.lifecycle_policy.identity != lifecycle_policy.identity:
             raise ValueError("configured lifecycle policy does not match durable state")
         self.lifecycle_policy = lifecycle_policy
+        self.runtime_started = _utc(self.clock())
+        self.health_reporter = HealthReporter(config.operational.health_path)
+        self.disk_monitor = DiskMonitor(config.operational.disk)
+        self.consecutive_failed_cycles = 0
+        self.last_success = self.last_failure = self.last_error_category = None
+        self._cycle_started = self.monotonic()
+        self._metrics: dict[str, Any] = {}
         self.audit.append(
             "STATE_LOADED",
             "runtime",
@@ -249,6 +264,7 @@ class PaperScannerRunner:
                 f"lifecycle_policy={self.lifecycle_policy.identity}"
             ),
         )
+        self._publish_health(HealthStatus.STARTING, None)
 
     def run_once(
         self,
@@ -256,6 +272,12 @@ class PaperScannerRunner:
         cancellation_wait: Callable[[float], bool] | None = None,
     ) -> PaperScanCycleResult:
         cancellation_requested = cancelled or (lambda: False)
+        self._cycle_started = self.monotonic()
+        self._metrics = {
+            "stale_market_limit_seconds": self.config.stale_market_snapshot_limit.total_seconds(),
+            "stale_strategy_limit_seconds": self.config.stale_strategy_candle_limit.total_seconds(),
+            "retry_count": 0,
+        }
         cycle = uuid.uuid4().hex
         self.audit.append("SCAN_STARTED", cycle)
         completed = None
@@ -267,7 +289,18 @@ class PaperScannerRunner:
                 request = self.request_factory()
                 if request.mode != "LIVE":
                     raise ValueError("paper scanner supports LIVE requests only")
-                completed = self.scanner.run(request, cancellation_requested)
+                pipeline_started = self.monotonic()
+                try:
+                    completed = self.scanner.run(request, cancellation_requested)
+                finally:
+                    self._metrics["pipeline_duration_ms"] = (
+                        self.monotonic() - pipeline_started
+                    ) * 1000
+                    self._capture_http_telemetry(cycle)
+                self._metrics.update(aggregate_acquisition_metrics(
+                    getattr(completed, "preliminary", None),
+                    getattr(completed, "readiness", None),
+                ))
                 break
             except OpportunityScanCancelled:
                 self.audit.append("SCAN_CANCELLED", cycle)
@@ -280,12 +313,25 @@ class PaperScannerRunner:
                         "SCAN_FAILED", cycle, detail=f"{type(exc).__name__}: {exc}"
                     )
                     return self._finish(cycle, None, None, status=CycleStatus.FAILED)
+                backoff = retry_delay_seconds(
+                    exc, attempt + 1, self.config.retry_backoff,
+                    self.config.operational.retry_backoff_cap,
+                    self.config.operational.rate_limit_min_backoff,
+                )
+                retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
                 self.audit.append(
                     "SCAN_RETRY",
                     cycle,
                     detail=f"attempt={attempt + 1} {type(exc).__name__}",
+                    severity="WARNING",
+                    component="scanner_pipeline",
+                    fields={"error_type": type(exc).__name__, "attempt": attempt + 1,
+                            "delay_seconds": backoff,
+                            "http_status": getattr(exc, "code", None),
+                            "retry_after_seconds": retry_after},
                 )
-                backoff = self.config.retry_backoff.total_seconds()
+                self._metrics["retry_count"] = attempt + 1
+                self._metrics["last_retry_delay_seconds"] = backoff
                 if cancellation_wait is not None:
                     if cancellation_wait(backoff):
                         self.audit.append("SCAN_CANCELLED", cycle)
@@ -304,12 +350,14 @@ class PaperScannerRunner:
         decision = _parse(completed.summary["decision_timestamp"])
         self.audit.append("SCAN_COMPLETED", cycle, scan_run_id=run_id)
         age = _utc(self.clock()) - decision
+        self._metrics["discovery_age_seconds"] = age.total_seconds()
         if age < timedelta(0) or age > self.config.stale_market_snapshot_limit:
             self.audit.append(
                 "STALE_DISCOVERY",
                 cycle,
                 scan_run_id=run_id,
                 detail=f"age_seconds={age.total_seconds()}",
+                severity="ERROR", fields={"discovery_age_seconds": age.total_seconds()},
             )
             return self._finish(
                 cycle,
@@ -318,6 +366,7 @@ class PaperScannerRunner:
                 len(completed.final),
                 status=CycleStatus.STALE_DISCOVERY,
             )
+        lifecycle_started = self.monotonic()
         try:
             lifecycle = apply_candidate_lifecycle(
                 self.state.candidate_lifecycle,
@@ -335,14 +384,14 @@ class PaperScannerRunner:
                 "CANDIDATE_SET_REJECTED", cycle, scan_run_id=run_id,
                 detail=f"decision_timestamp={decision.isoformat()} {exc}",
             )
-            self.audit.append(
-                "CYCLE_COMPLETED", cycle, scan_run_id=run_id,
-                detail=CycleStatus.FAILED.value,
+            self._metrics["lifecycle_duration_ms"] = (
+                self.monotonic() - lifecycle_started
+            ) * 1000
+            return self._finish_operational_only(
+                cycle, run_id, decision, len(completed.final),
+                error_category="LIFECYCLE_REJECTED",
             )
-            return PaperScanCycleResult(
-                cycle, run_id, decision.isoformat(), len(completed.final),
-                0, 0, 0, 0, 0, 0, CycleStatus.FAILED,
-            )
+        self._metrics["lifecycle_duration_ms"] = (self.monotonic() - lifecycle_started) * 1000
         lifecycle_state = PaperScannerState(
             emitted_signal_ids=list(self.state.emitted_signal_ids),
             paper_entries=list(self.state.paper_entries),
@@ -359,13 +408,9 @@ class PaperScannerRunner:
                 "STATE_PERSIST_FAILED", cycle, scan_run_id=run_id,
                 detail=f"candidate lifecycle: {type(exc).__name__}: {exc}",
             )
-            self.audit.append(
-                "CYCLE_COMPLETED", cycle, scan_run_id=run_id,
-                detail=CycleStatus.FAILED.value,
-            )
-            return PaperScanCycleResult(
-                cycle, run_id, decision.isoformat(), len(completed.final),
-                0, 0, 0, 0, 0, 0, CycleStatus.FAILED,
+            return self._finish_operational_only(
+                cycle, run_id, decision, len(completed.final),
+                error_category="LIFECYCLE_PERSIST_FAILED",
             )
         self.state = lifecycle_state
         for transition in lifecycle.transitions:
@@ -402,6 +447,7 @@ class PaperScannerRunner:
         # never removed while the corresponding signal could still be emitted.
         self._prune_expired_signal_history(decision)
         evaluated = fresh = stale = signals = duplicates = entries = 0
+        strategy_started = self.monotonic()
         for row in lifecycle.active_rows:
             symbol = str(row["symbol"])
             try:
@@ -426,6 +472,9 @@ class PaperScannerRunner:
                     symbol=symbol,
                     detail=f"{type(exc).__name__}: {exc}",
                 )
+                self._metrics["strategy_evaluation_duration_ms"] = (
+                    self.monotonic() - strategy_started
+                ) * 1000
                 return self._finish(
                     cycle,
                     run_id,
@@ -498,6 +547,9 @@ class PaperScannerRunner:
                     signal_id=signal.signal_id,
                     detail=f"max_signal_history={self.config.max_signal_history}",
                 )
+                self._metrics["strategy_evaluation_duration_ms"] = (
+                    self.monotonic() - strategy_started
+                ) * 1000
                 return self._finish(
                     cycle,
                     run_id,
@@ -547,26 +599,14 @@ class PaperScannerRunner:
                     signal_id=signal.signal_id,
                     detail=f"{type(exc).__name__}: {exc}",
                 )
-                result = PaperScanCycleResult(
-                    cycle,
-                    run_id,
-                    decision.isoformat(),
-                    len(completed.final),
-                    evaluated,
-                    fresh,
-                    stale,
-                    signals,
-                    duplicates,
-                    entries,
-                    CycleStatus.FAILED,
+                self._metrics["strategy_evaluation_duration_ms"] = (
+                    self.monotonic() - strategy_started
+                ) * 1000
+                return self._finish_operational_only(
+                    cycle, run_id, decision, len(completed.final), evaluated,
+                    fresh, stale, signals, duplicates, entries,
+                    error_category="SIGNAL_PERSIST_FAILED",
                 )
-                self.audit.append(
-                    "CYCLE_COMPLETED",
-                    cycle,
-                    scan_run_id=run_id,
-                    detail=CycleStatus.FAILED.value,
-                )
-                return result
             self.state = next_state
             entries += 1
             self.audit.append(
@@ -588,6 +628,7 @@ class PaperScannerRunner:
             if stale and not fresh
             else CycleStatus.COMPLETED
         )
+        self._metrics["strategy_evaluation_duration_ms"] = (self.monotonic() - strategy_started) * 1000
         return self._finish(
             cycle,
             run_id,
@@ -664,18 +705,13 @@ class PaperScannerRunner:
         entries=0,
         status=CycleStatus.COMPLETED,
     ):
+        self._metrics.update({"fresh_candidates": fresh, "stale_candidates": stale,
+                              "active_candidates": final,
+                              "total_cycle_duration_ms": (self.monotonic() - self._cycle_started) * 1000})
         result = PaperScanCycleResult(
-            cycle,
-            run_id,
-            decision.isoformat() if decision else None,
-            final,
-            evaluated,
-            fresh,
-            stale,
-            signals,
-            duplicates,
-            entries,
-            status,
+            cycle, run_id, decision.isoformat() if decision else None, final,
+            evaluated, fresh, stale, signals, duplicates, entries, status,
+            dict(self._metrics),
         )
         cycle_state = asdict(result)
         # Keep the on-disk schema independent of Enum.__str__ implementation
@@ -685,22 +721,179 @@ class PaperScannerRunner:
         if status is CycleStatus.COMPLETED:
             self.state.last_successful_scan_run_id = run_id
         self.store.save(self.state)
-        self.audit.append(
-            "CYCLE_COMPLETED", cycle, scan_run_id=run_id, detail=status.value
+        return self._finalize_operations(result)
+
+    def _finish_operational_only(
+        self, cycle, run_id, decision, final=0, evaluated=0, fresh=0,
+        stale=0, signals=0, duplicates=0, entries=0, *, error_category: str,
+    ) -> PaperScanCycleResult:
+        """Finalize health/audit without touching authoritative PAPER state."""
+        self._metrics.update({
+            "fresh_candidates": fresh,
+            "stale_candidates": stale,
+            "active_candidates": final,
+            "total_cycle_duration_ms": (
+                self.monotonic() - self._cycle_started
+            ) * 1000,
+        })
+        result = PaperScanCycleResult(
+            cycle, run_id, decision.isoformat() if decision else None, final,
+            evaluated, fresh, stale, signals, duplicates, entries,
+            CycleStatus.FAILED, dict(self._metrics),
         )
+        return self._finalize_operations(result, error_category=error_category)
+
+    def _finalize_operations(
+        self, result: PaperScanCycleResult, *, error_category: str | None = None,
+    ) -> PaperScanCycleResult:
+        health_status, disk = self._health_status(result)
+        category = error_category or result.status.value
+        self.audit.append(
+            "CYCLE_COMPLETED", result.cycle_id,
+            scan_run_id=result.scanner_run_id, detail=result.status.value,
+            severity=("ERROR" if health_status is HealthStatus.UNHEALTHY
+                      else "WARNING" if health_status is HealthStatus.DEGRADED
+                      else "INFO"),
+            fields={"health_status": health_status.value, **self._metrics},
+        )
+        now = _utc(self.clock())
+        if health_status is HealthStatus.UNHEALTHY:
+            self.consecutive_failed_cycles += 1
+            self.last_failure, self.last_error_category = now, category
+        elif result.status is CycleStatus.COMPLETED:
+            # Both HEALTHY and usable DEGRADED completions are successful scans.
+            self.consecutive_failed_cycles = 0
+            self.last_success, self.last_error_category = now, None
+        # CANCELLED is operationally neutral: it is neither success nor failure
+        # and therefore preserves prior success/failure accounting.
+        self._publish_health(health_status, result, disk=disk)
         return result
 
     def run_forever(self, stop_event) -> None:
         self.audit.append("RUNTIME_STARTED", "runtime")
         try:
             while not stop_event.is_set():
-                self.run_once(stop_event.is_set, stop_event.wait)
+                try:
+                    self.run_once(stop_event.is_set, stop_event.wait)
+                except Exception as exc:
+                    self.consecutive_failed_cycles += 1
+                    self.last_failure, self.last_error_category = _utc(self.clock()), type(exc).__name__
+                    self.audit.append("RUNTIME_CYCLE_CRASH", "runtime", severity="ERROR",
+                                      fields={"error_type": type(exc).__name__})
+                    self._publish_health(HealthStatus.UNHEALTHY, None)
+                    if stop_event.wait(self.config.operational.crash_recovery_delay.total_seconds()):
+                        break
+                    continue
                 if stop_event.is_set():
                     break
                 if stop_event.wait(self.config.scan_interval.total_seconds()):
                     break
         finally:
             self.audit.append("RUNTIME_STOPPED", "runtime")
+            self._publish_health(HealthStatus.STOPPED, None)
+
+    def _capture_http_telemetry(self, cycle: str) -> None:
+        if self.http_telemetry is None or not self.http_telemetry:
+            return
+        observations = [dict(item) for item in self.http_telemetry]
+        self.http_telemetry.clear()
+        previous = self._metrics.get("binance_public_api", {})
+        self._metrics["binance_public_api"] = {
+            "request_count": previous.get("request_count", 0) + len(observations),
+            "latest": observations[-1],
+            "rate_limit_pressure": previous.get("rate_limit_pressure", False) or any(
+                item.get("http_status") == 429 for item in observations
+            ),
+        }
+        for fields in observations:
+            self.audit.append(
+                "BINANCE_API_RESPONSE", cycle, component="binance_public_api",
+                severity=("WARNING" if fields.get("http_status") in {418, 429}
+                          else "INFO"), fields=fields,
+            )
+
+    def _health_status(self, result: PaperScanCycleResult) -> tuple[HealthStatus, dict[str, Any]]:
+        disk_error = False
+        try:
+            disk = dict(self.disk_monitor.sample())
+            self._metrics.pop("disk_monitor_error", None)
+        except OSError as exc:
+            disk_error = True
+            disk = dict(self.disk_monitor.latest)
+            error = {
+                "error_type": type(exc).__name__,
+                "operation": "disk_cache_sample",
+            }
+            filename = getattr(exc, "filename", None)
+            if filename is not None:
+                error["path"] = str(filename)
+            self._metrics["disk_monitor_error"] = error
+            self.audit.append(
+                "DISK_MONITOR_FAILED", result.cycle_id,
+                scan_run_id=result.scanner_run_id,
+                severity="WARNING", component="disk_monitor", fields=error,
+            )
+        disappeared = sum(
+            int(value.get("entries_disappeared", 0) or 0)
+            for value in disk.values() if isinstance(value, dict)
+        )
+        if disappeared:
+            warning_fields = {
+                "operation": "cache_walk",
+                "entries_disappeared": disappeared,
+            }
+            self._metrics["disk_monitor_warning"] = warning_fields
+            self.audit.append(
+                "DISK_MONITOR_WARNING", result.cycle_id,
+                scan_run_id=result.scanner_run_id, severity="WARNING",
+                component="disk_monitor", fields=warning_fields,
+            )
+        else:
+            self._metrics.pop("disk_monitor_warning", None)
+        if result.status in {CycleStatus.FAILED, CycleStatus.STALE_DISCOVERY, CycleStatus.STALE_STRATEGY_DATA}:
+            return HealthStatus.UNHEALTHY, disk
+        if result.status is CycleStatus.CANCELLED:
+            return HealthStatus.DEGRADED, disk
+        levels = {value.get("level") for value in disk.values()
+                  if isinstance(value, dict)}
+        if "CRITICAL" in levels:
+            return HealthStatus.UNHEALTHY, disk
+        candle = self._metrics.get("strategy_candle_acquisition", {})
+        rich = self._metrics.get("rich_feature_readiness", {})
+        partial = any(candle.get(name, 0) for name in (
+            "missing", "quality_failed", "download_failed", "cancelled"
+        ))
+        optional_degraded = bool(
+            rich.get("degraded", 0) or rich.get("unavailable", 0)
+        )
+        rate_limit_pressure = self._metrics.get("binance_public_api", {}).get(
+            "rate_limit_pressure", False
+        )
+        warning = (
+            "WARNING" in levels or result.stale_candidates
+            or self._metrics.get("retry_count") or partial or optional_degraded
+            or rate_limit_pressure or disk_error or disappeared
+        )
+        return (HealthStatus.DEGRADED if warning else HealthStatus.HEALTHY), disk
+
+    def _publish_health(
+        self, status: HealthStatus, result: PaperScanCycleResult | None,
+        *, disk: Mapping[str, Any] | None = None,
+    ) -> None:
+        try:
+            snapshot = ScannerHealthSnapshot(
+                1, _utc(self.clock()).isoformat(), self.runtime_started.isoformat(), status.value,
+                result.cycle_id if result else None, result.scanner_run_id if result else None,
+                result.status.value if result else None,
+                self.last_success.isoformat() if self.last_success else None,
+                self.last_failure.isoformat() if self.last_failure else None,
+                self.consecutive_failed_cycles, self.last_error_category,
+                dict(self._metrics), dict(disk if disk is not None else self.disk_monitor.sample()),
+            )
+            self.health_reporter.publish(snapshot)
+        except OSError as exc:
+            self.audit.append("HEALTH_PUBLISH_FAILED", "runtime", severity="WARNING",
+                              fields={"error_type": type(exc).__name__})
 
 
 def _utc(value: datetime) -> datetime:

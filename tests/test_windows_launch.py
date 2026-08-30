@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_no_console_launcher_quotes_paths_and_uses_project_venv():
-    launcher = (ROOT / "Crypto Strategy Lab.vbs").read_text()
+    launcher = (ROOT / "Crypto Opportunity Scanner.vbs").read_text()
     assert 'files.BuildPath(root, ".venv\\Scripts\\pythonw.exe")' in launcher
     assert 'files.BuildPath(root, "app.py")' in launcher
     assert 'shell.CurrentDirectory = root' in launcher

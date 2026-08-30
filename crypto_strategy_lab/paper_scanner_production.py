@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -13,6 +14,7 @@ from crypto_strategy_lab.data.backtest_service import load_backtest_bundle
 from crypto_strategy_lab.data.query import DataRequest
 from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
 from crypto_strategy_lab.data.store import MarketDataStore
+from crypto_strategy_lab.data.binance.universe import BinanceUsdMDiscoveryClient
 from crypto_strategy_lab.gui.opportunity_scanner_controller import (
     OpportunityScanRequest,
     create_opportunity_scanner_service,
@@ -48,11 +50,34 @@ def create_production_paper_scanner(
     decision API.
     """
     raw_root, cache = Path(market_data_root), Path(cache_root)
+    output = Path(scan_output_root)
+    options = dict(scanner_pipeline_options or {})
+    http_telemetry: list[Mapping[str, Any]] = []
+    if "live_client" not in options:
+        options["live_client"] = BinanceUsdMDiscoveryClient(
+            telemetry=http_telemetry.append
+        )
+    if not paper_config.operational.disk.paths:
+        disk = replace(
+            paper_config.operational.disk,
+            paths={
+                "paper_state": paper_config.state_path.parent,
+                "paper_audit": paper_config.audit_log_path.parent,
+                "opportunity_scans": output,
+                "data_lake_raw": raw_root,
+                "cache": cache,
+            },
+            cache_path=(paper_config.operational.disk.cache_path or cache),
+        )
+        paper_config = replace(
+            paper_config,
+            operational=replace(paper_config.operational, disk=disk),
+        )
     scanner = create_opportunity_scanner_service(
         raw_root,
         cache,
-        Path(scan_output_root),
-        **dict(scanner_pipeline_options or {}),
+        output,
+        **options,
     )
     store = MarketDataStore(raw_root, cache)
 
@@ -99,6 +124,7 @@ def create_production_paper_scanner(
         LatestNativeStrategyEvaluator(engine_builder),
         clock=clock,
         sleeper=sleeper,
+        http_telemetry=http_telemetry,
     )
 
 
