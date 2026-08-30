@@ -194,7 +194,14 @@ def test_off_grid_decision_aligns_task3_but_preserves_pipeline_boundary(
         minimum_listing_age_days=30,minimum_quote_volume=Decimal(0),
         maximum_spread_percent=Decimal(1),preliminary_size=1,final_size=1,
         strategy_interval="1h",model=None,enabled_features=())
-    assert pipeline(request,lambda:False) == tmp_path/"published"
+    events=[]
+    assert pipeline.run_with_progress(request,lambda:False,events.append) == tmp_path/"published"
+    assert [(event.stage,event.name) for event in events] == [
+        (1,"discovery" if mode == "LIVE" else "historical_discovery"),
+        (2,"candle_acquisition"),(3,"scoring"),(4,"final_candidates"),
+        (5,"rich_data"),(6,"publication"),
+    ]
+    assert events[2].detail == "skipped (scoring disabled)"
     task3=next(call for call in calls if call[0]=="task3")
     assert task3[2] == datetime(2026,1,2,12,0,tzinfo=timezone.utc)
     assert task3[1] == datetime(2025,12,31,9,0,tzinfo=timezone.utc)
@@ -295,3 +302,36 @@ def test_workspace_uses_code_commit_and_has_shutdown_wait_contract():
     assert '"acquisition_state","quality_status","detail"' in source
     installer=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_install.py").read_text(encoding="utf-8")
     assert "application.aboutToQuit.connect(workspace.shutdown)" in installer
+
+def test_workspace_rows_and_gui_timestamp_precision():
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    widgets=pytest.importorskip("PySide6.QtWidgets",exc_type=ImportError)
+    core=pytest.importorskip("PySide6.QtCore",exc_type=ImportError)
+    from crypto_strategy_lab.gui.opportunity_scanner_workspace import OpportunityScannerWorkspace
+    app=widgets.QApplication.instance() or widgets.QApplication([])
+    workspace=OpportunityScannerWorkspace(object())
+    def row_visible(field):
+        label=workspace.form.labelForField(field)
+        return field.isVisibleTo(workspace) and label.isVisibleTo(workspace)
+    try:
+        workspace.show(); app.processEvents()
+        assert not row_visible(workspace.historical_execution)
+        assert not row_visible(workspace.decision_time)
+        assert not row_visible(workspace.range_start)
+        workspace.mode.setCurrentIndex(1); app.processEvents()
+        assert row_visible(workspace.historical_execution)
+        assert row_visible(workspace.decision_time)
+        assert not row_visible(workspace.range_start)
+        value=core.QDateTime.fromString("2026-01-02T03:04:05.437Z",core.Qt.ISODateWithMs)
+        workspace.decision_time.setDateTime(value)
+        assert workspace.request().decision_time.microsecond == 0
+        assert workspace.request().decision_time.strftime("%Y-%m-%d %H:%M:%S UTC") == workspace.decision_time.text()
+        workspace.historical_execution.setCurrentIndex(1); app.processEvents()
+        assert not row_visible(workspace.decision_time)
+        assert all(row_visible(field) for field in (workspace.range_start,workspace.range_end,workspace.replay_cadence,workspace.planned_scans))
+        workspace.range_start.setDateTime(value)
+        workspace.range_end.setDateTime(value.addSecs(7200))
+        workspace.replay_cadence.setValue(1)
+        assert workspace.planned_scans.text() == "3"
+        assert all(point.microsecond == 0 for point in workspace._range_points())
+    finally: workspace.close()

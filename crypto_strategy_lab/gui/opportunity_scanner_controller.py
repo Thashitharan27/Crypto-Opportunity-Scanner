@@ -6,12 +6,12 @@ canonical, integrity-checked Task-7 result reader.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import pandas as pd
 
@@ -152,9 +152,77 @@ class OpportunityScannerApplicationService:
     def run(self, request: OpportunityScanRequest, cancelled: Callable[[], bool]) -> CompletedOpportunityScan:
         return self.reader.read(self._run_once(request, cancelled))
 
+    def run_with_progress(self, request: OpportunityScanRequest,
+                          cancelled: Callable[[], bool], progress=None) -> CompletedOpportunityScan:
+        """Run once, forwarding production stage events when the adapter supports them."""
+        callback = progress or (lambda _event: None)
+        runner = getattr(self._run_once, "run_with_progress", None)
+        path = runner(request, cancelled, callback) if runner else self._run_once(request, cancelled)
+        return self.reader.read(path)
+
 
 class OpportunityScanCancelled(RuntimeError):
     """Cooperative cancellation before an authoritative Task-7 publication."""
+
+
+@dataclass(frozen=True, slots=True)
+class OpportunityScanProgress:
+    """A stable, presentation-neutral production pipeline progress event."""
+
+    stage: int
+    name: str
+    detail: str = ""
+
+
+def historical_decision_points(start: datetime, end: datetime,
+                               cadence: timedelta) -> tuple[datetime, ...]:
+    """Return inclusive sequential replay boundaries without rounding callers' values."""
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("historical range timestamps must be timezone-aware")
+    if cadence <= timedelta(0):
+        raise ValueError("historical replay cadence must be positive")
+    first, last = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    if first > last:
+        raise ValueError("historical range start must not be after end")
+    points = []
+    current = first
+    while current <= last:
+        points.append(current)
+        current += cadence
+    return tuple(points)
+
+
+class HistoricalRangeRunner:
+    """Sequentially reuse the single-scan service for each historical boundary."""
+
+    def __init__(self, service):
+        self.service = service
+
+    def run(self, request: OpportunityScanRequest, points,
+            cancelled: Callable[[], bool], progress=None):
+        callback = progress or (lambda *_args: None)
+        results = []
+        total = len(points)
+        for index, decision in enumerate(points, 1):
+            if cancelled():
+                raise OpportunityScanCancelled(
+                    f"historical range cancelled after {len(results)} / {total} scans"
+                )
+            item = dataclass_replace(request, decision_time=decision)
+            try:
+                enhanced = getattr(self.service, "run_with_progress", None)
+                result = (enhanced(item, cancelled, lambda event: callback(
+                    "stage", len(results), total, decision, event))
+                    if enhanced else self.service.run(item, cancelled))
+            except OpportunityScanCancelled:
+                raise OpportunityScanCancelled(
+                    f"historical range cancelled after {len(results)} / {total} scans"
+                )
+            except Exception as exc:
+                raise RuntimeError(f"historical scan failed at {decision.isoformat()}: {exc}") from exc
+            results.append(result)
+            callback("completed", index, total, decision, None)
+        return tuple(results)
 
 
 class UnconfiguredOpportunityScannerService(OpportunityScannerApplicationService):
@@ -185,6 +253,10 @@ class Task1To7OpportunityScanner:
 
     def __call__(self, request: OpportunityScanRequest,
                  cancelled: Callable[[], bool]) -> Path:
+        return self.run_with_progress(request, cancelled, lambda _event: None)
+
+    def run_with_progress(self, request: OpportunityScanRequest,
+                          cancelled: Callable[[], bool], progress) -> Path:
         if request.mode == "LIVE":
             discovery = scan_universe(
                 self.live_client, request.live_discovery, now=self.now
@@ -200,6 +272,10 @@ class Task1To7OpportunityScanner:
             )
             discovery_config = None
 
+        progress(OpportunityScanProgress(
+            1, "discovery" if request.mode == "LIVE" else "historical_discovery"
+        ))
+
         self._raise_if_cancelled(cancelled)
 
         required_bars = max(
@@ -212,15 +288,21 @@ class Task1To7OpportunityScanner:
         candles = SelectiveCandleAcquirer(
             self.store, self.backend, request.candle_acquisition
         ).acquire(discovery, candle_start, candle_end, cancelled=cancelled)
+        progress(OpportunityScanProgress(2, "candle_acquisition"))
 
         self._raise_if_cancelled(cancelled)
         scoring = self._score(request, candles, decision) if request.scoring else None
+        progress(OpportunityScanProgress(
+            3, "scoring", "completed" if request.scoring else "skipped (scoring disabled)"
+        ))
         final = build_final_candidate_set(
             discovery, candles, scoring, request.final_candidates
         )
+        progress(OpportunityScanProgress(4, "final_candidates"))
         rich = SelectiveRichDataAcquirer(
             self.store, self.backend, request.rich_data, self.registry
         ).acquire(final, cancelled=cancelled)
+        progress(OpportunityScanProgress(5, "rich_data"))
         # Task 7 has no cancellation contract and writes an immutable completed
         # marker.  Never enter publication after a cooperative cancellation.
         self._raise_if_cancelled(cancelled)
@@ -232,7 +314,9 @@ class Task1To7OpportunityScanner:
             final_candidates=final, rich_data=rich,
             rich_data_config=request.rich_data,
         )
-        return publish_opportunity_scan(self.output_root, package)
+        path = publish_opportunity_scan(self.output_root, package)
+        progress(OpportunityScanProgress(6, "publication"))
+        return path
 
     @staticmethod
     def _raise_if_cancelled(cancelled: Callable[[], bool]) -> None:
