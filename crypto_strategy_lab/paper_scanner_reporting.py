@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 
 class PaperScannerAuditLog:
@@ -23,6 +23,9 @@ class PaperScannerAuditLog:
         symbol: str | None = None,
         signal_id: str | None = None,
         detail: str = "",
+        severity: str = "INFO",
+        component: str = "paper_scanner",
+        fields: Mapping[str, Any] | None = None,
     ) -> None:
         row = {
             "timestamp": self.clock().astimezone(timezone.utc).isoformat(),
@@ -32,6 +35,9 @@ class PaperScannerAuditLog:
             "symbol": symbol,
             "signal_id": signal_id,
             "detail": detail,
+            "severity": severity,
+            "component": component,
+            "fields": dict(fields or {}),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as stream:

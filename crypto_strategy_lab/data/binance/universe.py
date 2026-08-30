@@ -33,12 +33,23 @@ class DiscoveryClient(Protocol):
 class BinanceUsdMDiscoveryClient:
     """Minimal adapter for Binance's public USD-M Futures REST API."""
 
-    def __init__(self, base_url: str = "https://fapi.binance.com", timeout: float = 10.0):
+    def __init__(self, base_url: str = "https://fapi.binance.com", timeout: float = 10.0,
+                 *, transport: Callable[..., Any] = urlopen,
+                 telemetry: Callable[[Mapping[str, Any]], None] | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.transport = transport
+        self.telemetry = telemetry or (lambda _fields: None)
 
     def _get(self, path: str) -> Any:
-        with urlopen(f"{self.base_url}{path}", timeout=self.timeout) as response:
+        with self.transport(f"{self.base_url}{path}", timeout=self.timeout) as response:
+            headers = response.headers
+            self.telemetry({
+                "endpoint": path,
+                "http_status": getattr(response, "status", None),
+                "retry_after_seconds": headers.get("Retry-After"),
+                "used_weight": headers.get("X-MBX-USED-WEIGHT-1M"),
+            })
             return json.load(response)
 
     def exchange_info(self) -> Mapping[str, Any]:

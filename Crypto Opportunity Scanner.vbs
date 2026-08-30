@@ -11,7 +11,7 @@ appPath = files.BuildPath(root, "app.py")
 If Not files.FileExists(pythonw) Then
     MsgBox "The Python environment was not found:" & vbCrLf & pythonw & vbCrLf & vbCrLf & _
            "Create .venv and install requirements before launching.", _
-           vbCritical, "Crypto Strategy Lab"
+           vbCritical, "Crypto Opportunity Scanner"
     WScript.Quit 1
 End If
 

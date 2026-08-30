@@ -16,6 +16,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable, Protocol
 import uuid
+import time
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,10 @@ from crypto_strategy_lab.paper_scanner_reporting import PaperScannerAuditLog
 from crypto_strategy_lab.paper_scanner_state import (
     PaperScannerState,
     PaperScannerStateStore,
+)
+from crypto_strategy_lab.scanner_operations import (
+    DiskMonitor, HealthReporter, HealthStatus, ScannerHealthSnapshot,
+    ScannerOperationalConfig, retry_delay_seconds, retryable_exception,
 )
 
 
@@ -62,6 +67,7 @@ class PaperScannerConfig:
     audit_log_path: Path
     max_signal_history: int = 10_000
     signal_history_retention: timedelta = timedelta(days=365)
+    operational: ScannerOperationalConfig = ScannerOperationalConfig()
 
     def __post_init__(self) -> None:
         if self.scan_interval <= timedelta(0):
@@ -210,6 +216,7 @@ class PaperScanCycleResult:
     duplicate_signals_suppressed: int
     new_paper_entries: int
     status: CycleStatus
+    metrics: dict[str, Any] | None = None
 
 
 class PaperScannerRunner:
@@ -224,16 +231,14 @@ class PaperScannerRunner:
         sleeper: Callable[[float], None] | None = None,
         transient_error: Callable[[Exception], bool] | None = None,
         lifecycle_policy: CandidateLifecyclePolicy = DEFAULT_LIFECYCLE_POLICY,
+        monotonic: Callable[[], float] | None = None,
     ):
         self.config, self.scanner = config, scanner
         self.request_factory, self.evaluator = request_factory, evaluator
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        import time
-
         self.sleeper = sleeper or time.sleep
-        self.transient_error = transient_error or (
-            lambda exc: isinstance(exc, (ConnectionError, TimeoutError))
-        )
+        self.monotonic = monotonic or time.monotonic
+        self.transient_error = transient_error or retryable_exception
         self.store = PaperScannerStateStore(config.state_path)
         self.audit = PaperScannerAuditLog(config.audit_log_path, self.clock)
         self.state = self.store.load()  # corrupt state fails closed before runtime
@@ -241,6 +246,13 @@ class PaperScannerRunner:
         if self.state.lifecycle_policy.identity != lifecycle_policy.identity:
             raise ValueError("configured lifecycle policy does not match durable state")
         self.lifecycle_policy = lifecycle_policy
+        self.runtime_started = _utc(self.clock())
+        self.health_reporter = HealthReporter(config.operational.health_path)
+        self.disk_monitor = DiskMonitor(config.operational.disk)
+        self.consecutive_failed_cycles = 0
+        self.last_success = self.last_failure = self.last_error_category = None
+        self._cycle_started = self.monotonic()
+        self._metrics: dict[str, Any] = {}
         self.audit.append(
             "STATE_LOADED",
             "runtime",
@@ -249,6 +261,7 @@ class PaperScannerRunner:
                 f"lifecycle_policy={self.lifecycle_policy.identity}"
             ),
         )
+        self._publish_health(HealthStatus.STARTING, None)
 
     def run_once(
         self,
@@ -256,6 +269,12 @@ class PaperScannerRunner:
         cancellation_wait: Callable[[float], bool] | None = None,
     ) -> PaperScanCycleResult:
         cancellation_requested = cancelled or (lambda: False)
+        self._cycle_started = self.monotonic()
+        self._metrics = {
+            "stale_market_limit_seconds": self.config.stale_market_snapshot_limit.total_seconds(),
+            "stale_strategy_limit_seconds": self.config.stale_strategy_candle_limit.total_seconds(),
+            "retry_count": 0,
+        }
         cycle = uuid.uuid4().hex
         self.audit.append("SCAN_STARTED", cycle)
         completed = None
@@ -267,7 +286,10 @@ class PaperScannerRunner:
                 request = self.request_factory()
                 if request.mode != "LIVE":
                     raise ValueError("paper scanner supports LIVE requests only")
+                pipeline_started = self.monotonic()
                 completed = self.scanner.run(request, cancellation_requested)
+                self._metrics["pipeline_duration_ms"] = (self.monotonic() - pipeline_started) * 1000
+                self._metrics.update(_published_acquisition_metrics(completed))
                 break
             except OpportunityScanCancelled:
                 self.audit.append("SCAN_CANCELLED", cycle)
@@ -284,8 +306,17 @@ class PaperScannerRunner:
                     "SCAN_RETRY",
                     cycle,
                     detail=f"attempt={attempt + 1} {type(exc).__name__}",
+                    severity="WARNING",
+                    component="scanner_pipeline",
+                    fields={"error_type": type(exc).__name__, "attempt": attempt + 1,
+                            "http_status": getattr(exc, "code", None)},
                 )
-                backoff = self.config.retry_backoff.total_seconds()
+                backoff = retry_delay_seconds(
+                    exc, attempt + 1, self.config.retry_backoff,
+                    self.config.operational.retry_backoff_cap,
+                )
+                self._metrics["retry_count"] = attempt + 1
+                self._metrics["last_retry_delay_seconds"] = backoff
                 if cancellation_wait is not None:
                     if cancellation_wait(backoff):
                         self.audit.append("SCAN_CANCELLED", cycle)
@@ -304,12 +335,14 @@ class PaperScannerRunner:
         decision = _parse(completed.summary["decision_timestamp"])
         self.audit.append("SCAN_COMPLETED", cycle, scan_run_id=run_id)
         age = _utc(self.clock()) - decision
+        self._metrics["discovery_age_seconds"] = age.total_seconds()
         if age < timedelta(0) or age > self.config.stale_market_snapshot_limit:
             self.audit.append(
                 "STALE_DISCOVERY",
                 cycle,
                 scan_run_id=run_id,
                 detail=f"age_seconds={age.total_seconds()}",
+                severity="ERROR", fields={"discovery_age_seconds": age.total_seconds()},
             )
             return self._finish(
                 cycle,
@@ -318,6 +351,7 @@ class PaperScannerRunner:
                 len(completed.final),
                 status=CycleStatus.STALE_DISCOVERY,
             )
+        lifecycle_started = self.monotonic()
         try:
             lifecycle = apply_candidate_lifecycle(
                 self.state.candidate_lifecycle,
@@ -341,8 +375,9 @@ class PaperScannerRunner:
             )
             return PaperScanCycleResult(
                 cycle, run_id, decision.isoformat(), len(completed.final),
-                0, 0, 0, 0, 0, 0, CycleStatus.FAILED,
+                0, 0, 0, 0, 0, 0, CycleStatus.FAILED, dict(self._metrics),
             )
+        self._metrics["lifecycle_duration_ms"] = (self.monotonic() - lifecycle_started) * 1000
         lifecycle_state = PaperScannerState(
             emitted_signal_ids=list(self.state.emitted_signal_ids),
             paper_entries=list(self.state.paper_entries),
@@ -402,6 +437,7 @@ class PaperScannerRunner:
         # never removed while the corresponding signal could still be emitted.
         self._prune_expired_signal_history(decision)
         evaluated = fresh = stale = signals = duplicates = entries = 0
+        strategy_started = self.monotonic()
         for row in lifecycle.active_rows:
             symbol = str(row["symbol"])
             try:
@@ -588,6 +624,7 @@ class PaperScannerRunner:
             if stale and not fresh
             else CycleStatus.COMPLETED
         )
+        self._metrics["strategy_evaluation_duration_ms"] = (self.monotonic() - strategy_started) * 1000
         return self._finish(
             cycle,
             run_id,
@@ -664,18 +701,13 @@ class PaperScannerRunner:
         entries=0,
         status=CycleStatus.COMPLETED,
     ):
+        self._metrics.update({"fresh_candidates": fresh, "stale_candidates": stale,
+                              "active_candidates": final,
+                              "total_cycle_duration_ms": (self.monotonic() - self._cycle_started) * 1000})
         result = PaperScanCycleResult(
-            cycle,
-            run_id,
-            decision.isoformat() if decision else None,
-            final,
-            evaluated,
-            fresh,
-            stale,
-            signals,
-            duplicates,
-            entries,
-            status,
+            cycle, run_id, decision.isoformat() if decision else None, final,
+            evaluated, fresh, stale, signals, duplicates, entries, status,
+            dict(self._metrics),
         )
         cycle_state = asdict(result)
         # Keep the on-disk schema independent of Enum.__str__ implementation
@@ -685,22 +717,67 @@ class PaperScannerRunner:
         if status is CycleStatus.COMPLETED:
             self.state.last_successful_scan_run_id = run_id
         self.store.save(self.state)
+        health_status = self._health_status(result)
         self.audit.append(
-            "CYCLE_COMPLETED", cycle, scan_run_id=run_id, detail=status.value
+            "CYCLE_COMPLETED", cycle, scan_run_id=run_id, detail=status.value,
+            severity="ERROR" if status in {CycleStatus.FAILED, CycleStatus.STALE_DISCOVERY} else "INFO",
+            fields={"health_status": health_status.value, **self._metrics},
         )
+        if health_status is HealthStatus.UNHEALTHY:
+            self.consecutive_failed_cycles += 1
+            self.last_failure, self.last_error_category = _utc(self.clock()), status.value
+        else:
+            self.consecutive_failed_cycles = 0
+            self.last_success, self.last_error_category = _utc(self.clock()), None
+        self._publish_health(health_status, result)
         return result
 
     def run_forever(self, stop_event) -> None:
         self.audit.append("RUNTIME_STARTED", "runtime")
         try:
             while not stop_event.is_set():
-                self.run_once(stop_event.is_set, stop_event.wait)
+                try:
+                    self.run_once(stop_event.is_set, stop_event.wait)
+                except Exception as exc:
+                    self.consecutive_failed_cycles += 1
+                    self.last_failure, self.last_error_category = _utc(self.clock()), type(exc).__name__
+                    self.audit.append("RUNTIME_CYCLE_CRASH", "runtime", severity="ERROR",
+                                      fields={"error_type": type(exc).__name__})
+                    self._publish_health(HealthStatus.UNHEALTHY, None)
+                    if stop_event.wait(self.config.operational.crash_recovery_delay.total_seconds()):
+                        break
+                    continue
                 if stop_event.is_set():
                     break
                 if stop_event.wait(self.config.scan_interval.total_seconds()):
                     break
         finally:
             self.audit.append("RUNTIME_STOPPED", "runtime")
+            self._publish_health(HealthStatus.STOPPED, None)
+
+    def _health_status(self, result: PaperScanCycleResult) -> HealthStatus:
+        if result.status in {CycleStatus.FAILED, CycleStatus.STALE_DISCOVERY, CycleStatus.STALE_STRATEGY_DATA}:
+            return HealthStatus.UNHEALTHY
+        disk = self.disk_monitor.sample()
+        warning = any(value.get("level") in {"WARNING", "CRITICAL"}
+                      for value in disk.values() if isinstance(value, dict))
+        return HealthStatus.DEGRADED if result.stale_candidates or self._metrics.get("retry_count") or warning else HealthStatus.HEALTHY
+
+    def _publish_health(self, status: HealthStatus, result: PaperScanCycleResult | None) -> None:
+        try:
+            snapshot = ScannerHealthSnapshot(
+                1, _utc(self.clock()).isoformat(), self.runtime_started.isoformat(), status.value,
+                result.cycle_id if result else None, result.scanner_run_id if result else None,
+                result.status.value if result else None,
+                self.last_success.isoformat() if self.last_success else None,
+                self.last_failure.isoformat() if self.last_failure else None,
+                self.consecutive_failed_cycles, self.last_error_category,
+                dict(self._metrics), self.disk_monitor.sample(),
+            )
+            self.health_reporter.publish(snapshot)
+        except OSError as exc:
+            self.audit.append("HEALTH_PUBLISH_FAILED", "runtime", severity="WARNING",
+                              fields={"error_type": type(exc).__name__})
 
 
 def _utc(value: datetime) -> datetime:
@@ -723,3 +800,29 @@ def _optional_int(value):
 
 def _optional_float(value):
     return None if value is None or pd.isna(value) else float(value)
+
+
+def _published_acquisition_metrics(completed: Any) -> dict[str, Any]:
+    """Aggregate Task-7 published Task 3/6 fields without changing semantics."""
+    preliminary = getattr(completed, "preliminary", pd.DataFrame())
+    readiness = getattr(completed, "readiness", pd.DataFrame())
+    states = ("REUSED", "ACQUIRED", "MISSING", "QUALITY_FAILED", "DOWNLOAD_FAILED", "CANCELLED")
+    if "acquisition_state" in preliminary:
+        state_values = preliminary["acquisition_state"].astype(str)
+        candle = {state.lower(): int((state_values == state).sum()) for state in states}
+        candle.update({
+            "requested_symbols": int(len(preliminary)),
+            "rows_available": int(pd.to_numeric(preliminary.get("row_count", pd.Series(dtype=int)), errors="coerce").fillna(0).sum()),
+            "coverage_gaps_attempted": int(preliminary.get("acquisition_ranges", pd.Series(dtype=str)).fillna("[]").astype(str).ne("[]").sum()),
+        })
+    else:
+        candle = {}
+    rich_states = readiness.get("acquisition_state", pd.Series(dtype=str)).astype(str)
+    feature = readiness.get("feature_readiness", pd.Series(dtype=str)).astype(str)
+    return {
+        "strategy_candle_acquisition": candle,
+        "rich_dataset_acquisition": {"dataset_requirements": int(len(readiness)),
+                                     **{state.lower(): int((rich_states == state).sum()) for state in states}},
+        "rich_feature_readiness": {state.lower(): int((feature == state).sum())
+                                   for state in ("READY", "DEGRADED", "UNAVAILABLE")},
+    }
