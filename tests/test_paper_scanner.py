@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
@@ -27,7 +28,7 @@ from crypto_strategy_lab.rule_native_engine import (
     RuleAwareDataLakeProductionBacktestEngine,
 )
 from crypto_strategy_lab.scanner_operations import (
-    DiskMonitoringConfig, ScannerOperationalConfig,
+    DiskMonitor, DiskMonitoringConfig, ScannerOperationalConfig,
 )
 
 
@@ -684,6 +685,60 @@ def test_runner_health_observes_disk_warning_and_critical(tmp_path, free, expect
     )
     assert app.run_once().status is CycleStatus.COMPLETED
     assert health(tmp_path)["status"] == expected
+
+
+def test_disk_monitor_failure_degrades_success_without_state_or_scheduler_crash(tmp_path):
+    disk = DiskMonitoringConfig(
+        paths={"paper": tmp_path}, sample_every_cycles=1,
+    )
+    app, _ = runner(tmp_path, operational=health_config(tmp_path, disk=disk))
+    app.disk_monitor.usage = lambda path: (_ for _ in ()).throw(
+        OSError(5, "filesystem unavailable", str(path))
+    )
+    result = app.run_once()
+    durable = PaperScannerStateStore(tmp_path / "state.json").load()
+    assert result.status is CycleStatus.COMPLETED
+    assert len(durable.paper_entries) == 1
+    assert durable.candidate_lifecycle == app.state.candidate_lifecycle
+    current = health(tmp_path)
+    assert current["status"] == "DEGRADED"
+    assert current["metrics"]["disk_monitor_error"] == {
+        "error_type": "OSError", "operation": "disk_cache_sample",
+        "path": str(tmp_path),
+    }
+    assert "DISK_MONITOR_FAILED" in events(tmp_path / "audit.jsonl")
+
+    class Stop:
+        def is_set(self): return False
+        def wait(self, _seconds): return True
+
+    app.run_forever(Stop())
+    assert "RUNTIME_CYCLE_CRASH" not in events(tmp_path / "audit.jsonl")
+
+
+def test_different_device_critical_disk_makes_runner_unhealthy(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    disk = DiskMonitoringConfig(
+        paths={"first": first, "second": second}, sample_every_cycles=1,
+        warning_free_percent=20, critical_free_percent=10,
+    )
+    app, _ = runner(tmp_path, operational=health_config(tmp_path, disk=disk))
+    devices = {first: 1, second: 2}
+    usage_calls = []
+    app.disk_monitor = DiskMonitor(
+        disk,
+        usage=lambda path: (
+            usage_calls.append(Path(path)),
+            SimpleNamespace(total=100, used=(50 if Path(path) == first else 95),
+                            free=(50 if Path(path) == first else 5)),
+        )[1],
+        filesystem_stat=lambda path: SimpleNamespace(st_dev=devices[Path(path)]),
+    )
+    assert app.run_once().status is CycleStatus.COMPLETED
+    assert usage_calls == [first, second]
+    assert health(tmp_path)["disk"]["first"]["level"] == "OK"
+    assert health(tmp_path)["disk"]["second"]["level"] == "CRITICAL"
+    assert health(tmp_path)["status"] == "UNHEALTHY"
 
 
 def test_cancelled_cycle_is_not_success_and_preserves_failure_history(tmp_path):

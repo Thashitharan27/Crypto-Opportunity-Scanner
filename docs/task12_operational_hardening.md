@@ -68,9 +68,16 @@ policy still fails closed. Recovery never deletes signal IDs, entries, lifecycle
 state, cursors, Data Lake data, or caches.
 
 Disk observation reports total/free bytes and free percentage for configured
-paths, deduplicates volume calls, classifies explicit warning/critical thresholds,
-and samples on a configured cadence. Cache size walking has a file bound. It is
-strictly read-only and performs no cleanup or repair.
+paths, deduplicates volume calls using the nearest existing path's filesystem
+device identity, classifies explicit warning/critical thresholds, and samples on
+a configured cadence. Cache size walking has a file bound and tolerates entries
+that disappear during concurrent cache replacement. It is strictly read-only and
+performs no cleanup or repair.
+
+Disk/cache observation is best-effort. An `OSError` produces a structured
+`DISK_MONITOR_FAILED` audit event and `disk_monitor_error` health metric; it does
+not unwind an otherwise completed PAPER cycle or enter crash recovery. A valid
+cycle with unavailable disk telemetry is `DEGRADED`, never falsely `HEALTHY`.
 
 The production PAPER composition automatically supplies the known Paper state,
 audit, OPPORTUNITY_SCAN output, raw Data Lake, and cache paths when no explicit

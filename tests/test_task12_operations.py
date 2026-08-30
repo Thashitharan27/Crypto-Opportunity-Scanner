@@ -116,6 +116,53 @@ def test_disk_monitor_is_read_only_cadenced_and_classified(tmp_path):
     assert len(calls) == 1  # same volume is deduplicated
 
 
+def test_disk_monitor_deduplicates_by_device_not_posix_anchor(tmp_path):
+    same_a, same_b, other = (tmp_path / name for name in ("a", "b", "other"))
+    calls = []
+    devices = {same_a: 11, same_b: 11, other: 22}
+
+    def stat(path):
+        return SimpleNamespace(st_dev=devices[Path(path)])
+
+    def usage(path):
+        calls.append(Path(path))
+        free = 50 if Path(path) in {same_a, same_b} else 5
+        return SimpleNamespace(total=100, used=100 - free, free=free)
+
+    monitor = DiskMonitor(
+        DiskMonitoringConfig(
+            paths={"same_a": same_a, "same_b": same_b, "other": other},
+            sample_every_cycles=1, warning_free_percent=20,
+            critical_free_percent=10,
+        ),
+        usage=usage,
+        filesystem_stat=stat,
+    )
+    sample = monitor.sample()
+    assert calls == [same_a, other]
+    assert sample["same_a"] is sample["same_b"]
+    assert sample["same_a"]["level"] == "OK"
+    assert sample["other"]["level"] == "CRITICAL"
+
+
+def test_cache_walk_tolerates_disappearing_file(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    raced = cache / "raced.bin"
+    raced.write_bytes(b"data")
+    original_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if Path(path) == raced:
+            raise FileNotFoundError(str(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    sample = DiskMonitor(DiskMonitoringConfig(cache_path=cache)).sample(force=True)
+    assert sample["cache"]["size_bytes"] == 0
+    assert sample["cache"]["entries_disappeared"] == 1
+
+
 def test_acquisition_metrics_use_existing_state_and_readiness_values():
     candles = [
         {"acquisition_state": "REUSED", "row_count": 5,

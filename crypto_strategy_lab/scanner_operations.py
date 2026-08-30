@@ -119,8 +119,17 @@ class HealthReporter:
 
 class DiskMonitor:
     """Read-only, cadence-controlled filesystem observer with bounded cache walk."""
-    def __init__(self, config: DiskMonitoringConfig, usage: Callable[[Path], Any] = shutil.disk_usage):
-        self.config, self.usage, self.samples, self.latest = config, usage, 0, {}
+    def __init__(
+        self,
+        config: DiskMonitoringConfig,
+        usage: Callable[[Path], Any] = shutil.disk_usage,
+        filesystem_stat: Callable[[Path], Any] = os.stat,
+    ):
+        self.config = config
+        self.usage = usage
+        self.filesystem_stat = filesystem_stat
+        self.samples = 0
+        self.latest: Mapping[str, Any] = {}
 
     def sample(self, force: bool = False) -> Mapping[str, Any]:
         self.samples += 1
@@ -128,8 +137,11 @@ class DiskMonitor:
             return self.latest
         volumes, result = {}, {}
         for name, configured in self.config.paths.items():
-            path = configured if configured.exists() else configured.parent
-            key = str(path.resolve().anchor or path.resolve())
+            path, device = self._existing_path_and_device(configured)
+            # Device identity is authoritative on POSIX and Windows.  If a
+            # platform stat result has no device identity, use a unique path
+            # key rather than incorrectly coalescing unrelated filesystems.
+            key = ("device", device) if device is not None else ("path", str(path.resolve()))
             if key not in volumes:
                 usage = self.usage(path)
                 free_percent = usage.free * 100.0 / usage.total if usage.total else None
@@ -139,16 +151,35 @@ class DiskMonitor:
             result[name] = volumes[key]
         if self.config.cache_path is not None:
             size = files = 0
+            disappeared = 0
             if self.config.cache_path.exists():
                 for entry in self.config.cache_path.rglob("*"):
-                    if entry.is_file():
-                        size += entry.stat().st_size; files += 1
-                        if files >= self.config.max_cache_files:
-                            break
+                    try:
+                        if entry.is_file():
+                            size += entry.stat().st_size
+                            files += 1
+                            if files >= self.config.max_cache_files:
+                                break
+                    except FileNotFoundError:
+                        # Concurrent cache replacement/removal is expected and
+                        # must never crash the PAPER scheduler.
+                        disappeared += 1
             result["cache"] = {"size_bytes": size, "files_sampled": files,
-                               "truncated": files >= self.config.max_cache_files}
+                               "truncated": files >= self.config.max_cache_files,
+                               "entries_disappeared": disappeared}
         self.latest = result
         return result
+
+    def _existing_path_and_device(self, configured: Path) -> tuple[Path, int | None]:
+        path = Path(configured).absolute()
+        while True:
+            try:
+                stat_result = self.filesystem_stat(path)
+                return path, getattr(stat_result, "st_dev", None)
+            except FileNotFoundError:
+                if path.parent == path:
+                    raise
+                path = path.parent
 
     def _level(self, free: float | None) -> str:
         if free is None: return "UNKNOWN"

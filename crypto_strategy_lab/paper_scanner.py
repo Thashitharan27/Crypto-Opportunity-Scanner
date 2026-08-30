@@ -812,7 +812,43 @@ class PaperScannerRunner:
             )
 
     def _health_status(self, result: PaperScanCycleResult) -> tuple[HealthStatus, dict[str, Any]]:
-        disk = dict(self.disk_monitor.sample())
+        disk_error = False
+        try:
+            disk = dict(self.disk_monitor.sample())
+            self._metrics.pop("disk_monitor_error", None)
+        except OSError as exc:
+            disk_error = True
+            disk = dict(self.disk_monitor.latest)
+            error = {
+                "error_type": type(exc).__name__,
+                "operation": "disk_cache_sample",
+            }
+            filename = getattr(exc, "filename", None)
+            if filename is not None:
+                error["path"] = str(filename)
+            self._metrics["disk_monitor_error"] = error
+            self.audit.append(
+                "DISK_MONITOR_FAILED", result.cycle_id,
+                scan_run_id=result.scanner_run_id,
+                severity="WARNING", component="disk_monitor", fields=error,
+            )
+        disappeared = sum(
+            int(value.get("entries_disappeared", 0) or 0)
+            for value in disk.values() if isinstance(value, dict)
+        )
+        if disappeared:
+            warning_fields = {
+                "operation": "cache_walk",
+                "entries_disappeared": disappeared,
+            }
+            self._metrics["disk_monitor_warning"] = warning_fields
+            self.audit.append(
+                "DISK_MONITOR_WARNING", result.cycle_id,
+                scan_run_id=result.scanner_run_id, severity="WARNING",
+                component="disk_monitor", fields=warning_fields,
+            )
+        else:
+            self._metrics.pop("disk_monitor_warning", None)
         if result.status in {CycleStatus.FAILED, CycleStatus.STALE_DISCOVERY, CycleStatus.STALE_STRATEGY_DATA}:
             return HealthStatus.UNHEALTHY, disk
         if result.status is CycleStatus.CANCELLED:
@@ -835,7 +871,7 @@ class PaperScannerRunner:
         warning = (
             "WARNING" in levels or result.stale_candidates
             or self._metrics.get("retry_count") or partial or optional_degraded
-            or rate_limit_pressure
+            or rate_limit_pressure or disk_error or disappeared
         )
         return (HealthStatus.DEGRADED if warning else HealthStatus.HEALTHY), disk
 
