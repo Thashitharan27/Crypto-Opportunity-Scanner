@@ -87,6 +87,101 @@ class CompletedOpportunityScan:
     scores: pd.DataFrame
 
 
+@dataclass(frozen=True, slots=True)
+class OpportunityScanProgress:
+    """Operational progress only; never part of a research/publication model."""
+
+    stage: str
+    stage_index: int
+    stage_count: int = 6
+    message: str = ""
+    decision_timestamp: datetime | None = None
+    completed_scans: int = 0
+    total_scans: int = 1
+    current_scan_index: int = 1
+    elapsed_seconds: float = 0.0
+    average_scan_seconds: float | None = None
+    eta_seconds: float | None = None
+
+
+MAX_HISTORICAL_REPLAY_SCANS = 1000
+HISTORICAL_REPLAY_CADENCES = {
+    "1h": timedelta(hours=1), "4h": timedelta(hours=4), "1d": timedelta(days=1),
+}
+
+
+def historical_decision_points(start: datetime, end: datetime, cadence: timedelta,
+                               *, maximum: int = MAX_HISTORICAL_REPLAY_SCANS) -> tuple[datetime, ...]:
+    """Return exact, inclusive UTC replay instants without grid alignment."""
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("historical range timestamps must be timezone-aware UTC")
+    if start.utcoffset() != timedelta(0) or end.utcoffset() != timedelta(0):
+        raise ValueError("historical range timestamps must be UTC")
+    if cadence <= timedelta(0):
+        raise ValueError("historical replay cadence must be greater than zero")
+    if end < start:
+        raise ValueError("historical range end must be at or after start")
+    count = ((end - start) // cadence) + 1
+    if count < 1:
+        raise ValueError("historical range must contain at least one decision point")
+    if count > maximum:
+        raise ValueError(f"historical range has {count} scans; maximum is {maximum}")
+    return tuple(start + cadence * offset for offset in range(count))
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalReplayResult:
+    completed: tuple[CompletedOpportunityScan, ...]
+    decision_points: tuple[datetime, ...]
+    elapsed_seconds: float
+
+    @property
+    def last(self) -> CompletedOpportunityScan | None:
+        return self.completed[-1] if self.completed else None
+
+
+class HistoricalReplayFailure(RuntimeError):
+    def __init__(self, decision_time: datetime, completed: tuple[CompletedOpportunityScan, ...], cause: Exception):
+        super().__init__(str(cause)); self.decision_time = decision_time; self.completed = completed
+
+
+class HistoricalRangeRunner:
+    """Sequentially reuse the native single-scan service boundary."""
+
+    def __init__(self, service, *, monotonic: Callable[[], float]):
+        self.service, self.monotonic = service, monotonic
+
+    def run(self, decision_points, request_factory, cancelled, progress=lambda _event: None):
+        points = tuple(decision_points)
+        if not points:
+            raise ValueError("historical range must contain at least one decision point")
+        started = self.monotonic(); completed = []; completed_seconds = 0.0
+        for index, decision in enumerate(points, 1):
+            if cancelled():
+                raise OpportunityScanCancelled(f"historical replay cancelled; {len(completed)} completed")
+            scan_started = self.monotonic()
+            def forward(event, i=index, d=decision):
+                elapsed = self.monotonic() - started
+                average = completed_seconds / len(completed) if completed else None
+                progress(OpportunityScanProgress(event.stage, event.stage_index,
+                    event.stage_count, event.message, d, len(completed), len(points), i,
+                    elapsed, average, None if average is None else average * (len(points)-len(completed))))
+            try:
+                result = self.service.run_with_progress(request_factory(decision), cancelled, forward)
+            except OpportunityScanCancelled:
+                raise
+            except Exception as exc:
+                raise HistoricalReplayFailure(decision, tuple(completed), exc) from exc
+            completed.append(result)
+            completed_seconds += self.monotonic() - scan_started
+            elapsed = self.monotonic() - started
+            average = completed_seconds / len(completed)
+            progress(OpportunityScanProgress("scan_complete", 6, 6, "Scan complete", decision,
+                len(completed), len(points), index, elapsed, average,
+                average * (len(points) - len(completed))))
+        return HistoricalReplayResult(tuple(completed), points, self.monotonic() - started)
+
+
 class OpportunityScanResultReader:
     """Read only paths declared by a completed OPPORTUNITY_SCAN manifest."""
 
@@ -152,6 +247,12 @@ class OpportunityScannerApplicationService:
     def run(self, request: OpportunityScanRequest, cancelled: Callable[[], bool]) -> CompletedOpportunityScan:
         return self.reader.read(self._run_once(request, cancelled))
 
+    def run_with_progress(self, request, cancelled, progress) -> CompletedOpportunityScan:
+        """Optional GUI boundary; the original two-argument API stays intact."""
+        method = getattr(self._run_once, "run_with_progress", None)
+        path = method(request, cancelled, progress) if method else self._run_once(request, cancelled)
+        return self.reader.read(path)
+
 
 class OpportunityScanCancelled(RuntimeError):
     """Cooperative cancellation before an authoritative Task-7 publication."""
@@ -185,13 +286,22 @@ class Task1To7OpportunityScanner:
 
     def __call__(self, request: OpportunityScanRequest,
                  cancelled: Callable[[], bool]) -> Path:
+        return self.run_with_progress(request, cancelled, lambda _event: None)
+
+    def run_with_progress(self, request: OpportunityScanRequest,
+                          cancelled: Callable[[], bool], progress) -> Path:
+        def report(stage, index, message):
+            progress(OpportunityScanProgress(stage, index, 6, message,
+                                             request.decision_time))
         if request.mode == "LIVE":
+            report("discovery", 1, "Live discovery")
             discovery = scan_universe(
                 self.live_client, request.live_discovery, now=self.now
             )
             discovery_config = request.live_discovery
             decision = self._live_decision(discovery)
         else:
+            report("historical_discovery", 1, "Historical discovery")
             decision = request.decision_time
             discovery = discover_historical_universe(
                 self.store, self._historical_symbols(),
@@ -209,21 +319,26 @@ class Task1To7OpportunityScanner:
             decision, request.candle_acquisition.strategy_interval,
             required_bars + 1,
         )
+        report("candle_acquisition", 2, "Selective candle acquisition")
         candles = SelectiveCandleAcquirer(
             self.store, self.backend, request.candle_acquisition
         ).acquire(discovery, candle_start, candle_end, cancelled=cancelled)
 
         self._raise_if_cancelled(cancelled)
+        report("scoring", 3, "Opportunity scoring" if request.scoring else "Opportunity scoring skipped")
         scoring = self._score(request, candles, decision) if request.scoring else None
+        report("final_candidates", 4, "Final candidate boundary")
         final = build_final_candidate_set(
             discovery, candles, scoring, request.final_candidates
         )
+        report("rich_data", 5, "Selective rich-data acquisition")
         rich = SelectiveRichDataAcquirer(
             self.store, self.backend, request.rich_data, self.registry
         ).acquire(final, cancelled=cancelled)
         # Task 7 has no cancellation contract and writes an immutable completed
         # marker.  Never enter publication after a cooperative cancellation.
         self._raise_if_cancelled(cancelled)
+        report("publication", 6, "Immutable OPPORTUNITY_SCAN publication")
         package = OpportunityScanPublicationInput(
             scan_timestamp=self.now(), discovery=discovery,
             discovery_config=discovery_config, candle_acquisition=candles,

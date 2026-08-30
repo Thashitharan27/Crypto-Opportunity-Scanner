@@ -196,3 +196,15 @@ started by the GUI are stopped in tunnel-then-server order. Because Qt-owned
 child processes cannot be reliably detached on every supported platform, the
 application offers the safe choices **Stop and Exit** or **Cancel** at shutdown
 rather than risking broken orphan processes.
+
+## Opportunity Scanner historical execution
+
+### Historical Single
+
+**Single timestamp** reconstructs one causal decision point at the exact UTC timestamp supplied. It continues to use the native Task 1–7 scan and immutable `OPPORTUNITY_SCAN` publication path.
+
+### Historical Range
+
+**Date/time range** generates `start`, `start + cadence`, and subsequent exact UTC decision timestamps through the inclusive end, then runs the same single historical scan sequentially for each timestamp. **A range replay is not one giant backtest. It is a sequence of immutable historical `OPPORTUNITY_SCAN` experiments.** Completed publications are retained if a later scan is cancelled or fails.
+
+Runtime depends heavily on range length, preliminary shortlist size, selected rich features, existing Data Lake coverage, and how much missing data must be acquired. The GUI displays exact range completion and monotonic elapsed time; estimated remaining time appears only after completed scans provide timing evidence.
