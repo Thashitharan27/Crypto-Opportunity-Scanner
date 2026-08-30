@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 import json
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 import numpy as np
 import pandas as pd
@@ -113,13 +115,14 @@ def runner(
     retention=timedelta(days=365),
     operational=None,
     monotonic=None,
+    retry_backoff=timedelta(seconds=2),
 ):
     config = PaperScannerConfig(
         timedelta(seconds=1),
         stale_market,
         stale_strategy,
         retries,
-        timedelta(seconds=2),
+        retry_backoff,
         tmp_path / "state.json",
         tmp_path / "audit.jsonl",
         max_history,
@@ -637,6 +640,36 @@ def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
     scan.failures = 0
     assert app.run_once().new_paper_entries == 1
     assert {"SCAN_RETRY", "SCAN_FAILED"} <= set(events(tmp_path / "audit.jsonl"))
+
+
+def test_429_positive_minimum_wait_is_cancellable_with_zero_normal_backoff(tmp_path):
+    headers = Message()
+    error = HTTPError("https://example.test", 429, "limited", headers, None)
+
+    class RateLimitedScanner:
+        calls = 0
+        def run(self, _request, _cancelled):
+            self.calls += 1
+            raise error
+
+    waits = []
+    operational = ScannerOperationalConfig(
+        retry_backoff_cap=timedelta(seconds=10),
+        rate_limit_min_backoff=timedelta(seconds=3),
+    )
+    app, scanner = runner(
+        tmp_path, scan=RateLimitedScanner(), retries=2,
+        retry_backoff=timedelta(0), operational=operational,
+    )
+    result = app.run_once(
+        cancellation_wait=lambda seconds: waits.append(seconds) or True
+    )
+    assert result.status is CycleStatus.CANCELLED
+    assert scanner.calls == 1
+    assert waits == [3.0]
+    retry = next(row for row in audit_rows(tmp_path / "audit.jsonl")
+                 if row["event_type"] == "SCAN_RETRY")
+    assert retry["fields"]["delay_seconds"] == 3.0
 
 
 def test_runner_health_clean_retry_partial_and_recovery_transitions(tmp_path):

@@ -316,6 +316,7 @@ class PaperScannerRunner:
                 backoff = retry_delay_seconds(
                     exc, attempt + 1, self.config.retry_backoff,
                     self.config.operational.retry_backoff_cap,
+                    self.config.operational.rate_limit_min_backoff,
                 )
                 retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
                 self.audit.append(

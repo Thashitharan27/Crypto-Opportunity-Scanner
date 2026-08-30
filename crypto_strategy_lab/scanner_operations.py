@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import ast
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -52,12 +53,17 @@ class DiskMonitoringConfig:
 class ScannerOperationalConfig:
     health_path: Path | None = None
     retry_backoff_cap: timedelta = timedelta(minutes=5)
+    rate_limit_min_backoff: timedelta = timedelta(seconds=5)
     crash_recovery_delay: timedelta = timedelta(seconds=30)
     disk: DiskMonitoringConfig = field(default_factory=DiskMonitoringConfig)
 
     def __post_init__(self) -> None:
-        if self.retry_backoff_cap < timedelta(0) or self.retry_backoff_cap > timedelta(hours=1):
-            raise ValueError("retry backoff cap must be between zero and one hour")
+        if self.retry_backoff_cap <= timedelta(0) or self.retry_backoff_cap > timedelta(hours=1):
+            raise ValueError("retry backoff cap must be positive and at most one hour")
+        if self.rate_limit_min_backoff <= timedelta(0):
+            raise ValueError("rate-limit minimum backoff must be positive")
+        if self.rate_limit_min_backoff > self.retry_backoff_cap:
+            raise ValueError("rate-limit minimum backoff cannot exceed retry cap")
         if self.crash_recovery_delay < timedelta(0) or self.crash_recovery_delay > timedelta(hours=1):
             raise ValueError("crash recovery delay must be between zero and one hour")
         if self.health_path is not None:
@@ -71,11 +77,20 @@ def retryable_exception(exc: Exception) -> bool:
     return isinstance(exc, (ConnectionError, TimeoutError, URLError))
 
 
-def retry_delay_seconds(exc: Exception, attempt: int, base: timedelta, cap: timedelta) -> float:
+def retry_delay_seconds(
+    exc: Exception,
+    attempt: int,
+    base: timedelta,
+    cap: timedelta,
+    rate_limit_minimum: timedelta = timedelta(seconds=5),
+) -> float:
     delay = base.total_seconds() * (2 ** max(0, attempt - 1))
     if isinstance(exc, HTTPError) and exc.code == 429:
+        delay = max(delay, rate_limit_minimum.total_seconds())
         try:
-            delay = max(delay, float(exc.headers.get("Retry-After", "")))
+            retry_after = float(exc.headers.get("Retry-After", ""))
+            if math.isfinite(retry_after) and retry_after >= 0:
+                delay = max(delay, retry_after)
         except (TypeError, ValueError):
             pass
     return min(delay, cap.total_seconds())

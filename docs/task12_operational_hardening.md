@@ -14,6 +14,11 @@ state failures do not. Backoff doubles up to the configured cap. A valid 429
 `Retry-After` is honored up to that same cap. HTTP 418 is deliberately not retried.
 Cooperative cancellation interrupts retry and recovery waits.
 
+HTTP 429 additionally uses the explicit positive `rate_limit_min_backoff`, even
+when the normal retry base is zero or `Retry-After` is missing/malformed. The
+validated retry cap is positive and cannot be lower than this minimum, preventing
+rate-limit retries from becoming a zero-delay loop.
+
 The injectable public Binance transport reports endpoint, status,
 `Retry-After`, and `X-MBX-USED-WEIGHT-1M` when supplied. Headers are telemetry,
 not hard-coded exchange-limit truth; no credentials are used.

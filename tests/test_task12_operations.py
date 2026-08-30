@@ -42,9 +42,29 @@ def test_exponential_retry_after_and_cap_are_deterministic():
     assert retry_delay_seconds(http_error(429, 99), 1, base, cap) == 10
 
 
+@pytest.mark.parametrize("retry_after", [None, "malformed"])
+def test_429_zero_base_uses_positive_rate_limit_minimum(retry_after):
+    error = http_error(429, retry_after)
+    assert retry_delay_seconds(
+        error, 1, timedelta(0), timedelta(seconds=10), timedelta(seconds=3)
+    ) == 3
+
+
 def test_operational_configuration_validation(tmp_path):
     with pytest.raises(ValueError):
         ScannerOperationalConfig(retry_backoff_cap=timedelta(hours=2))
+    with pytest.raises(ValueError, match="positive"):
+        ScannerOperationalConfig(retry_backoff_cap=timedelta(0))
+    with pytest.raises(ValueError, match="minimum backoff must be positive"):
+        ScannerOperationalConfig(
+            retry_backoff_cap=timedelta(seconds=10),
+            rate_limit_min_backoff=timedelta(0),
+        )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        ScannerOperationalConfig(
+            retry_backoff_cap=timedelta(seconds=2),
+            rate_limit_min_backoff=timedelta(seconds=3),
+        )
     with pytest.raises(ValueError):
         DiskMonitoringConfig(warning_free_percent=5, critical_free_percent=10)
     assert ScannerOperationalConfig(health_path=tmp_path / "health.json").health_path.is_absolute()
