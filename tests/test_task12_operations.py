@@ -67,6 +67,23 @@ def test_binance_transport_emits_optional_header_telemetry():
                          "retry_after_seconds": "3", "used_weight": "41"}]
 
 
+def test_binance_http_error_emits_available_rate_limit_telemetry():
+    observed = []
+    error = http_error(429, 7)
+    error.headers["X-MBX-USED-WEIGHT-1M"] = "88"
+    client = BinanceUsdMDiscoveryClient(
+        transport=lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+        telemetry=observed.append,
+    )
+    with pytest.raises(HTTPError) as raised:
+        client.tickers_24h()
+    assert raised.value is error
+    assert observed == [{
+        "endpoint": "/fapi/v1/ticker/24hr", "http_status": 429,
+        "retry_after_seconds": "7", "used_weight": "88",
+    }]
+
+
 def snapshot(status="STARTING"):
     return ScannerHealthSnapshot(1, "2026-01-01T00:00:00+00:00",
                                  "2026-01-01T00:00:00+00:00", status)
@@ -100,20 +117,45 @@ def test_disk_monitor_is_read_only_cadenced_and_classified(tmp_path):
 
 
 def test_acquisition_metrics_use_existing_state_and_readiness_values():
-    candles = [SimpleNamespace(state="REUSED", row_count=5, acquisition_ranges=()),
-               SimpleNamespace(state="DOWNLOAD_FAILED", row_count=0,
-                               acquisition_ranges=(1, 2))]
-    datasets = [SimpleNamespace(state="ACQUIRED"), SimpleNamespace(state="MISSING")]
-    readiness = [SimpleNamespace(readiness="READY"), SimpleNamespace(readiness="DEGRADED"),
-                 SimpleNamespace(readiness="UNAVAILABLE")]
-    result = aggregate_acquisition_metrics(candles, datasets, readiness)
-    assert result["strategy_candles"] == {
+    candles = [
+        {"acquisition_state": "REUSED", "row_count": 5,
+         "acquisition_ranges": "[]"},
+        {"acquisition_state": "DOWNLOAD_FAILED", "row_count": 0,
+         "acquisition_ranges": '[["a","b"],["c","d"]]'},
+    ]
+    # Dataset A is coalesced for two features; feature one uses two datasets.
+    rich = [
+        {"symbol": "BTCUSDT", "dataset": "A", "interval": "5m",
+         "requested_start": "s", "requested_end": "e", "acquisition_state": "ACQUIRED",
+         "feature_name": "one", "feature_readiness": "READY"},
+        {"symbol": "BTCUSDT", "dataset": "A", "interval": "5m",
+         "requested_start": "s", "requested_end": "e", "acquisition_state": "ACQUIRED",
+         "feature_name": "two", "feature_readiness": "DEGRADED"},
+        {"symbol": "BTCUSDT", "dataset": "B", "interval": "1h",
+         "requested_start": "s", "requested_end": "e", "acquisition_state": "MISSING",
+         "feature_name": "one", "feature_readiness": "READY"},
+    ]
+    result = aggregate_acquisition_metrics(candles, rich)
+    assert result["strategy_candle_acquisition"] == {
         "reused": 1, "acquired": 0, "missing": 0, "quality_failed": 0,
         "download_failed": 1, "cancelled": 0, "requested_symbols": 2,
         "rows_available": 5, "coverage_gaps_attempted": 2,
     }
-    assert result["rich_datasets"]["dataset_requirements"] == 2
-    assert result["feature_readiness"] == {"ready": 1, "degraded": 1, "unavailable": 1}
+    assert result["rich_dataset_acquisition"]["dataset_requirements"] == 2
+    assert result["rich_dataset_acquisition"]["acquired"] == 1
+    assert result["rich_dataset_acquisition"]["missing"] == 1
+    assert result["rich_feature_readiness"] == {"ready": 1, "degraded": 1, "unavailable": 0}
+
+
+def test_acquisition_metrics_reject_conflicting_denormalized_feature_rows():
+    rows = [
+        {"symbol": "BTCUSDT", "dataset": name, "interval": "5m",
+         "requested_start": "s", "requested_end": "e", "acquisition_state": "ACQUIRED",
+         "feature_name": "feature", "feature_readiness": readiness}
+        for name, readiness in (("A", "READY"), ("B", "DEGRADED"))
+    ]
+    with pytest.raises(ValueError, match="conflicting feature readiness"):
+        aggregate_acquisition_metrics([], rows)
 
 
 def test_windows_launchers_are_local_quoted_and_scanner_named():

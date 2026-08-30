@@ -26,6 +26,9 @@ from crypto_strategy_lab.paper_scanner_state import (
 from crypto_strategy_lab.rule_native_engine import (
     RuleAwareDataLakeProductionBacktestEngine,
 )
+from crypto_strategy_lab.scanner_operations import (
+    DiskMonitoringConfig, ScannerOperationalConfig,
+)
 
 
 UTC = timezone.utc
@@ -90,6 +93,8 @@ def completed(decision=DECISION, run_id="run-1"):
         manifest={"run_id": run_id},
         summary={"decision_timestamp": decision.isoformat()},
         final=final,
+        preliminary=pd.DataFrame(),
+        readiness=pd.DataFrame(),
     )
 
 
@@ -105,6 +110,8 @@ def runner(
     sleeps=None,
     max_history=10_000,
     retention=timedelta(days=365),
+    operational=None,
+    monotonic=None,
 ):
     config = PaperScannerConfig(
         timedelta(seconds=1),
@@ -116,6 +123,7 @@ def runner(
         tmp_path / "audit.jsonl",
         max_history,
         retention,
+        operational or ScannerOperationalConfig(),
     )
     scan = scan or Scanner(completed())
     return PaperScannerRunner(
@@ -125,6 +133,7 @@ def runner(
         evaluator or Evaluator(),
         clock=lambda: now,
         sleeper=(sleeps.append if sleeps is not None else lambda _: None),
+        monotonic=monotonic,
     ), scan
 
 
@@ -134,6 +143,17 @@ def events(path):
 
 def audit_rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def health_config(tmp_path, *, disk=None):
+    return ScannerOperationalConfig(
+        health_path=tmp_path / "health.json",
+        disk=disk or DiskMonitoringConfig(),
+    )
+
+
+def health(tmp_path):
+    return json.loads((tmp_path / "health.json").read_text())
 
 
 def test_fresh_verified_scan_emits_paper_entry_and_duplicate_survives_restart(tmp_path):
@@ -178,7 +198,7 @@ def test_fresh_verified_scan_emits_paper_entry_and_duplicate_survives_restart(tm
 
 
 def test_lifecycle_commit_failure_keeps_prior_durable_membership(tmp_path):
-    app, _ = runner(tmp_path)
+    app, _ = runner(tmp_path, operational=health_config(tmp_path))
     assert app.run_once().status is CycleStatus.COMPLETED
     durable_before = (tmp_path / "state.json").read_bytes()
     state_before = list(app.state.candidate_lifecycle)
@@ -191,6 +211,10 @@ def test_lifecycle_commit_failure_keeps_prior_durable_membership(tmp_path):
     assert result.status is CycleStatus.FAILED
     assert app.state.candidate_lifecycle == state_before
     assert (tmp_path / "state.json").read_bytes() == durable_before
+    assert app.consecutive_failed_cycles == 1
+    assert health(tmp_path)["status"] == "UNHEALTHY"
+    assert health(tmp_path)["last_error_category"] == "LIFECYCLE_PERSIST_FAILED"
+    assert "total_cycle_duration_ms" in result.metrics
     terminal = audit_rows(tmp_path / "audit.jsonl")[-1]
     assert (terminal["event_type"], terminal["detail"]) == (
         "CYCLE_COMPLETED", "FAILED"
@@ -199,7 +223,9 @@ def test_lifecycle_commit_failure_keeps_prior_durable_membership(tmp_path):
 
 def test_out_of_order_paper_scan_fails_without_changing_durable_state(tmp_path):
     scanner = Scanner(completed(decision=DECISION, run_id="newer"))
-    app, _ = runner(tmp_path, scan=scanner)
+    app, _ = runner(
+        tmp_path, scan=scanner, operational=health_config(tmp_path)
+    )
     assert app.run_once().status is CycleStatus.COMPLETED
     durable_before = (tmp_path / "state.json").read_bytes()
     lifecycle_before = list(app.state.candidate_lifecycle)
@@ -211,6 +237,10 @@ def test_out_of_order_paper_scan_fails_without_changing_durable_state(tmp_path):
     assert rejected.status is CycleStatus.FAILED
     assert app.state.candidate_lifecycle == lifecycle_before
     assert (tmp_path / "state.json").read_bytes() == durable_before
+    assert health(tmp_path)["status"] == "UNHEALTHY"
+    assert health(tmp_path)["last_error_category"] == "LIFECYCLE_REJECTED"
+    assert "lifecycle_duration_ms" in rejected.metrics
+    assert "total_cycle_duration_ms" in rejected.metrics
     assert "CANDIDATE_SET_REJECTED" in events(tmp_path / "audit.jsonl")
     terminal = audit_rows(tmp_path / "audit.jsonl")[-1]
     assert (terminal["event_type"], terminal["detail"]) == (
@@ -526,6 +556,12 @@ def test_production_factory_composes_scanner_data_lake_and_native_engine(
         timedelta(0),
         tmp_path / "paper-state.json",
         tmp_path / "paper-audit.jsonl",
+        operational=health_config(
+            tmp_path,
+            disk=DiskMonitoringConfig(
+                warning_free_percent=None, critical_free_percent=None,
+            ),
+        ),
     )
     strategy_config = BacktestConfig(
         strategy_timeframe_minutes=60, telemetry_interval_minutes=60
@@ -538,6 +574,7 @@ def test_production_factory_composes_scanner_data_lake_and_native_engine(
         paper_config=paper_config,
         scan_request_factory=lambda: SimpleNamespace(mode="LIVE"),
         strategy_config=strategy_config,
+        clock=lambda: DECISION,
     )
 
     assert isinstance(runner, PaperScannerRunner)
@@ -545,9 +582,20 @@ def test_production_factory_composes_scanner_data_lake_and_native_engine(
     assert runner.scanner is scanner
     assert runner.config.state_path == tmp_path / "paper-state.json"
     assert runner.config.audit_log_path == tmp_path / "paper-audit.jsonl"
-    assert scanner_factory_calls == [
-        (tmp_path / "raw", tmp_path / "cache", tmp_path / "scans", {})
-    ]
+    assert len(scanner_factory_calls) == 1
+    raw, cache, output, options = scanner_factory_calls[0]
+    assert (raw, cache, output) == (
+        tmp_path / "raw", tmp_path / "cache", tmp_path / "scans"
+    )
+    assert options["live_client"].base_url == "https://fapi.binance.com"
+    assert runner.config.operational.disk.paths == {
+        "paper_state": tmp_path,
+        "paper_audit": tmp_path,
+        "opportunity_scans": tmp_path / "scans",
+        "data_lake_raw": tmp_path / "raw",
+        "cache": tmp_path / "cache",
+    }
+    assert runner.config.operational.disk.cache_path == tmp_path / "cache"
     candidate = {
         "symbol": "BTCUSDT",
         "strategy_interval": "1h",
@@ -564,6 +612,18 @@ def test_production_factory_composes_scanner_data_lake_and_native_engine(
         name in vars(runner)
         for name in ("broker", "order_client", "auth", "live_orders")
     )
+    options["live_client"].telemetry({
+        "endpoint": "/fapi/v1/ticker/24hr", "http_status": 429,
+        "retry_after_seconds": "4", "used_weight": "120",
+    })
+    scanner.completed.final = scanner.completed.final.iloc[0:0]
+    result = runner.run_once()
+    assert result.metrics["binance_public_api"]["rate_limit_pressure"] is True
+    api_rows = [row for row in audit_rows(tmp_path / "paper-audit.jsonl")
+                if row["event_type"] == "BINANCE_API_RESPONSE"]
+    assert api_rows[-1]["fields"]["used_weight"] == "120"
+    assert health(tmp_path)["metrics"]["binance_public_api"]["latest"]["http_status"] == 429
+    assert health(tmp_path)["status"] == "DEGRADED"
 
 
 def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
@@ -576,6 +636,130 @@ def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
     scan.failures = 0
     assert app.run_once().new_paper_entries == 1
     assert {"SCAN_RETRY", "SCAN_FAILED"} <= set(events(tmp_path / "audit.jsonl"))
+
+
+def test_runner_health_clean_retry_partial_and_recovery_transitions(tmp_path):
+    scan_result = completed()
+    scan_result.preliminary = pd.DataFrame([{
+        "symbol": "BTCUSDT", "acquisition_state": "REUSED",
+        "row_count": 10, "acquisition_ranges": "[]",
+    }])
+    app, scan = runner(
+        tmp_path, scan=Scanner(scan_result, failures=1), retries=1,
+        operational=health_config(tmp_path), sleeps=[],
+    )
+    assert app.run_once().status is CycleStatus.COMPLETED
+    assert health(tmp_path)["status"] == "DEGRADED"
+    assert app.consecutive_failed_cycles == 0
+
+    scan_result.preliminary.loc[0, "acquisition_state"] = "DOWNLOAD_FAILED"
+    scan_result.readiness = pd.DataFrame([{
+        "symbol": "BTCUSDT", "dataset": "funding", "interval": "8h",
+        "requested_start": "s", "requested_end": "e",
+        "acquisition_state": "MISSING", "feature_name": "context",
+        "feature_readiness": "DEGRADED",
+    }])
+    assert app.run_once().status is CycleStatus.COMPLETED
+    current = health(tmp_path)
+    assert current["status"] == "DEGRADED"
+    assert current["metrics"]["strategy_candle_acquisition"]["download_failed"] == 1
+    assert current["metrics"]["rich_feature_readiness"]["degraded"] == 1
+
+    scan_result.preliminary.loc[0, "acquisition_state"] = "REUSED"
+    scan_result.readiness = pd.DataFrame()
+    assert app.run_once().status is CycleStatus.COMPLETED
+    assert health(tmp_path)["status"] == "HEALTHY"
+    assert app.consecutive_failed_cycles == 0
+
+
+@pytest.mark.parametrize("free,expected", [(15, "DEGRADED"), (5, "UNHEALTHY")])
+def test_runner_health_observes_disk_warning_and_critical(tmp_path, free, expected):
+    disk = DiskMonitoringConfig(
+        paths={"paper": tmp_path}, sample_every_cycles=1,
+        warning_free_percent=20, critical_free_percent=10,
+    )
+    app, _ = runner(tmp_path, operational=health_config(tmp_path, disk=disk))
+    app.disk_monitor.usage = lambda _path: SimpleNamespace(
+        total=100, used=100 - free, free=free
+    )
+    assert app.run_once().status is CycleStatus.COMPLETED
+    assert health(tmp_path)["status"] == expected
+
+
+def test_cancelled_cycle_is_not_success_and_preserves_failure_history(tmp_path):
+    app, _ = runner(tmp_path, operational=health_config(tmp_path))
+    app.consecutive_failed_cycles = 2
+    app.last_error_category = "PRIOR_FAILURE"
+    result = app.run_once(cancelled=lambda: True)
+    current = health(tmp_path)
+    assert result.status is CycleStatus.CANCELLED
+    assert current["status"] == "DEGRADED"
+    assert current["last_successful_scan_at"] is None
+    assert current["consecutive_failed_cycles"] == 2
+    assert current["last_error_category"] == "PRIOR_FAILURE"
+
+
+def test_monotonic_cycle_metrics_are_present_without_wall_clock_elapsed(tmp_path):
+    class Monotonic:
+        value = 0.0
+        def __call__(self):
+            self.value += 0.25
+            return self.value
+
+    app, _ = runner(
+        tmp_path, operational=health_config(tmp_path), monotonic=Monotonic()
+    )
+    metrics = app.run_once().metrics
+    assert all(metrics[name] >= 0 for name in (
+        "pipeline_duration_ms", "lifecycle_duration_ms",
+        "strategy_evaluation_duration_ms", "total_cycle_duration_ms",
+    ))
+
+
+def test_stale_discovery_and_stale_only_strategy_are_unhealthy(tmp_path):
+    stale_app, _ = runner(
+        tmp_path / "discovery", now=DECISION + timedelta(minutes=6),
+        operational=health_config(tmp_path / "discovery"),
+    )
+    assert stale_app.run_once().status is CycleStatus.STALE_DISCOVERY
+    assert health(tmp_path / "discovery")["status"] == "UNHEALTHY"
+
+    strategy_app, _ = runner(
+        tmp_path / "strategy",
+        evaluator=Evaluator(available=DECISION - timedelta(hours=3)),
+        operational=health_config(tmp_path / "strategy"),
+    )
+    assert strategy_app.run_once().status is CycleStatus.STALE_STRATEGY_DATA
+    assert health(tmp_path / "strategy")["status"] == "UNHEALTHY"
+
+
+def test_scheduler_recovers_unexpected_cycle_then_later_cycle_succeeds(tmp_path):
+    app, _ = runner(tmp_path, operational=health_config(tmp_path))
+    real_run_once = app.run_once
+    calls = 0
+
+    def crashing_once(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("cycle crash")
+        return real_run_once(*args)
+
+    app.run_once = crashing_once
+
+    class Stop:
+        waits = []
+        def is_set(self): return False
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            return len(self.waits) == 2
+
+    stop = Stop()
+    app.run_forever(stop)
+    assert calls == 2
+    assert stop.waits == [30.0, 1.0]
+    assert "RUNTIME_CYCLE_CRASH" in events(tmp_path / "audit.jsonl")
+    assert app.consecutive_failed_cycles == 0
 
 
 def test_state_is_versioned_atomic_and_corruption_fails_closed(tmp_path, monkeypatch):

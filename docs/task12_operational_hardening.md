@@ -44,15 +44,20 @@ Statuses are:
 
 * `STARTING`: durable state loaded and validated;
 * `HEALTHY`: latest cycle completed without an operational warning;
-* `DEGRADED`: valid completion with retry, stale candidate, or disk warning;
-* `UNHEALTHY`: failed/stale-discovery/stale-only cycle or runtime crash;
+* `DEGRADED`: valid completion with retry, partial Task 3/6 results, stale
+  candidates, or disk warning; cancellation is also reported as degraded but
+  does not reset or increment failure history and is not recorded as success;
+* `UNHEALTHY`: failed/stale-discovery/stale-only cycle, runtime crash, lifecycle
+  rejection/persistence failure, or critical disk state;
 * `STOPPED`: scheduler exited.
 
 Metrics include monotonic pipeline, lifecycle, strategy-evaluation, and total
 cycle milliseconds; numeric discovery age and stale limits; fresh/stale/active
 candidate counts; and retry delay/count. `aggregate_acquisition_metrics` reports
-Task 3 requested/state/row/gap counts and Task 6 dataset/readiness counts directly
-from the existing enums.
+Task 3 requested/state/row/actual-gap counts and Task 6 dataset/readiness counts
+directly from the existing enums. Task 6 dataset requirements are deduplicated
+by request identity and feature readiness by `(symbol, feature_name)`; conflicting
+denormalized rows fail closed.
 
 ## Crash and storage boundaries
 
@@ -66,6 +71,10 @@ Disk observation reports total/free bytes and free percentage for configured
 paths, deduplicates volume calls, classifies explicit warning/critical thresholds,
 and samples on a configured cadence. Cache size walking has a file bound. It is
 strictly read-only and performs no cleanup or repair.
+
+The production PAPER composition automatically supplies the known Paper state,
+audit, OPPORTUNITY_SCAN output, raw Data Lake, and cache paths when no explicit
+disk mapping is configured. Explicit operator mappings are never overwritten.
 
 ## Windows launch and troubleshooting
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import ast
 import json
 import os
 from pathlib import Path
@@ -156,25 +157,100 @@ class DiskMonitor:
         return "OK"
 
 
-def aggregate_acquisition_metrics(candle_results=(), dataset_results=(), readiness_results=()) -> dict[str, Any]:
-    """Count existing Task 3/6 enum values without reinterpreting validity."""
-    def value(item: Any, name: str) -> str | None:
-        raw = item.get(name) if isinstance(item, Mapping) else getattr(item, name, None)
-        return getattr(raw, "value", raw)
+def aggregate_acquisition_metrics(preliminary: Any, readiness: Any) -> dict[str, Any]:
+    """Canonically aggregate denormalized Task-7 Task 3/6 publications.
 
-    candle = list(candle_results)
-    datasets = list(dataset_results)
-    readiness = list(readiness_results)
-    states = ("REUSED", "ACQUIRED", "MISSING", "QUALITY_FAILED", "DOWNLOAD_FAILED", "CANCELLED")
-    candle_counts = {state.lower(): sum(value(item, "state") == state for item in candle) for state in states}
-    dataset_counts = {state.lower(): sum(value(item, "state") == state for item in datasets) for state in states}
+    Rich-data CSV rows repeat dataset requirements for each consuming feature.
+    This function therefore deduplicates datasets by their Task-6 request
+    identity and features by ``(symbol, feature_name)``.  Conflicting duplicate
+    observations fail closed rather than producing misleading health metrics.
+    """
+    candle_rows = _records(preliminary)
+    rich_rows = _records(readiness)
+    states = (
+        "REUSED", "ACQUIRED", "MISSING", "QUALITY_FAILED",
+        "DOWNLOAD_FAILED", "CANCELLED",
+    )
+    candle_counts = {
+        state.lower(): sum(_enum(row.get("acquisition_state")) == state for row in candle_rows)
+        for state in states
+    }
     candle_counts.update({
-        "requested_symbols": len(candle),
-        "rows_available": sum(int(getattr(item, "row_count", 0) or 0) for item in candle),
-        "coverage_gaps_attempted": sum(len(getattr(item, "acquisition_ranges", ()) or ()) for item in candle),
+        "requested_symbols": len(candle_rows),
+        "rows_available": sum(_integer(row.get("row_count")) for row in candle_rows),
+        "coverage_gaps_attempted": sum(
+            len(_ranges(row.get("acquisition_ranges"))) for row in candle_rows
+        ),
     })
-    ready_states = ("READY", "DEGRADED", "UNAVAILABLE")
-    return {"strategy_candles": candle_counts,
-            "rich_datasets": {"dataset_requirements": len(datasets), **dataset_counts},
-            "feature_readiness": {state.lower(): sum(value(item, "readiness") == state for item in readiness)
-                                  for state in ready_states}}
+
+    dataset_states: dict[tuple[str, ...], str] = {}
+    feature_states: dict[tuple[str, str], str] = {}
+    for row in rich_rows:
+        dataset_key = tuple(str(row.get(name, "")) for name in (
+            "symbol", "dataset", "interval", "requested_start", "requested_end"
+        ))
+        state = _enum(row.get("acquisition_state"))
+        _consistent(dataset_states, dataset_key, state, "dataset requirement")
+        feature_key = (str(row.get("symbol", "")), str(row.get("feature_name", "")))
+        feature_state = _enum(row.get("feature_readiness"))
+        _consistent(feature_states, feature_key, feature_state, "feature readiness")
+
+    dataset_counts = {
+        state.lower(): sum(value == state for value in dataset_states.values())
+        for state in states
+    }
+    readiness_states = ("READY", "DEGRADED", "UNAVAILABLE")
+    return {
+        "strategy_candle_acquisition": candle_counts,
+        "rich_dataset_acquisition": {
+            "dataset_requirements": len(dataset_states), **dataset_counts,
+        },
+        "rich_feature_readiness": {
+            state.lower(): sum(value == state for value in feature_states.values())
+            for state in readiness_states
+        },
+    }
+
+
+def _records(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if hasattr(value, "to_dict"):
+        return list(value.to_dict("records"))
+    return [dict(item) if isinstance(item, Mapping) else vars(item) for item in value]
+
+
+def _enum(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").rsplit(".", 1)[-1].upper()
+
+
+def _integer(value: Any) -> int:
+    try:
+        return 0 if value is None else int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ranges(value: Any) -> list[Any]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(str(value))
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError("invalid published acquisition_ranges") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("published acquisition_ranges must be a list")
+    return parsed
+
+
+def _consistent(target: dict[Any, str], key: Any, value: str, label: str) -> None:
+    existing = target.get(key)
+    if existing is not None and existing != value:
+        raise ValueError(f"conflicting {label} observations for {key}")
+    target[key] = value

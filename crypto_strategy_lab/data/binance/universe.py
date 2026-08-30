@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 import json
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.request import urlopen
+from urllib.error import HTTPError
 
 
 DEFAULT_STABLECOIN_BASES = frozenset({
@@ -42,15 +43,23 @@ class BinanceUsdMDiscoveryClient:
         self.telemetry = telemetry or (lambda _fields: None)
 
     def _get(self, path: str) -> Any:
-        with self.transport(f"{self.base_url}{path}", timeout=self.timeout) as response:
-            headers = response.headers
-            self.telemetry({
-                "endpoint": path,
-                "http_status": getattr(response, "status", None),
-                "retry_after_seconds": headers.get("Retry-After"),
-                "used_weight": headers.get("X-MBX-USED-WEIGHT-1M"),
-            })
-            return json.load(response)
+        try:
+            with self.transport(f"{self.base_url}{path}", timeout=self.timeout) as response:
+                headers = response.headers
+                self.telemetry(self._telemetry(path, getattr(response, "status", None), headers))
+                return json.load(response)
+        except HTTPError as exc:
+            self.telemetry(self._telemetry(path, exc.code, exc.headers))
+            raise
+
+    @staticmethod
+    def _telemetry(path: str, status: int | None, headers: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "endpoint": path,
+            "http_status": status,
+            "retry_after_seconds": headers.get("Retry-After"),
+            "used_weight": headers.get("X-MBX-USED-WEIGHT-1M"),
+        }
 
     def exchange_info(self) -> Mapping[str, Any]:
         return self._get("/fapi/v1/exchangeInfo")
