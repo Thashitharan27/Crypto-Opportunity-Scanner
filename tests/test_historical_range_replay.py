@@ -95,3 +95,130 @@ def test_two_argument_service_api_remains_compatible(tmp_path):
     request=native_request(T)
     assert service.run(request,lambda:False)==tmp_path
     assert calls == [request]
+
+
+def test_range_falls_back_to_existing_two_argument_service():
+    class LegacyService:
+        def __init__(self): self.calls=[]
+        def run(self, request, cancelled):
+            self.calls.append(request)
+            return request
+    service=LegacyService(); clock=Clock()
+    points=(T,T+timedelta(hours=1))
+    result=HistoricalRangeRunner(service,monotonic=clock).run(
+        points,native_request,lambda:False)
+    assert [request.decision_time for request in service.calls] == list(points)
+    assert result.completed == tuple(service.calls)
+
+
+def test_production_stage_events_precede_each_operation_and_scoring_skip(monkeypatch,tmp_path):
+    from types import SimpleNamespace
+    import crypto_strategy_lab.gui.opportunity_scanner_controller as controller
+    from crypto_strategy_lab.data.binance.selective_acquisition import CandleAcquisitionResult
+
+    trace=[]
+    def event(progress): trace.append(("progress",progress.stage,progress.message))
+    def discovery(*args,**kwargs): trace.append(("operation","historical_discovery")); return "discovery"
+    class CandleStage:
+        def __init__(self,*args): pass
+        def acquire(self,*args,**kwargs):
+            trace.append(("operation","candle_acquisition")); return CandleAcquisitionResult(())
+    def final(*args): trace.append(("operation","final_candidates")); return "final"
+    class RichStage:
+        def __init__(self,*args): pass
+        def acquire(self,*args,**kwargs): trace.append(("operation","rich_data")); return "rich"
+    def publication(*args): trace.append(("operation","publication")); return tmp_path/"run"
+    monkeypatch.setattr(controller,"discover_historical_universe",discovery)
+    monkeypatch.setattr(controller,"SelectiveCandleAcquirer",CandleStage)
+    monkeypatch.setattr(controller,"build_final_candidate_set",final)
+    monkeypatch.setattr(controller,"SelectiveRichDataAcquirer",RichStage)
+    monkeypatch.setattr(controller,"publish_opportunity_scan",publication)
+    store=SimpleNamespace(raw_root=tmp_path,catalog=SimpleNamespace(inventory=lambda *a,**k:[]))
+    pipeline=controller.Task1To7OpportunityScanner(store,object(),tmp_path,
+        registry=SimpleNamespace(effective_warmup=lambda _:1),now=lambda:T)
+    pipeline.run_with_progress(native_request(T),lambda:False,event)
+    stages=[item[1] for item in trace if item[0]=="progress"]
+    assert stages == ["historical_discovery","candle_acquisition","scoring",
+                      "final_candidates","rich_data","publication"]
+    assert "skipped" in next(item[2] for item in trace if item[:2]==("progress","scoring")).lower()
+    for stage in ("historical_discovery","candle_acquisition","final_candidates","rich_data","publication"):
+        assert trace.index(next(item for item in trace if item[:2]==("progress",stage))) < trace.index(("operation",stage))
+
+
+def test_gui_rows_and_timestamp_precision_match_displayed_seconds():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    widgets=pytest.importorskip("PySide6.QtWidgets",exc_type=ImportError)
+    from PySide6.QtCore import QDateTime, Qt
+    from crypto_strategy_lab.gui.opportunity_scanner_workspace import OpportunityScannerWorkspace
+    app=widgets.QApplication.instance() or widgets.QApplication([])
+    workspace=OpportunityScannerWorkspace(object())
+    def row_visible(field):
+        label=workspace._form.labelForField(field)
+        return field.isVisible() and (label is None or label.isVisible())
+    try:
+        workspace.show(); app.processEvents()
+        assert not row_visible(workspace.execution)
+        assert not row_visible(workspace.decision_time)
+        assert not row_visible(workspace.range_start)
+        workspace.mode.setCurrentIndex(1); app.processEvents()
+        assert row_visible(workspace.execution) and row_visible(workspace.decision_time)
+        assert not row_visible(workspace.range_start)
+        precise=QDateTime.fromMSecsSinceEpoch(1738800300789,Qt.UTC)
+        workspace.decision_time.setDateTime(precise)
+        single=workspace.request().decision_time
+        assert single.microsecond == 0
+        assert single.strftime("%Y-%m-%d %H:%M:%S UTC") == workspace.decision_time.text()
+        workspace.execution.setCurrentIndex(1); app.processEvents()
+        assert row_visible(workspace.execution) and not row_visible(workspace.decision_time)
+        assert all(row_visible(field) for field in
+                   (workspace.range_start,workspace.range_end,workspace.cadence,workspace.planned))
+        workspace.range_start.setDateTime(precise)
+        workspace.range_end.setDateTime(precise.addSecs(7200))
+        points=workspace.decision_points()
+        assert all(point.microsecond==0 for point in points)
+        assert points[0].strftime("%Y-%m-%d %H:%M:%S UTC") == workspace.range_start.text()
+        executed=__import__("dataclasses").replace(workspace.request(),decision_time=points[0])
+        assert executed.decision_time == points[0]
+        assert workspace.planned.text()=="Planned scans: 3"
+        workspace.range_progress.show(); workspace.progress_text.setText("ETA: stale")
+        workspace.execution.setCurrentIndex(0); app.processEvents()
+        assert not workspace.range_progress.isVisible()
+        assert "stale" not in workspace.progress_text.text()
+    finally:
+        workspace.close()
+
+
+def test_gui_progress_has_exact_counts_stages_and_time_based_eta():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    widgets=pytest.importorskip("PySide6.QtWidgets",exc_type=ImportError)
+    from crypto_strategy_lab.gui.opportunity_scanner_workspace import OpportunityScannerWorkspace
+    app=widgets.QApplication.instance() or widgets.QApplication([])
+    workspace=OpportunityScannerWorkspace(object())
+    try:
+        workspace.range_progress.setRange(0,3)
+        workspace.range_progress.setValue(0); workspace.range_progress.setFormat("0 / 3")
+        assert workspace.range_progress.text()=="0 / 3"
+        for stage in range(1,7):
+            event=OpportunityScanProgress(f"stage_{stage}",stage,6,f"Stage {stage}",T,
+                0,3,1,stage,None,None)
+            workspace._progress(event)
+            assert f"Stage: {stage}/6" in workspace.progress_text.text()
+        assert "ETA: calculating" in workspace.progress_text.text()
+        first=OpportunityScanProgress("scan_complete",6,6,"Scan complete",T,1,3,1,10,10,20)
+        workspace._progress(first)
+        assert workspace.range_progress.text()=="1 / 3"
+        assert "ETA (estimate): 00:00:20" in workspace.progress_text.text()
+        second=OpportunityScanProgress("scan_complete",6,6,"Scan complete",T,2,3,2,20,10,10)
+        workspace._progress(second)
+        assert workspace.range_progress.text()=="2 / 3"
+        assert "ETA (estimate): 00:00:10" in workspace.progress_text.text()
+        last=OpportunityScanProgress("scan_complete",6,6,"Scan complete",T,3,3,3,30,10,0)
+        workspace._progress(last)
+        assert workspace.range_progress.text()=="3 / 3"
+        single=OpportunityScanProgress("candle_acquisition",2,6,"Selective candle acquisition",T,0,1,1,5)
+        workspace._progress(single)
+        assert "Stage: 2/6" in workspace.progress_text.text() and "ETA" not in workspace.progress_text.text()
+    finally:
+        workspace.close()

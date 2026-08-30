@@ -167,7 +167,13 @@ class HistoricalRangeRunner:
                     event.stage_count, event.message, d, len(completed), len(points), i,
                     elapsed, average, None if average is None else average * (len(points)-len(completed))))
             try:
-                result = self.service.run_with_progress(request_factory(decision), cancelled, forward)
+                request = request_factory(decision)
+                run_with_progress = getattr(self.service, "run_with_progress", None)
+                result = (
+                    run_with_progress(request, cancelled, forward)
+                    if run_with_progress is not None
+                    else self.service.run(request, cancelled)
+                )
             except OpportunityScanCancelled:
                 raise
             except Exception as exc:
