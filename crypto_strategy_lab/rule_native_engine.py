@@ -5,7 +5,10 @@ prepared features. This layer only exposes those already-prepared values to the
 generic Entry/Veto rule contract and neutralizes retired independent filtering
 paths.
 """
+
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -124,8 +127,68 @@ _RESEARCH_RULE_INDICATORS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class NativeLatestEntryDecision:
+    """Paper-safe view of the native Entry/Veto decision at one prepared row."""
+
+    accepted: bool
+    strategy_profile_key: str | None
+    side: str | None
+    reference_price: float
+    detail: str
+
+
 class RuleAwareDataLakeProductionBacktestEngine(DataLakeProductionBacktestEngine):
     """Current native runtime with prepared research evidence available to rules."""
+
+    def required_entry_research_features(self, index: int) -> frozenset[str]:
+        """Return prepared research blocks read by Entry/Veto at this row."""
+        context = self._profile_context(index)
+        if context is None:
+            return frozenset()
+        profile = context[3]
+        required: set[str] = set()
+        for rule in profile.entry_rules:
+            indicator = rule.get("indicator")
+            if indicator in _SR_RULE_INDICATORS:
+                required.add("support_resistance")
+            elif indicator in _RESEARCH_NUMERIC_FIELDS:
+                required.add(_RESEARCH_NUMERIC_FIELDS[indicator][0])
+            elif indicator in _RESEARCH_CATEGORICAL_FIELDS:
+                required.add(_RESEARCH_CATEGORICAL_FIELDS[indicator][0])
+        return frozenset(required)
+
+    def evaluate_prepared_entry(self, index: int) -> NativeLatestEntryDecision:
+        """Evaluate Entry/Veto semantics at one already-causal prepared row.
+
+        This deliberately does not open a position, apply portfolio overlap
+        behavior, or simulate an exit.  Callers own causal row selection.
+        """
+        if index < 0 or index >= len(self.close):
+            raise IndexError("prepared strategy row is out of range")
+        missing = object()
+        previous_sr_context = getattr(self, "_pending_sr_context", missing)
+        try:
+            accepted, detail = self._entry_filter_result(index)
+        finally:
+            if previous_sr_context is missing:
+                try:
+                    del self._pending_sr_context
+                except AttributeError:
+                    pass
+            else:
+                self._pending_sr_context = previous_sr_context
+        context = self._profile_context(index)
+        side = None
+        if context is not None:
+            _, side = self._resolved_profile_direction(index, context)
+        return NativeLatestEntryDecision(
+            accepted=bool(accepted),
+            strategy_profile_key=context[2] if context else None,
+            side=side,
+            reference_price=float(self.close[index]),
+            detail=str(detail),
+        )
 
     @classmethod
     def from_prepared(cls, *args, **kwargs):
@@ -143,14 +206,20 @@ class RuleAwareDataLakeProductionBacktestEngine(DataLakeProductionBacktestEngine
         if prepared is None:
             return engine
         sr_block = next(
-            (block for block in prepared.research if block.name == "support_resistance"),
+            (
+                block
+                for block in prepared.research
+                if block.name == "support_resistance"
+            ),
             None,
         )
         if sr_block is None:
             return engine
         engine.research_features["support_resistance"] = sr_block
         existing = set(engine.research_output_columns)
-        sr_columns = tuple(column for column in sr_block.values if column not in existing)
+        sr_columns = tuple(
+            column for column in sr_block.values if column not in existing
+        )
         engine.research_output_columns = (*engine.research_output_columns, *sr_columns)
         available_name = "support_resistance_feature_available_at"
         if available_name not in engine.research_feature_available_columns:
@@ -233,7 +302,9 @@ class RuleAwareDataLakeProductionBacktestEngine(DataLakeProductionBacktestEngine
         """Return one O(1) prepared S/R context and reuse it for all rules at the row."""
         if direction not in {"LONG", "SHORT"}:
             return None
-        if not getattr(getattr(self, "config", None), "enable_support_resistance_analysis", False):
+        if not getattr(
+            getattr(self, "config", None), "enable_support_resistance_analysis", False
+        ):
             return None
         pending = getattr(self, "_pending_sr_context", None)
         if pending is not None and pending[0] == i and pending[1] == direction:

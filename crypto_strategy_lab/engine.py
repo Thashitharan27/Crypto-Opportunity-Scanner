@@ -476,22 +476,29 @@ class BacktestEngine:
     def _active_positions(self, pair):
         return pair.positions()
 
+    def _resolved_profile_direction(self, i, profile_context=None):
+        """Return the native post-profile direction used for entry execution."""
+        context = profile_context or self._profile_context(i)
+        if context is None:
+            raise ValueError("Cannot resolve direction without a Strategy Profile context")
+        _, original_direction, _, profile = context
+        rule_flip = bool(profile.entry_rules and self._strategy_profile_rule_group_match(
+            i, original_direction, profile, "FLIP", profile.flip_rule_match_mode
+        ))
+        direction = original_direction
+        if profile.flip_direction or rule_flip:
+            direction = "SHORT" if original_direction == "LONG" else "LONG"
+        return original_direction, direction
+
     def _open_pair(self, i, entry_filter_passed=True, entry_filter_reason="Strategy profile passed", schedule=None):
         ind_i = schedule["indicator_index"] if schedule else i
         raw = self.open[i] if self.config.enable_daily_entry_schedule else self.close[i]
         profile_context = self._profile_context(ind_i)
         if profile_context is None:
             raise ValueError("Cannot open a trade without a current Strategy Profile context")
-        regime, original_direction, active_profile_key, active_profile = profile_context
-        direction = original_direction
-        profile_filter_flip = bool(
-            active_profile.entry_rules
-            and self._strategy_profile_rule_group_match(
-                ind_i, original_direction, active_profile, "FLIP", active_profile.flip_rule_match_mode
-            )
-        )
-        if active_profile.flip_direction or profile_filter_flip:
-            direction = "SHORT" if direction == "LONG" else "LONG"
+        regime, _, active_profile_key, active_profile = profile_context
+        original_direction, direction = self._resolved_profile_direction(ind_i, profile_context)
+        if direction != original_direction:
             entry_filter_reason = (
                 f"{entry_filter_reason}; direction flipped after profile rules: "
                 f"{original_direction} -> {direction}"
