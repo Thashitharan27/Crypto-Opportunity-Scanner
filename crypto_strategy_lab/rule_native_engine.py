@@ -166,7 +166,18 @@ class RuleAwareDataLakeProductionBacktestEngine(DataLakeProductionBacktestEngine
         """
         if index < 0 or index >= len(self.close):
             raise IndexError("prepared strategy row is out of range")
-        accepted, detail = self._strategy_profile_filter_result(index)
+        missing = object()
+        previous_sr_context = getattr(self, "_pending_sr_context", missing)
+        try:
+            accepted, detail = self._entry_filter_result(index)
+        finally:
+            if previous_sr_context is missing:
+                try:
+                    del self._pending_sr_context
+                except AttributeError:
+                    pass
+            else:
+                self._pending_sr_context = previous_sr_context
         context = self._profile_context(index)
         side = None
         if context is not None:

@@ -144,15 +144,34 @@ def test_legacy_sr_preset_filter_is_retired_in_current_native_runtime():
 
 def test_public_entry_decision_reports_native_post_flip_side():
     engine = _engine()
+    engine.config.enable_support_resistance_analysis = False
     engine.close = np.array([100.0])
     profile = SimpleNamespace(flip_direction=True, entry_rules=(), flip_rule_match_mode="ALL")
-    engine._strategy_profile_filter_result = lambda index: (True, "passed")
+    engine._strategy_profile_filter_result = lambda index, execution_i=None: (True, "passed")
     engine._profile_context = lambda index: ("BULL", "LONG", "BULL_LONG", profile)
     decision = engine.evaluate_prepared_entry(0)
     assert decision.accepted
     assert decision.strategy_profile_key == "BULL_LONG"
     assert decision.side == "SHORT"
     assert decision.reference_price == 100.0
+
+
+def test_public_entry_decision_uses_complete_native_filter_boundary():
+    engine = _engine()
+    engine.close = np.array([100.0])
+    engine._pending_sr_context = "existing-context"
+    profile = SimpleNamespace(flip_direction=False, entry_rules=(), flip_rule_match_mode="ALL")
+    engine._profile_context = lambda index: ("BULL", "LONG", "BULL_LONG", profile)
+    engine._strategy_profile_filter_result = lambda index, execution_i=None: (True, "profile passed")
+    engine._selected_direction = lambda index: "LONG"
+    engine._should_reject_for_sr = lambda index, direction, context: (
+        True, "NATIVE_LATER_FILTER_REJECT",
+    )
+    decision = engine.evaluate_prepared_entry(0)
+    assert decision.accepted is False
+    assert decision.detail == "NATIVE_LATER_FILTER_REJECT"
+    assert decision.side == "LONG"
+    assert engine._pending_sr_context == "existing-context"
 
 
 def test_public_entry_research_requirements_follow_active_profile_rules():

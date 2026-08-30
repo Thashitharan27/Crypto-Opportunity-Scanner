@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from crypto_strategy_lab.config import BacktestConfig
 from crypto_strategy_lab.gui.opportunity_scanner_controller import (
     OpportunityScanCancelled,
 )
@@ -21,6 +22,9 @@ from crypto_strategy_lab.paper_scanner_state import (
     PaperScannerState,
     PaperScannerStateError,
     PaperScannerStateStore,
+)
+from crypto_strategy_lab.rule_native_engine import (
+    RuleAwareDataLakeProductionBacktestEngine,
 )
 
 
@@ -376,6 +380,94 @@ def test_signal_state_failure_does_not_install_uncommitted_duplicate_key(tmp_pat
     # The failed in-memory attempt does not suppress a later durable emission.
     assert app.run_once().new_paper_entries == 1
     assert len(app.state.paper_entries) == 1
+
+
+def test_production_factory_composes_scanner_data_lake_and_native_engine(
+    tmp_path, monkeypatch
+):
+    import crypto_strategy_lab.paper_scanner_production as production
+
+    scanner = Scanner(completed())
+    scanner_factory_calls = []
+    monkeypatch.setattr(
+        production,
+        "create_opportunity_scanner_service",
+        lambda raw, cache, output, **options: (
+            scanner_factory_calls.append((raw, cache, output, options)) or scanner
+        ),
+    )
+    bundle = object()
+    prepared = SimpleNamespace(strategy_interval=pd.Timedelta(hours=1))
+    load_calls = []
+    monkeypatch.setattr(
+        production,
+        "load_backtest_bundle",
+        lambda store, request, **options: (
+            load_calls.append((store, request, options)) or bundle
+        ),
+    )
+    monkeypatch.setattr(
+        production,
+        "from_data_lake_bundle",
+        lambda actual, config: (prepared, None),
+    )
+    native_engine = object()
+    engine_calls = []
+    monkeypatch.setattr(
+        RuleAwareDataLakeProductionBacktestEngine,
+        "from_prepared",
+        classmethod(
+            lambda cls, frame, intrabar, config: (
+                engine_calls.append((frame, intrabar, config)) or native_engine
+            )
+        ),
+    )
+    paper_config = PaperScannerConfig(
+        timedelta(minutes=1),
+        timedelta(minutes=2),
+        timedelta(hours=2),
+        0,
+        timedelta(0),
+        tmp_path / "paper-state.json",
+        tmp_path / "paper-audit.jsonl",
+    )
+    strategy_config = BacktestConfig(
+        strategy_timeframe_minutes=60, telemetry_interval_minutes=60
+    )
+
+    runner = production.create_production_paper_scanner(
+        market_data_root=tmp_path / "raw",
+        cache_root=tmp_path / "cache",
+        scan_output_root=tmp_path / "scans",
+        paper_config=paper_config,
+        scan_request_factory=lambda: SimpleNamespace(mode="LIVE"),
+        strategy_config=strategy_config,
+    )
+
+    assert isinstance(runner, PaperScannerRunner)
+    assert isinstance(runner.evaluator, LatestNativeStrategyEvaluator)
+    assert runner.scanner is scanner
+    assert runner.config.state_path == tmp_path / "paper-state.json"
+    assert runner.config.audit_log_path == tmp_path / "paper-audit.jsonl"
+    assert scanner_factory_calls == [
+        (tmp_path / "raw", tmp_path / "cache", tmp_path / "scans", {})
+    ]
+    candidate = {
+        "symbol": "BTCUSDT",
+        "strategy_interval": "1h",
+        "strategy_request_start": "2026-01-01T00:00:00+00:00",
+        "strategy_request_end": "2026-01-02T00:00:00+00:00",
+        "strategy_request_market": "futures_um",
+        "strategy_request_exchange": "binance",
+    }
+    assert runner.evaluator.engine_builder(candidate) == (prepared, native_engine)
+    assert load_calls[0][1].symbol == "BTCUSDT"
+    assert load_calls[0][1].strategy_interval == "1h"
+    assert engine_calls == [(prepared, None, strategy_config)]
+    assert not any(
+        name in vars(runner)
+        for name in ("broker", "order_client", "auth", "live_orders")
+    )
 
 
 def test_retry_is_bounded_and_failed_runner_can_run_next_cycle(tmp_path):
