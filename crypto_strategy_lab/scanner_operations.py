@@ -164,9 +164,12 @@ class DiskMonitor:
                         # Concurrent cache replacement/removal is expected and
                         # must never crash the PAPER scheduler.
                         disappeared += 1
-            result["cache"] = {"size_bytes": size, "files_sampled": files,
-                               "truncated": files >= self.config.max_cache_files,
-                               "entries_disappeared": disappeared}
+            result["cache_usage"] = {
+                "size_bytes": size,
+                "files_sampled": files,
+                "truncated": files >= self.config.max_cache_files,
+                "entries_disappeared": disappeared,
+            }
         self.latest = result
         return result
 

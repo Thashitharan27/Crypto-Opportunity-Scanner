@@ -74,6 +74,11 @@ a configured cadence. Cache size walking has a file bound and tolerates entries
 that disappear during concurrent cache replacement. It is strictly read-only and
 performs no cleanup or repair.
 
+Filesystem capacity remains under each configured path name (including
+`disk.cache`), while directory-walk usage is published separately as
+`disk.cache_usage`. Cache sizing therefore cannot hide the cache filesystem's
+`WARNING` or `CRITICAL` capacity level.
+
 Disk/cache observation is best-effort. An `OSError` produces a structured
 `DISK_MONITOR_FAILED` audit event and `disk_monitor_error` health metric; it does
 not unwind an otherwise completed PAPER cycle or enter crash recovery. A valid

@@ -112,7 +112,8 @@ def test_disk_monitor_is_read_only_cadenced_and_classified(tmp_path):
     ), usage=lambda path: (calls.append(path), SimpleNamespace(total=100, used=85, free=15))[1])
     first = monitor.sample(force=True); second = monitor.sample()
     assert first == second and first["paper"]["level"] == "WARNING"
-    assert first["cache"]["size_bytes"] == 4 and (cache / "kept.bin").read_bytes() == b"1234"
+    assert first["cache_usage"]["size_bytes"] == 4
+    assert (cache / "kept.bin").read_bytes() == b"1234"
     assert len(calls) == 1  # same volume is deduplicated
 
 
@@ -159,8 +160,38 @@ def test_cache_walk_tolerates_disappearing_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "stat", stat)
     sample = DiskMonitor(DiskMonitoringConfig(cache_path=cache)).sample(force=True)
-    assert sample["cache"]["size_bytes"] == 0
-    assert sample["cache"]["entries_disappeared"] == 1
+    assert sample["cache_usage"]["size_bytes"] == 0
+    assert sample["cache_usage"]["entries_disappeared"] == 1
+
+
+def test_cache_filesystem_capacity_survives_cache_usage_walk(tmp_path):
+    raw, cache = tmp_path / "raw", tmp_path / "cache"
+    cache.mkdir()
+    (cache / "entry.bin").write_bytes(b"cache-data")
+    devices = {raw: 1, cache: 2}
+
+    monitor = DiskMonitor(
+        DiskMonitoringConfig(
+            paths={"data_lake_raw": raw, "cache": cache},
+            cache_path=cache, sample_every_cycles=1,
+            warning_free_percent=20, critical_free_percent=10,
+        ),
+        usage=lambda path: SimpleNamespace(
+            total=100,
+            used=(50 if Path(path) == raw else 95),
+            free=(50 if Path(path) == raw else 5),
+        ),
+        filesystem_stat=lambda path: SimpleNamespace(st_dev=devices[Path(path)]),
+    )
+    sample = monitor.sample()
+    assert sample["data_lake_raw"]["level"] == "OK"
+    assert sample["cache"]["level"] == "CRITICAL"
+    assert sample["cache_usage"] == {
+        "size_bytes": 10,
+        "files_sampled": 1,
+        "truncated": False,
+        "entries_disappeared": 0,
+    }
 
 
 def test_acquisition_metrics_use_existing_state_and_readiness_values():

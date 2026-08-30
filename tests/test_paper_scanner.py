@@ -716,10 +716,13 @@ def test_disk_monitor_failure_degrades_success_without_state_or_scheduler_crash(
     assert "RUNTIME_CYCLE_CRASH" not in events(tmp_path / "audit.jsonl")
 
 
-def test_different_device_critical_disk_makes_runner_unhealthy(tmp_path):
-    first, second = tmp_path / "first", tmp_path / "second"
+def test_different_device_critical_cache_disk_makes_runner_unhealthy(tmp_path):
+    first, second = tmp_path / "raw", tmp_path / "cache"
+    second.mkdir()
+    (second / "entry.bin").write_bytes(b"cache-data")
     disk = DiskMonitoringConfig(
-        paths={"first": first, "second": second}, sample_every_cycles=1,
+        paths={"data_lake_raw": first, "cache": second}, cache_path=second,
+        sample_every_cycles=1,
         warning_free_percent=20, critical_free_percent=10,
     )
     app, _ = runner(tmp_path, operational=health_config(tmp_path, disk=disk))
@@ -736,9 +739,11 @@ def test_different_device_critical_disk_makes_runner_unhealthy(tmp_path):
     )
     assert app.run_once().status is CycleStatus.COMPLETED
     assert usage_calls == [first, second]
-    assert health(tmp_path)["disk"]["first"]["level"] == "OK"
-    assert health(tmp_path)["disk"]["second"]["level"] == "CRITICAL"
-    assert health(tmp_path)["status"] == "UNHEALTHY"
+    current = health(tmp_path)
+    assert current["disk"]["data_lake_raw"]["level"] == "OK"
+    assert current["disk"]["cache"]["level"] == "CRITICAL"
+    assert current["disk"]["cache_usage"]["size_bytes"] == 10
+    assert current["status"] == "UNHEALTHY"
 
 
 def test_cancelled_cycle_is_not_success_and_preserves_failure_history(tmp_path):
