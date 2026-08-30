@@ -9,7 +9,7 @@ import time
 
 from PySide6.QtCore import QDateTime, QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDateTimeEdit, QDoubleSpinBox,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QProgressBar, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from crypto_strategy_lab.data.binance.selective_acquisition import SelectiveCandleAcquisitionConfig
@@ -93,11 +93,20 @@ class OpportunityScannerWorkspace(QWidget):
         self.summary=QLabel("No completed scan loaded."); self.summary.setWordWrap(True); root.addWidget(self.summary)
         self.tabs=QTabWidget(); self.preliminary_table=QTableWidget(); self.final_table=QTableWidget(); self.readiness_table=QTableWidget()
         self.tabs.addTab(self.preliminary_table,"Preliminary Candidates"); self.tabs.addTab(self.final_table,"Final Candidates"); self.tabs.addTab(self.readiness_table,"Data Readiness"); root.addWidget(self.tabs,1)
+        validation=QWidget(); validation_layout=QVBoxLayout(validation); validation_form=QFormLayout()
+        config_row=QWidget(); config_layout=QHBoxLayout(config_row); config_layout.setContentsMargins(0,0,0,0)
+        self.validation_config=QLineEdit(); self.validation_browse=QPushButton("Browse"); config_layout.addWidget(self.validation_config,1); config_layout.addWidget(self.validation_browse)
+        self.validation_horizon=QLineEdit("24h"); validation_form.addRow("Strategy config",config_row); validation_form.addRow("Entry evaluation horizon",self.validation_horizon); validation_layout.addLayout(validation_form)
+        validation_actions=QHBoxLayout(); self.validate_button=QPushButton("Validate Final Candidates"); self.validation_cancel=QPushButton("Cancel"); self.validate_button.setEnabled(False); self.validation_cancel.setEnabled(False); validation_actions.addWidget(self.validate_button); validation_actions.addWidget(self.validation_cancel); validation_actions.addStretch(1); validation_layout.addLayout(validation_actions)
+        self.validation_progress=QLabel("Strategy validation: —\nCurrent symbol: —\nStage: —\nElapsed: 00:00:00\nETA: calculating…"); validation_layout.addWidget(self.validation_progress)
+        self.validation_views=QTabWidget(); self.validation_outcomes=QTableWidget(); self.validation_summary=QTableWidget(); self.validation_rank=QTableWidget(); self.validation_views.addTab(self.validation_outcomes,"Candidate Outcomes"); self.validation_views.addTab(self.validation_summary,"Summary"); self.validation_views.addTab(self.validation_rank,"Rank Performance"); validation_layout.addWidget(self.validation_views,1)
+        self.tabs.addTab(validation,"Strategy Validation")
         self._timer=QTimer(self); self._timer.timeout.connect(self._update_elapsed)
         self.mode.currentIndexChanged.connect(self._mode_changed); self.execution.currentIndexChanged.connect(self._mode_changed)
         for widget in (self.range_start,self.range_end): widget.dateTimeChanged.connect(self._update_planned)
         self.cadence.currentIndexChanged.connect(self._update_planned)
         self.run_button.clicked.connect(self.start_scan); self.cancel_button.clicked.connect(self.cancel_scan)
+        self.validation_browse.clicked.connect(self._browse_validation_config)
         self._mode_changed()
 
     def _mode_changed(self):
@@ -117,6 +126,20 @@ class OpportunityScannerWorkspace(QWidget):
             self.range_progress.setValue(0)
             self.progress_text.setText("Stage: —\nElapsed: 00:00:00")
         self._update_planned()
+        if not historical:
+            self.validate_button.setEnabled(False)
+
+    def _browse_validation_config(self):
+        path,_=QFileDialog.getOpenFileName(self,"Select v3 ResearchRunConfig",self.validation_config.text(),"JSON (*.json)")
+        if path: self.validation_config.setText(path)
+
+    def render_validation(self, result):
+        """Render already-computed validation facts; no strategy logic lives in Qt."""
+        self._fill(self.validation_outcomes,result.outcomes,("decision_timestamp","final_rank","symbol","population","valid_entry","side","result","completed_trade_count","wins","losses","neutrals","average_r"))
+        self._fill(self.validation_summary,result.summary,("population","candidate_observations","candidate_to_entry_conversion","unique_trade_count","unique_wins","unique_losses","unique_neutrals","resolved_unique_trade_win_rate","average_r_per_unique_trade"))
+        rank=result.by_rank.copy(); top=result.top_k.copy()
+        if not top.empty: top["final_rank"]="Top "+top.top_k.astype(str)
+        self._fill(self.validation_rank,__import__("pandas").concat([rank,top],ignore_index=True),("population","final_rank","candidate_observations","candidate_to_entry_conversion","unique_trade_count","unique_wins","unique_losses","unique_neutrals","resolved_unique_trade_win_rate","average_r_per_unique_trade"))
 
     def _set_row_visible(self, field, visible):
         """Hide both parts of a form row on Qt versions without setRowVisible."""
@@ -231,3 +254,4 @@ class OpportunityScannerWorkspace(QWidget):
         self._fill(self.preliminary_table,result.preliminary,("discovery_rank","symbol","range_percent","absolute_price_change_percent","quote_volume","spread_percent","model_rank","score","acquisition_state","quality_status","detail"))
         self._fill(self.final_table,result.final,("final_rank","symbol","discovery_rank","opportunity_model_name","opportunity_model_version","opportunity_model_rank","opportunity_score","strategy_interval","quality_status","acquisition_state"))
         self._fill(self.readiness_table,result.readiness,("symbol","feature_name","dataset","feature_readiness","acquisition_state","requiredness_for_feature","quality_status","detail"))
+        self.validate_button.setEnabled(scan.get("discovery_mode")=="HISTORICAL" and not result.final.empty)
