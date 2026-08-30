@@ -8,10 +8,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+from crypto_strategy_lab.candidate_lifecycle import (
+    CandidateLifecycleRecord,
+    CandidateLifecyclePolicy,
+    DEFAULT_LIFECYCLE_POLICY,
+    LifecycleCursor,
+    validate_lifecycle_cursor,
+)
 from crypto_strategy_lab.run_manifest import atomic_json
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 class PaperScannerStateError(RuntimeError):
@@ -24,14 +31,26 @@ class PaperScannerState:
     paper_entries: list[dict[str, Any]] = field(default_factory=list)
     last_completed_cycle: dict[str, Any] | None = None
     last_successful_scan_run_id: str | None = None
+    lifecycle_policy: CandidateLifecyclePolicy = DEFAULT_LIFECYCLE_POLICY
+    candidate_lifecycle: list[CandidateLifecycleRecord] = field(default_factory=list)
+    lifecycle_cursor: LifecycleCursor | None = None
 
     def serializable(self) -> dict[str, Any]:
+        validate_lifecycle_cursor(self.candidate_lifecycle, self.lifecycle_cursor)
         return {
             "version": STATE_VERSION,
             "emitted_signal_ids": self.emitted_signal_ids,
             "paper_entries": self.paper_entries,
             "last_completed_cycle": self.last_completed_cycle,
             "last_successful_scan_run_id": self.last_successful_scan_run_id,
+            "lifecycle_policy": {
+                "identity": self.lifecycle_policy.identity,
+                "config": json.loads(self.lifecycle_policy.canonical_json()),
+            },
+            "candidate_lifecycle": [item.serializable() for item in self.candidate_lifecycle],
+            "lifecycle_cursor": (
+                self.lifecycle_cursor.serializable() if self.lifecycle_cursor else None
+            ),
         }
 
 
@@ -44,7 +63,8 @@ class PaperScannerStateStore:
             return PaperScannerState()
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            if value.get("version") != STATE_VERSION:
+            version = value.get("version")
+            if version not in (1, STATE_VERSION):
                 raise PaperScannerStateError(
                     f"unsupported paper scanner state version: {value.get('version')!r}"
                 )
@@ -86,11 +106,37 @@ class PaperScannerStateStore:
             # durable paper record or, worse, re-emit an existing paper entry.
             if entry_ids != ids:
                 raise ValueError("paper entry ledger and duplicate index disagree")
+            lifecycle_policy = DEFAULT_LIFECYCLE_POLICY
+            lifecycle: list[CandidateLifecycleRecord] = []
+            lifecycle_cursor: LifecycleCursor | None = None
+            if version == STATE_VERSION:
+                policy_value = value["lifecycle_policy"]
+                lifecycle_policy = CandidateLifecyclePolicy(**policy_value["config"])
+                lifecycle_policy.validate_executable()
+                if policy_value["identity"] != lifecycle_policy.identity:
+                    raise ValueError("lifecycle policy identity is invalid")
+                lifecycle = [
+                    CandidateLifecycleRecord.from_dict(item)
+                    for item in value["candidate_lifecycle"]
+                ]
+                if len({item.symbol for item in lifecycle}) != len(lifecycle):
+                    raise ValueError("candidate lifecycle symbols are not unique")
+                cursor_value = value["lifecycle_cursor"]
+                lifecycle_cursor = (
+                    LifecycleCursor.from_dict(cursor_value)
+                    if cursor_value is not None else None
+                )
+                validate_lifecycle_cursor(lifecycle, lifecycle_cursor)
+            # v1 migration intentionally starts with no inferred membership: v1
+            # did not durably retain the last candidate snapshot.
             return PaperScannerState(
                 ids,
                 entries,
                 value.get("last_completed_cycle"),
                 value.get("last_successful_scan_run_id"),
+                lifecycle_policy,
+                lifecycle,
+                lifecycle_cursor,
             )
         except PaperScannerStateError:
             raise
