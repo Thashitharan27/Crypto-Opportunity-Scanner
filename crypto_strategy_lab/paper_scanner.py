@@ -318,13 +318,26 @@ class PaperScannerRunner:
                 len(completed.final),
                 status=CycleStatus.STALE_DISCOVERY,
             )
-        lifecycle = apply_candidate_lifecycle(
-            self.state.candidate_lifecycle,
-            completed.final.to_dict("records"),
-            decision,
-            run_id,
-            self.lifecycle_policy,
-        )
+        try:
+            lifecycle = apply_candidate_lifecycle(
+                self.state.candidate_lifecycle,
+                completed.final.to_dict("records"),
+                decision,
+                run_id,
+                self.lifecycle_policy,
+            )
+        except ValueError as exc:
+            # A non-causal scan must not modify either in-memory or durable
+            # lifecycle state.  In particular, do not call _finish(), because
+            # that would replace the otherwise unchanged state document.
+            self.audit.append(
+                "CANDIDATE_SET_REJECTED", cycle, scan_run_id=run_id,
+                detail=f"decision_timestamp={decision.isoformat()} {exc}",
+            )
+            return PaperScanCycleResult(
+                cycle, run_id, decision.isoformat(), len(completed.final),
+                0, 0, 0, 0, 0, 0, CycleStatus.FAILED,
+            )
         lifecycle_state = PaperScannerState(
             emitted_signal_ids=list(self.state.emitted_signal_ids),
             paper_entries=list(self.state.paper_entries),
@@ -356,7 +369,9 @@ class PaperScannerRunner:
                 detail=(
                     f"decision_timestamp={transition.decision_timestamp} "
                     f"previous_final_rank={transition.previous_final_rank} "
-                    f"final_rank={transition.final_rank}"
+                    f"final_rank={transition.final_rank} "
+                    f"previous_discovery_rank={transition.previous_discovery_rank} "
+                    f"discovery_rank={transition.discovery_rank}"
                 ),
             )
         counts = {

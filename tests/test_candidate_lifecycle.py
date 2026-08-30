@@ -48,6 +48,7 @@ def test_rolling_immediate_lifecycle_activation_retention_removal_reactivation()
     again = apply(removed.state, [row("BTCUSDT", 1, 2)], T1 + timedelta(hours=3), "run-4")
     assert kinds(again) == [("BTCUSDT", TransitionType.ACTIVATED)]
     assert again.state[0].activated_timestamp == (T1 + timedelta(hours=3)).isoformat()
+    assert again.state[0].first_seen_decision_timestamp == T1.isoformat()
 
 
 def test_rank_tracking_no_false_transition_and_deterministic_symbol_order():
@@ -67,6 +68,36 @@ def test_rank_tracking_no_false_transition_and_deterministic_symbol_order():
     assert (btc.previous_final_rank, btc.final_rank) == (1, 2)
     unchanged = apply(changed.state, list(changed.active_rows), T1 + timedelta(hours=2), "run-3")
     assert not unchanged.transitions
+
+
+def test_discovery_rank_only_change_has_unambiguous_transition():
+    first = apply(rows=[row("BTCUSDT", 1, 4)])
+    changed = apply(
+        first.state, [row("BTCUSDT", 1, 7)], T1 + timedelta(hours=1), "run-2"
+    )
+    transition = changed.transitions[0]
+    assert transition.transition is TransitionType.RANK_CHANGED
+    assert (transition.previous_final_rank, transition.final_rank) == (1, 1)
+    assert (transition.previous_discovery_rank, transition.discovery_rank) == (4, 7)
+
+
+def test_shared_engine_rejects_older_decision_for_active_and_removed_state():
+    active = apply(rows=[row("BTCUSDT", 1)], when=T1 + timedelta(hours=1), run="run-2")
+    with pytest.raises(ValueError, match="later than prior"):
+        apply(active.state, [row("BTCUSDT", 1)], T1, "run-1")
+
+    removed = apply(active.state, [], T1 + timedelta(hours=2), "run-3")
+    with pytest.raises(ValueError, match="later than prior"):
+        apply(removed.state, [row("BTCUSDT", 1)], T1, "run-1")
+
+
+def test_exact_same_scan_replay_is_idempotent_but_equal_other_run_is_rejected():
+    first = apply(rows=[row("BTCUSDT", 1, 2)])
+    assert apply(first.state, [row("BTCUSDT", 1, 2)]) == first.__class__(
+        first.state, (), first.active_rows
+    )
+    with pytest.raises(ValueError, match="later than prior"):
+        apply(first.state, [row("BTCUSDT", 1, 2)], run="different-run")
 
 
 def test_empty_snapshot_removes_all_in_symbol_order_and_function_is_pure():

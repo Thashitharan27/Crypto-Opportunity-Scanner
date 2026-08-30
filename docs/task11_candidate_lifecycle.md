@@ -21,6 +21,13 @@ are ordered deterministically. An unchanged active symbol emits no transition.
 Records retain first/last-seen and activation/removal times, latest discovery and
 final rank, previous final rank, status, and originating run.
 
+The shared boundary rejects decisions older than its latest prior lifecycle
+timestamp. Equal timestamps are also rejected unless the run ID, active
+membership, and both ranks prove an exact replay of the same scan; that replay is
+an explicit idempotent no-op. Reactivation preserves the symbol's original
+first-seen timestamp while updating its latest activation timestamp. Rank-change
+transitions and audit details carry both discovery and final before/after ranks.
+
 Under v1, active rows are the current snapshot rows sorted by the existing final
 rank (with symbol only as a deterministic tie-break), so the native Task 10
 strategy evaluator receives the same rows and signal identity/duplicate behavior
@@ -47,7 +54,9 @@ closed. Existing temp-file, fsync, and replace persistence remains authoritative
 `replay_candidate_lifecycle` validates strictly increasing, timezone-aware
 decision times and unique run IDs, then calls the same
 `apply_candidate_lifecycle` function used by Paper for each snapshot. It has no
-clock and cannot inspect future snapshots while applying the current one.
+clock and cannot inspect future snapshots while applying the current one. The
+shared function independently enforces the monotonic rule, so Paper cannot move
+durable lifecycle time backward either.
 
 ## Intentionally deferred
 

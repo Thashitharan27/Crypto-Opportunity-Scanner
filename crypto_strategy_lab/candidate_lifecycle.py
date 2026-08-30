@@ -110,6 +110,8 @@ class CandidateTransition:
     scanner_run_id: str
     previous_final_rank: int | None
     final_rank: int | None
+    previous_discovery_rank: int | None
+    discovery_rank: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +130,8 @@ def apply_candidate_lifecycle(
 ) -> LifecycleResult:
     """Pure v1 transition: snapshot membership is active membership."""
     policy.validate_executable()
-    decision = _aware(decision_timestamp).isoformat()
+    decision_time = _aware(decision_timestamp)
+    decision = decision_time.isoformat()
     if not scanner_run_id:
         raise ValueError("scanner_run_id is required")
     previous = {record.symbol: record for record in previous_state}
@@ -140,6 +143,19 @@ def apply_candidate_lifecycle(
     if len(symbols) != len(set(symbols)):
         raise ValueError("candidate snapshot symbols must be unique")
 
+    authoritative_time = _latest_lifecycle_time(previous_state)
+    if authoritative_time is not None and decision_time <= authoritative_time:
+        if (
+            decision_time == authoritative_time
+            and _is_exact_scan_replay(
+                previous_state, rows, scanner_run_id, authoritative_time
+            )
+        ):
+            return LifecycleResult(tuple(previous_state), (), tuple(rows))
+        raise ValueError(
+            "candidate lifecycle decision must be later than prior lifecycle state"
+        )
+
     records: dict[str, CandidateLifecycleRecord] = dict(previous)
     transitions: list[CandidateTransition] = []
     for row, symbol in zip(rows, symbols):
@@ -149,12 +165,15 @@ def apply_candidate_lifecycle(
         activated = old is None or old.status is LifecycleStatus.REMOVED
         if activated:
             record = CandidateLifecycleRecord(
-                symbol, LifecycleStatus.ACTIVE, decision, decision, decision, None,
+                symbol, LifecycleStatus.ACTIVE,
+                old.first_seen_decision_timestamp if old else decision,
+                decision, decision, None,
                 discovery_rank, final_rank, old.final_rank if old else None, scanner_run_id,
             )
             transitions.append(CandidateTransition(
                 TransitionType.ACTIVATED, symbol, decision, scanner_run_id,
                 old.final_rank if old else None, final_rank,
+                old.discovery_rank if old else None, discovery_rank,
             ))
         else:
             rank_changed = (old.final_rank, old.discovery_rank) != (final_rank, discovery_rank)
@@ -167,6 +186,7 @@ def apply_candidate_lifecycle(
                 transitions.append(CandidateTransition(
                     TransitionType.RANK_CHANGED, symbol, decision, scanner_run_id,
                     old.final_rank, final_rank,
+                    old.discovery_rank, discovery_rank,
                 ))
         records[symbol] = record
 
@@ -182,6 +202,7 @@ def apply_candidate_lifecycle(
             transitions.append(CandidateTransition(
                 TransitionType.REMOVED, symbol, decision, scanner_run_id,
                 old.final_rank, None,
+                old.discovery_rank, None,
             ))
     transitions.sort(key=lambda item: (item.symbol, item.transition.value))
     return LifecycleResult(
@@ -230,6 +251,53 @@ def _aware(value: datetime) -> datetime:
 
 def _parse_timestamp(value: str) -> datetime:
     return _aware(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
+def _latest_lifecycle_time(
+    state: Sequence[CandidateLifecycleRecord],
+) -> datetime | None:
+    timestamps: list[datetime] = []
+    for record in state:
+        timestamps.extend((
+            _parse_timestamp(record.last_seen_decision_timestamp),
+            _parse_timestamp(record.activated_timestamp),
+        ))
+        if record.removed_timestamp is not None:
+            timestamps.append(_parse_timestamp(record.removed_timestamp))
+    return max(timestamps) if timestamps else None
+
+
+def _is_exact_scan_replay(
+    state: Sequence[CandidateLifecycleRecord],
+    rows: Sequence[Mapping[str, Any]],
+    scanner_run_id: str,
+    authoritative_time: datetime,
+) -> bool:
+    authoritative_records = [
+        record for record in state
+        if authoritative_time in {
+            _parse_timestamp(record.last_seen_decision_timestamp),
+            _parse_timestamp(record.activated_timestamp),
+            *(
+                [_parse_timestamp(record.removed_timestamp)]
+                if record.removed_timestamp is not None else []
+            ),
+        }
+    ]
+    if not authoritative_records or any(
+        record.last_scanner_run_id != scanner_run_id
+        for record in authoritative_records
+    ):
+        return False
+    active = {record.symbol: record for record in state if record.status is LifecycleStatus.ACTIVE}
+    if set(active) != {str(row["symbol"]).upper() for row in rows}:
+        return False
+    return all(
+        active[str(row["symbol"]).upper()].final_rank == _rank(row["final_rank"])
+        and active[str(row["symbol"]).upper()].discovery_rank
+        == _rank(row.get("discovery_rank"), optional=True)
+        for row in rows
+    )
 
 
 def _rank(value: Any, optional: bool = False) -> int | None:

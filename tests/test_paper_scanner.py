@@ -153,7 +153,12 @@ def test_fresh_verified_scan_emits_paper_entry_and_duplicate_survives_restart(tm
         ]
         == "COMPLETED"
     )
-    reloaded, _ = runner(tmp_path, scan=Scanner(completed(run_id="run-2")))
+    next_decision = DECISION + timedelta(minutes=1)
+    reloaded, _ = runner(
+        tmp_path,
+        scan=Scanner(completed(decision=next_decision, run_id="run-2")),
+        now=next_decision,
+    )
     second = reloaded.run_once()
     assert second.duplicate_signals_suppressed == 1
     assert second.new_paper_entries == 0
@@ -182,6 +187,26 @@ def test_lifecycle_commit_failure_keeps_prior_durable_membership(tmp_path):
     assert result.status is CycleStatus.FAILED
     assert app.state.candidate_lifecycle == state_before
     assert (tmp_path / "state.json").read_bytes() == durable_before
+
+
+def test_out_of_order_paper_scan_fails_without_changing_durable_state(tmp_path):
+    scanner = Scanner(completed(decision=DECISION, run_id="newer"))
+    app, _ = runner(tmp_path, scan=scanner)
+    assert app.run_once().status is CycleStatus.COMPLETED
+    durable_before = (tmp_path / "state.json").read_bytes()
+    lifecycle_before = list(app.state.candidate_lifecycle)
+
+    scanner.completed = completed(
+        decision=DECISION - timedelta(minutes=1), run_id="older"
+    )
+    rejected = app.run_once()
+    assert rejected.status is CycleStatus.FAILED
+    assert app.state.candidate_lifecycle == lifecycle_before
+    assert (tmp_path / "state.json").read_bytes() == durable_before
+    assert "CANDIDATE_SET_REJECTED" in events(tmp_path / "audit.jsonl")
+
+    reloaded = PaperScannerStateStore(tmp_path / "state.json").load()
+    assert reloaded.candidate_lifecycle == lifecycle_before
 
 
 def test_default_lifecycle_preserves_task10_candidate_and_signal_parity(tmp_path):
