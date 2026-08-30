@@ -1,13 +1,16 @@
 from dataclasses import replace
+import hashlib, json
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from crypto_strategy_lab.data_lake_config import ResearchRunConfig
+from crypto_strategy_lab.data_lake_config import ResearchRunConfig, ExecutionConfig
 from crypto_strategy_lab.historical_strategy_validation import (
     EVERY_VIABLE_ENTRY, STANDARD_SINGLE_SYMBOL, HistoricalStrategyValidator,
     SymbolResearchResult, aggregate_reports, attach_candidate_trades,
+    build_validation_data_request, load_validation_config,
 )
+from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
 
 
 def candidates(symbols=("SOLUSDT",)):
@@ -43,10 +46,68 @@ def test_one_sequential_invocation_per_unique_symbol_and_combined_period(tmp_pat
     calls=[]
     def execute(symbol,start,end,config):
         calls.append((symbol,pd.Timestamp(start),pd.Timestamp(end),config.strategy,config.execution))
-        return SymbolResearchResult("run-"+symbol,pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"]),pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"]),end)
+        return SymbolResearchResult("run-"+symbol,pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"]),pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"]),pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"]),end,tmp_path/symbol,start,end)
     config=ResearchRunConfig(); path=tmp_path/"config.json"; path.write_text("{}")
     result=HistoricalStrategyValidator(execute,warmup_bars=lambda _:10).run(c,config,config_path=path,publish=False)
     assert len(calls)==7 and [x[0] for x in calls]==sorted(symbols)
     assert all(x[3] is config.strategy and x[4] is config.execution for x in calls)
     assert len(result.outcomes)==200 and set(result.outcomes.population)=={STANDARD_SINGLE_SYMBOL,EVERY_VIABLE_ENTRY}
     assert all(end >= c[c.symbol.eq(symbol)].decision_timestamp.max()+pd.Timedelta("24h") for symbol,_,end,_,_ in calls)
+
+
+def test_eve_censored_entry_is_valid_and_unresolved():
+    empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
+    censored=pd.DataFrame({"entry_time":pd.to_datetime(["2025-01-01T01:00Z"]),
+        "pair_net_r":[None],"side":["SHORT"],"research_sample_id":["eod-1"]})
+    rows,associations=attach_candidate_trades(candidates(),empty,population=EVERY_VIABLE_ENTRY,
+        run_id="real-run",horizon=pd.Timedelta("24h"),available_through=pd.Timestamp("2025-01-02T00:00Z"),censored_trades=censored)
+    assert rows.iloc[0].valid_entry and rows.iloc[0].completed_trade_count == 0
+    assert rows.iloc[0].result == "UNRESOLVED"
+    assert associations.iloc[0].status == "CENSORED" and associations.iloc[0].trade_identity.endswith("eod-1")
+
+
+def test_timeout_tail_and_immutable_config_snapshot_are_published(tmp_path):
+    base=ResearchRunConfig(); execution=replace(base.execution,profiles={
+        key:replace(profile,timeout_enabled=True,timeout_minutes=1440 if key==next(iter(base.execution.profiles)) else 60)
+        for key,profile in base.execution.profiles.items()})
+    config=replace(base,execution=execution); external=tmp_path/"external.json"
+    external.write_text(json.dumps(config.to_dict(),default=str))
+    calls=[]
+    def execute(symbol,start,end,used):
+        calls.append((pd.Timestamp(start),pd.Timestamp(end),used.strategy,used.execution))
+        # Mutating the external file mid-run must not alter snapshotted provenance.
+        external.write_text('{"changed":true}')
+        empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"])
+        viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
+        return SymbolResearchResult("authoritative-run",empty,viable,viable.copy(),end,tmp_path/"native",start,end,("source-sha",))
+    result=HistoricalStrategyValidator(execute,warmup_bars=lambda _:5,output_root=tmp_path/"validation").run(
+        candidates().assign(scanner_source_identity="scanner-source"),config,config_path=external)
+    assert calls[0][1] == pd.Timestamp("2025-01-03T00:00Z")
+    snapshot=(result.run_dir/"strategy_config_snapshot.json").read_bytes()
+    assert hashlib.sha256(snapshot).hexdigest()==result.manifest["strategy_config_sha256"]
+    assert b'"changed"' not in snapshot
+    assert result.manifest["native_research_run_ids_by_symbol"]["SOLUSDT"]=="authoritative-run"
+    assert result.manifest["scanner_candidate_sources"][0]["scanner_source_identity"]=="scanner-source"
+    association=result.run_dir/"strategy_validation_trade_associations.csv"
+    assert association.exists() and result.manifest["artifacts"][association.name]["rows"]==0
+
+
+def test_timeout_disabled_uses_latest_coverage_without_forcing_exit(tmp_path):
+    seen=[]; latest=pd.Timestamp("2025-02-01T00:00Z")
+    def execute(symbol,start,end,config):
+        seen.append(pd.Timestamp(end)); empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"]); viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
+        return SymbolResearchResult("run",empty,viable,viable.copy(),latest,tmp_path/"native",start,end)
+    HistoricalStrategyValidator(execute,warmup_bars=lambda _:0,latest_available=lambda _:latest).run(candidates(),ResearchRunConfig(),config_path=tmp_path/"unused",publish=False)
+    assert seen==[latest]
+
+
+def test_strict_v3_load_and_production_request_projection(tmp_path):
+    config=ResearchRunConfig(); path=tmp_path/"config.json"; path.write_text(json.dumps(config.to_dict()))
+    loaded=load_validation_config(path); assert loaded==config
+    bad=tmp_path/"bad.json"; bad.write_text('{"config_version":3,"unknown":1}')
+    import pytest
+    with pytest.raises(ValueError,match="Unknown"): load_validation_config(bad)
+    registry=type("Registry",(),{"names":lambda self:("technical",),"required_datasets":lambda self,names:(DatasetKind.FUNDING_RATE,)})()
+    request=build_validation_data_request("btcusdt",datetime(2025,1,1,tzinfo=timezone.utc),datetime(2025,1,2,tzinfo=timezone.utc),loaded,registry)
+    assert request.market==MarketKind.FUTURES_UM and request.strategy_interval=="15m" and request.intrabar_interval=="1m"
+    assert request.datasets==(DatasetKind.KLINES,DatasetKind.FUNDING_RATE)

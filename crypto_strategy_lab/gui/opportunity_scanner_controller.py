@@ -246,9 +246,10 @@ class OpportunityScannerApplicationService:
     """Injectable facade that invokes the existing Task 1--7 pipeline once."""
 
     def __init__(self, run_once: Callable[[OpportunityScanRequest, Callable[[], bool]], Path],
-                 reader: OpportunityScanResultReader | None = None):
+                 reader: OpportunityScanResultReader | None = None, validation_service=None):
         self._run_once = run_once
         self.reader = reader or OpportunityScanResultReader()
+        self.validation_service = validation_service
 
     def run(self, request: OpportunityScanRequest, cancelled: Callable[[], bool]) -> CompletedOpportunityScan:
         return self.reader.read(self._run_once(request, cancelled))
@@ -427,7 +428,9 @@ def create_opportunity_scanner_service(raw_root: Path, cache_root: Path,
     pipeline = Task1To7OpportunityScanner(
         store, backend, Path(output_root), **pipeline_options
     )
-    return OpportunityScannerApplicationService(pipeline)
+    from crypto_strategy_lab.historical_strategy_validation import create_historical_strategy_validation_service
+    validation=create_historical_strategy_validation_service(raw_root,cache_root,Path(output_root)/"opportunity_validation")
+    return OpportunityScannerApplicationService(pipeline,validation_service=validation)
 
 
 def build_request(*, mode: str, decision_time: datetime | None,

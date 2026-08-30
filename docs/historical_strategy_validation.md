@@ -51,8 +51,17 @@ starting and preserves completed native runs, but does not terminate a running
 simulator unsafely. Unexpected native failure stops validation and no COMPLETE
 package is published.
 
+The entry horizon controls only when a trade may enter. The research request has
+a separate outcome-resolution tail equal to the largest enabled-profile timeout.
+If an enabled profile has no timeout, research runs through the latest catalogued
+validated coverage and leaves native `END_OF_DATA` observations censored. Actual
+usable bundle coverage—not the requested end—decides whether a candidate window
+is complete.
+
 Completed packages live under `output/opportunity_validation/<validation_run_id>`
 with candidate outcomes, overall/rank/Top-K/year tables, hashes, row counts,
-scanner/config provenance, native run IDs, and a completion marker. Scanner run
+an auditable candidate-to-native-trade association table, an immutable canonical
+strategy-config snapshot, scanner source identities, actual native run IDs/run
+directories/requests, and a completion marker. Scanner run
 directories remain immutable. This feature is historical research only and has
 no exchange-key, order, account, leverage, or live-trading path.

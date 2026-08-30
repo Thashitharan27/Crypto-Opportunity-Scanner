@@ -288,6 +288,33 @@ def test_workspace_constructs_and_mode_controls_utc_timestamp():
     finally: workspace.close()
 
 
+def test_validation_worker_retains_complete_range_and_runs_offscreen(tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    widgets=pytest.importorskip("PySide6.QtWidgets",exc_type=ImportError)
+    from PySide6.QtCore import QEventLoop, QTimer
+    from crypto_strategy_lab.data_lake_config import ResearchRunConfig
+    from crypto_strategy_lab.gui.opportunity_scanner_workspace import OpportunityScannerWorkspace
+    calls=[]
+    class Validation:
+        def validate(self,dirs,path,horizon,cancelled,progress):
+            calls.append((dirs,path,horizon)); progress({"symbol_index":1,"symbol_total":1,"symbol":"BTCUSDT","native_stage":"Preparing data & research features","elapsed":0,"eta":None})
+            return SimpleNamespace(run_dir=tmp_path/"validation",outcomes=pd.DataFrame(),summary=pd.DataFrame(),by_rank=pd.DataFrame(),top_k=pd.DataFrame())
+    service=SimpleNamespace(validation_service=Validation())
+    app=widgets.QApplication.instance() or widgets.QApplication([]); workspace=OpportunityScannerWorkspace(service)
+    config=tmp_path/"config.json"; config.write_text(json.dumps(ResearchRunConfig().to_dict()))
+    scan=lambda number:SimpleNamespace(run_dir=tmp_path/f"scan-{number}",manifest={"opportunity_scan":{"discovery_mode":"HISTORICAL"}},summary={},preliminary=pd.DataFrame(),final=pd.DataFrame({"symbol":["BTCUSDT"]}),readiness=pd.DataFrame())
+    replay=SimpleNamespace(completed=(scan(1),scan(2)),last=scan(2),elapsed_seconds=2,decision_points=(datetime(2026,1,1,tzinfo=timezone.utc),datetime(2026,1,2,tzinfo=timezone.utc)))
+    try:
+        workspace.mode.setCurrentIndex(1); workspace._completed(replay)
+        assert workspace._validation_scan_run_dirs==(tmp_path/"scan-1",tmp_path/"scan-2") and workspace.validate_button.isEnabled()
+        workspace.validation_config.setText(str(config)); workspace.validate_button.click()
+        loop=QEventLoop(); QTimer.singleShot(3000,loop.quit)
+        while workspace._validation_thread is not None: QTimer.singleShot(20,loop.quit); loop.exec()
+        assert calls and calls[0][0]==workspace._validation_scan_run_dirs
+        assert not workspace.validation_cancel.isEnabled()
+    finally: workspace.shutdown(); workspace.close()
+
+
 def test_workspace_uses_code_commit_and_has_shutdown_wait_contract():
     source=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_workspace.py").read_text(encoding="utf-8")
     assert "m.get('code_commit','—')" in source
