@@ -20,6 +20,12 @@ import uuid
 import numpy as np
 import pandas as pd
 
+from crypto_strategy_lab.candidate_lifecycle import (
+    CandidateLifecyclePolicy,
+    DEFAULT_LIFECYCLE_POLICY,
+    TransitionType,
+    apply_candidate_lifecycle,
+)
 from crypto_strategy_lab.data.timing import normalize_binance_interval
 from crypto_strategy_lab.gui.opportunity_scanner_controller import (
     OpportunityScanCancelled,
@@ -217,6 +223,7 @@ class PaperScannerRunner:
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] | None = None,
         transient_error: Callable[[Exception], bool] | None = None,
+        lifecycle_policy: CandidateLifecyclePolicy = DEFAULT_LIFECYCLE_POLICY,
     ):
         self.config, self.scanner = config, scanner
         self.request_factory, self.evaluator = request_factory, evaluator
@@ -230,10 +237,17 @@ class PaperScannerRunner:
         self.store = PaperScannerStateStore(config.state_path)
         self.audit = PaperScannerAuditLog(config.audit_log_path, self.clock)
         self.state = self.store.load()  # corrupt state fails closed before runtime
+        lifecycle_policy.validate_executable()
+        if self.state.lifecycle_policy.identity != lifecycle_policy.identity:
+            raise ValueError("configured lifecycle policy does not match durable state")
+        self.lifecycle_policy = lifecycle_policy
         self.audit.append(
             "STATE_LOADED",
             "runtime",
-            detail=f"version=1 entries={len(self.state.paper_entries)}",
+            detail=(
+                f"version=2 entries={len(self.state.paper_entries)} "
+                f"lifecycle_policy={self.lifecycle_policy.identity}"
+            ),
         )
 
     def run_once(
@@ -304,12 +318,66 @@ class PaperScannerRunner:
                 len(completed.final),
                 status=CycleStatus.STALE_DISCOVERY,
             )
+        lifecycle = apply_candidate_lifecycle(
+            self.state.candidate_lifecycle,
+            completed.final.to_dict("records"),
+            decision,
+            run_id,
+            self.lifecycle_policy,
+        )
+        lifecycle_state = PaperScannerState(
+            emitted_signal_ids=list(self.state.emitted_signal_ids),
+            paper_entries=list(self.state.paper_entries),
+            last_completed_cycle=self.state.last_completed_cycle,
+            last_successful_scan_run_id=self.state.last_successful_scan_run_id,
+            lifecycle_policy=self.lifecycle_policy,
+            candidate_lifecycle=list(lifecycle.state),
+        )
+        try:
+            self.store.save(lifecycle_state)
+        except OSError as exc:
+            self.audit.append(
+                "STATE_PERSIST_FAILED", cycle, scan_run_id=run_id,
+                detail=f"candidate lifecycle: {type(exc).__name__}: {exc}",
+            )
+            return PaperScanCycleResult(
+                cycle, run_id, decision.isoformat(), len(completed.final),
+                0, 0, 0, 0, 0, 0, CycleStatus.FAILED,
+            )
+        self.state = lifecycle_state
+        for transition in lifecycle.transitions:
+            event = {
+                TransitionType.ACTIVATED: "CANDIDATE_ACTIVATED",
+                TransitionType.REMOVED: "CANDIDATE_REMOVED",
+                TransitionType.RANK_CHANGED: "CANDIDATE_RANK_CHANGED",
+            }[transition.transition]
+            self.audit.append(
+                event, cycle, scan_run_id=run_id, symbol=transition.symbol,
+                detail=(
+                    f"decision_timestamp={transition.decision_timestamp} "
+                    f"previous_final_rank={transition.previous_final_rank} "
+                    f"final_rank={transition.final_rank}"
+                ),
+            )
+        counts = {
+            kind: sum(item.transition is kind for item in lifecycle.transitions)
+            for kind in TransitionType
+        }
+        self.audit.append(
+            "CANDIDATE_SET_APPLIED", cycle, scan_run_id=run_id,
+            detail=(
+                f"decision_timestamp={decision.isoformat()} active={len(lifecycle.active_rows)} "
+                f"activated={counts[TransitionType.ACTIVATED]} "
+                f"removed={counts[TransitionType.REMOVED]} "
+                f"rank_changed={counts[TransitionType.RANK_CHANGED]}"
+            ),
+        )
         # Retention is based on the authoritative signal-candle time.  It is
         # strictly longer than the strategy staleness window, so an identity is
         # never removed while the corresponding signal could still be emitted.
         self._prune_expired_signal_history(decision)
         evaluated = fresh = stale = signals = duplicates = entries = 0
-        for row in completed.final.sort_values("final_rank").to_dict("records"):
+        for row in lifecycle.active_rows:
             symbol = str(row["symbol"])
             try:
                 evaluation = self.evaluator.evaluate(
@@ -436,6 +504,8 @@ class PaperScannerRunner:
                 ],
                 last_completed_cycle=self.state.last_completed_cycle,
                 last_successful_scan_run_id=self.state.last_successful_scan_run_id,
+                lifecycle_policy=self.state.lifecycle_policy,
+                candidate_lifecycle=list(self.state.candidate_lifecycle),
             )
             try:
                 self.store.save(next_state)

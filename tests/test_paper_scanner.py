@@ -163,7 +163,42 @@ def test_fresh_verified_scan_emits_paper_entry_and_duplicate_survives_restart(tm
         "SIGNAL_EMITTED",
         "PAPER_ENTRY_RECORDED",
         "DUPLICATE_SUPPRESSED",
+        "CANDIDATE_ACTIVATED",
+        "CANDIDATE_SET_APPLIED",
     } <= set(events(tmp_path / "audit.jsonl"))
+
+
+def test_lifecycle_commit_failure_keeps_prior_durable_membership(tmp_path):
+    app, _ = runner(tmp_path)
+    assert app.run_once().status is CycleStatus.COMPLETED
+    durable_before = (tmp_path / "state.json").read_bytes()
+    state_before = list(app.state.candidate_lifecycle)
+
+    def fail(_state):
+        raise OSError("disk full")
+
+    app.store.save = fail
+    result = app.run_once()
+    assert result.status is CycleStatus.FAILED
+    assert app.state.candidate_lifecycle == state_before
+    assert (tmp_path / "state.json").read_bytes() == durable_before
+
+
+def test_default_lifecycle_preserves_task10_candidate_and_signal_parity(tmp_path):
+    scan_result = completed()
+    scan_result.final = pd.DataFrame([
+        {**scan_result.final.iloc[0].to_dict(), "symbol": "ETHUSDT", "final_rank": 2},
+        {**scan_result.final.iloc[0].to_dict(), "symbol": "BTCUSDT", "final_rank": 1},
+    ])
+    evaluator = Evaluator()
+    app, _ = runner(tmp_path, scan=Scanner(scan_result), evaluator=evaluator)
+    result = app.run_once()
+    legacy_rows = scan_result.final.sort_values("final_rank").to_dict("records")
+    assert [call[0] for call in evaluator.calls] == legacy_rows
+    assert result.strategy_signals == result.new_paper_entries == len(legacy_rows)
+    assert [entry["symbol"] for entry in app.state.paper_entries] == [
+        row["symbol"] for row in legacy_rows
+    ]
 
 
 def test_new_completed_signal_candle_may_emit_again(tmp_path):
@@ -374,7 +409,10 @@ def test_signal_state_failure_does_not_install_uncommitted_duplicate_key(tmp_pat
     assert result.status is CycleStatus.FAILED
     assert not app.state.emitted_signal_ids
     assert not app.state.paper_entries
-    assert not (tmp_path / "state.json").exists()
+    # The lifecycle snapshot was already committed atomically; failed signal
+    # persistence leaves that prior durable state intact without an identity.
+    durable = json.loads((tmp_path / "state.json").read_text())
+    assert not durable["emitted_signal_ids"] and durable["candidate_lifecycle"]
     assert "STATE_PERSIST_FAILED" in events(tmp_path / "audit.jsonl")
 
     # The failed in-memory attempt does not suppress a later durable emission.
@@ -509,7 +547,7 @@ def test_state_is_versioned_atomic_and_corruption_fails_closed(tmp_path, monkeyp
             ],
         )
     )
-    assert replaced and json.loads(path.read_text())["version"] == 1
+    assert replaced and json.loads(path.read_text())["version"] == 2
     path.write_text("not json")
     with pytest.raises(PaperScannerStateError):
         store.load()
