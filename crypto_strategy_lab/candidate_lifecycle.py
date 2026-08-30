@@ -270,6 +270,40 @@ def replay_candidate_lifecycle(
     return tuple(results)
 
 
+def validate_lifecycle_cursor(
+    state: Sequence[CandidateLifecycleRecord],
+    cursor: LifecycleCursor | None,
+) -> None:
+    """Validate the atomic cursor/membership invariant used by persisted v2 state."""
+    if state and cursor is None:
+        raise ValueError("candidate lifecycle records require a lifecycle cursor")
+    if cursor is None:
+        return
+    cursor_time = _parse_timestamp(cursor.decision_timestamp)
+    for record in state:
+        record_times = [
+            _parse_timestamp(record.first_seen_decision_timestamp),
+            _parse_timestamp(record.last_seen_decision_timestamp),
+            _parse_timestamp(record.activated_timestamp),
+        ]
+        if record.removed_timestamp is not None:
+            record_times.append(_parse_timestamp(record.removed_timestamp))
+        if max(record_times) > cursor_time:
+            raise ValueError("lifecycle cursor predates candidate lifecycle state")
+    active_rows = [
+        {
+            "symbol": record.symbol,
+            "final_rank": record.final_rank,
+            "discovery_rank": record.discovery_rank,
+        }
+        for record in state
+        if record.status is LifecycleStatus.ACTIVE
+    ]
+    active_rows.sort(key=lambda row: (row["final_rank"], row["symbol"]))
+    if cursor.snapshot_identity != _snapshot_identity(active_rows):
+        raise ValueError("lifecycle cursor snapshot identity disagrees with active state")
+
+
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("decision timestamp must be timezone-aware")

@@ -335,6 +335,10 @@ class PaperScannerRunner:
                 "CANDIDATE_SET_REJECTED", cycle, scan_run_id=run_id,
                 detail=f"decision_timestamp={decision.isoformat()} {exc}",
             )
+            self.audit.append(
+                "CYCLE_COMPLETED", cycle, scan_run_id=run_id,
+                detail=CycleStatus.FAILED.value,
+            )
             return PaperScanCycleResult(
                 cycle, run_id, decision.isoformat(), len(completed.final),
                 0, 0, 0, 0, 0, 0, CycleStatus.FAILED,
@@ -354,6 +358,10 @@ class PaperScannerRunner:
             self.audit.append(
                 "STATE_PERSIST_FAILED", cycle, scan_run_id=run_id,
                 detail=f"candidate lifecycle: {type(exc).__name__}: {exc}",
+            )
+            self.audit.append(
+                "CYCLE_COMPLETED", cycle, scan_run_id=run_id,
+                detail=CycleStatus.FAILED.value,
             )
             return PaperScanCycleResult(
                 cycle, run_id, decision.isoformat(), len(completed.final),

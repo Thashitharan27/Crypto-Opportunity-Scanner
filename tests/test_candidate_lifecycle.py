@@ -229,6 +229,28 @@ def test_v2_restart_reload_preserves_lifecycle_and_policy_identity(tmp_path):
     assert reloaded.lifecycle_policy.identity == original.lifecycle_policy.identity
 
 
+@pytest.mark.parametrize("corruption", ["missing", "earlier", "identity"])
+def test_v2_rejects_cursor_membership_disagreement(tmp_path, corruption):
+    path = tmp_path / "state.json"
+    applied = apply(rows=[row("BTCUSDT", 1, 4)], when=T1 + timedelta(hours=1))
+    store = PaperScannerStateStore(path)
+    store.save(PaperScannerState(
+        candidate_lifecycle=list(applied.state), lifecycle_cursor=applied.cursor
+    ))
+    value = json.loads(path.read_text())
+    if corruption == "missing":
+        value["lifecycle_cursor"] = None
+    elif corruption == "earlier":
+        value["lifecycle_cursor"]["decision_timestamp"] = (
+            T1 - timedelta(hours=1)
+        ).isoformat()
+    else:
+        value["lifecycle_cursor"]["snapshot_identity"] = "sha256:" + "0" * 64
+    path.write_text(json.dumps(value))
+    with pytest.raises(PaperScannerStateError, match="corrupt"):
+        store.load()
+
+
 @pytest.mark.parametrize("payload", ["not-json", '{"version":99}'])
 def test_corrupt_and_unsupported_state_fail_closed(tmp_path, payload):
     path = tmp_path / "state.json"

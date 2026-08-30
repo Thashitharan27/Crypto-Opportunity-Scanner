@@ -52,6 +52,9 @@ cursor also starts absent because v1 had no authoritative lifecycle decision.
 The first fresh completed scan establishes both deterministically. The next save emits
 v2. Invalid ledgers, corrupt JSON, unsupported versions or policy identities fail
 closed. Existing temp-file, fsync, and replace persistence remains authoritative.
+On v2 load (and before save), records require a cursor, the cursor may not predate
+any record timestamp, and its canonical snapshot identity must equal the ACTIVE
+membership and ranks. Empty membership with a cursor remains valid.
 
 ## Historical parity boundary
 

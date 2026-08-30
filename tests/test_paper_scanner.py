@@ -132,6 +132,10 @@ def events(path):
     return [json.loads(line)["event_type"] for line in path.read_text().splitlines()]
 
 
+def audit_rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 def test_fresh_verified_scan_emits_paper_entry_and_duplicate_survives_restart(tmp_path):
     app, scan = runner(tmp_path)
     first = app.run_once()
@@ -187,6 +191,10 @@ def test_lifecycle_commit_failure_keeps_prior_durable_membership(tmp_path):
     assert result.status is CycleStatus.FAILED
     assert app.state.candidate_lifecycle == state_before
     assert (tmp_path / "state.json").read_bytes() == durable_before
+    terminal = audit_rows(tmp_path / "audit.jsonl")[-1]
+    assert (terminal["event_type"], terminal["detail"]) == (
+        "CYCLE_COMPLETED", "FAILED"
+    )
 
 
 def test_out_of_order_paper_scan_fails_without_changing_durable_state(tmp_path):
@@ -204,6 +212,10 @@ def test_out_of_order_paper_scan_fails_without_changing_durable_state(tmp_path):
     assert app.state.candidate_lifecycle == lifecycle_before
     assert (tmp_path / "state.json").read_bytes() == durable_before
     assert "CANDIDATE_SET_REJECTED" in events(tmp_path / "audit.jsonl")
+    terminal = audit_rows(tmp_path / "audit.jsonl")[-1]
+    assert (terminal["event_type"], terminal["detail"]) == (
+        "CYCLE_COMPLETED", "FAILED"
+    )
 
     reloaded = PaperScannerStateStore(tmp_path / "state.json").load()
     assert reloaded.candidate_lifecycle == lifecycle_before

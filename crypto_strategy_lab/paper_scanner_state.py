@@ -13,6 +13,7 @@ from crypto_strategy_lab.candidate_lifecycle import (
     CandidateLifecyclePolicy,
     DEFAULT_LIFECYCLE_POLICY,
     LifecycleCursor,
+    validate_lifecycle_cursor,
 )
 from crypto_strategy_lab.run_manifest import atomic_json
 
@@ -35,6 +36,7 @@ class PaperScannerState:
     lifecycle_cursor: LifecycleCursor | None = None
 
     def serializable(self) -> dict[str, Any]:
+        validate_lifecycle_cursor(self.candidate_lifecycle, self.lifecycle_cursor)
         return {
             "version": STATE_VERSION,
             "emitted_signal_ids": self.emitted_signal_ids,
@@ -124,6 +126,7 @@ class PaperScannerStateStore:
                     LifecycleCursor.from_dict(cursor_value)
                     if cursor_value is not None else None
                 )
+                validate_lifecycle_cursor(lifecycle, lifecycle_cursor)
             # v1 migration intentionally starts with no inferred membership: v1
             # did not durably retain the last candidate snapshot.
             return PaperScannerState(
