@@ -316,10 +316,11 @@ class HistoricalStrategyValidator:
     def __init__(self, executor: Callable, *, warmup_bars: Callable[[ResearchRunConfig], int],
                  output_root: Path = Path("output/opportunity_validation"), monotonic=time.monotonic,
                  latest_available: Callable[[str], datetime | None] = lambda _symbol:None,
-                 preflight: Callable | None = None):
+                 preflight: Callable | None = None, common_available_end: Callable | None = None):
         self.executor, self.warmup_bars = executor, warmup_bars
         self.output_root, self.monotonic, self.latest_available = Path(output_root), monotonic, latest_available
         self.preflight=preflight
+        self.common_available_end=common_available_end
 
     def run(self, candidates: pd.DataFrame, config: ResearchRunConfig, *, config_path: Path,
             evaluation_horizon="24h", cancelled=lambda:False, progress=lambda event:None,
@@ -343,28 +344,39 @@ class HistoricalStrategyValidator:
         for index,symbol in enumerate(symbols,1):
             if cancelled(): raise ValidationCancelled(f"cancelled after {index-1} of {len(symbols)} symbols")
             subset=candidates[candidates.symbol.eq(symbol)]; start=subset.decision_timestamp.min()-warmup_bars*interval
-            minimum_end=subset.decision_timestamp.max()+horizon
+            mandatory_end=subset.decision_timestamp.max()+horizon
             latest=self.latest_available(symbol)
             if tail is not None:
-                desired_end=minimum_end+tail
-                end=desired_end
+                desired_end=mandatory_end+tail
             else:
-                end=max(minimum_end,pd.Timestamp(latest)) if latest is not None else minimum_end
-            if end <= start:
+                desired_end=max(mandatory_end,pd.Timestamp(latest)) if latest is not None else mandatory_end
+            if mandatory_end <= start:
                 raise ValueError(f"{symbol}: no usable market data after required warmup start")
             if self.preflight is not None:
                 def preflight_progress(event,i=index,total=len(symbols),s=symbol):
                     progress({"symbol_index":i,"symbol_total":total,"symbol":s,
                         "elapsed":sum(durations),"eta":None,**event})
-                readiness.extend(self.preflight(symbol,start.to_pydatetime(),end.to_pydatetime(),
-                    execution_config,cancelled=cancelled,progress=preflight_progress))
+                readiness.extend(self.preflight(symbol,start.to_pydatetime(),mandatory_end.to_pydatetime(),
+                    execution_config,coverage_scope="MANDATORY_ENTRY",cancelled=cancelled,progress=preflight_progress))
+            common_end=(self.common_available_end(symbol,start.to_pydatetime(),desired_end.to_pydatetime(),execution_config)
+                if self.common_available_end is not None else desired_end.to_pydatetime())
+            common=pd.Timestamp(common_end) if common_end is not None else mandatory_end
+            end=min(desired_end,common)
+            if end < mandatory_end:
+                raise ValueError(f"{symbol}: required inputs end before mandatory entry-observation coverage")
+            if self.preflight is not None and end > mandatory_end:
+                readiness.extend(self.preflight(symbol,mandatory_end.to_pydatetime(),end.to_pydatetime(),
+                    execution_config,coverage_scope="OUTCOME_TAIL",cancelled=cancelled,progress=preflight_progress))
             progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,"stage":"Starting native research","elapsed":sum(durations),"eta":(sum(durations)/len(durations)*(len(symbols)-index+1)) if durations else None})
             began=self.monotonic()
             result: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),execution_config)
             durations.append(self.monotonic()-began); run_ids[symbol]=result.research_run_id
             native_runs[symbol]={"run_id":result.research_run_id,"run_dir":str(result.run_dir),
                 "request_start":pd.Timestamp(result.request_start).isoformat(),"request_end":pd.Timestamp(result.request_end).isoformat(),
-                "available_through":pd.Timestamp(result.available_through).isoformat(),"source_identities":list(result.source_identities)}
+                "available_through":pd.Timestamp(result.available_through).isoformat(),"source_identities":list(result.source_identities),
+                "mandatory_entry_observation_end":mandatory_end.isoformat(),
+                "desired_outcome_resolution_end":desired_end.isoformat(),"actual_native_run_end":end.isoformat(),
+                "outcome_tail_status":"FULLY_RESOLVED_HORIZON_AVAILABLE" if end>=desired_end else "RIGHT_CENSORED_BY_AVAILABLE_DATA"}
             for population,trades,censored in ((STANDARD_SINGLE_SYMBOL,result.standard_trades,None),(EVERY_VIABLE_ENTRY,result.viable_trades,result.viable_censored)):
                 rows,assoc=attach_candidate_trades(subset,trades,population=population,run_id=result.research_run_id,horizon=horizon,available_through=result.available_through,censored_trades=censored)
                 all_rows.append(rows); all_assoc.append(assoc)
@@ -437,7 +449,8 @@ class HistoricalStrategyValidationService:
         executor=NativeResearchExecutor(runner_factory,request)
         preparer=ValidationDataPreparer(store,backend)
         validator=HistoricalStrategyValidator(executor,warmup_bars=lambda cfg:validation_warmup_bars(cfg,registry),
-            output_root=self.output_root,latest_available=latest,preflight=preparer.prepare)
+            output_root=self.output_root,latest_available=latest,preflight=preparer.prepare,
+            common_available_end=preparer.common_available_end)
         # Forward native runner stages while retaining exact symbol counters.
         current={}
         def outer(event): current.update(event); progress(event)

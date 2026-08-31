@@ -71,7 +71,8 @@ def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDat
 class ValidationDataPreparer:
     def __init__(self,store,backend): self.store,self.backend=store,backend
 
-    def prepare(self,symbol,start,end,config,*,cancelled=lambda:False,progress=lambda event:None):
+    def prepare(self,symbol,start,end,config,*,coverage_scope="MANDATORY_ENTRY",
+                cancelled=lambda:False,progress=lambda event:None):
         rows=[]; self.store.refresh_catalog()
         for requirement in validation_data_requirements(symbol,start,end,config):
             if cancelled(): raise ValidationDataUnavailable(f"Validation blocked on {symbol}: cancelled")
@@ -103,11 +104,24 @@ class ValidationDataPreparer:
             except Exception: source=None
             rows.append({"symbol":requirement.request.symbol,"candidate_symbol":symbol,
                 "dataset":requirement.dataset.value,"interval":requirement.interval,
-                "required_role":requirement.role,"requested_start":requirement.request.start,
+                "required_role":requirement.role,"coverage_scope":coverage_scope,
+                "requested_start":requirement.request.start,
                 "requested_end":requirement.request.end,"state":state.value,
                 "missing_ranges_attempted":json.dumps([{"start":x.start.isoformat(),"end":x.end.isoformat()} for x in gaps]),
                 "post_verification_quality_status":report.status.value,"source_identity":source})
         return rows
+
+    def common_available_end(self,symbol,start,end,config):
+        """Latest common catalog end across strategy-decision-required inputs."""
+        ends=[]
+        for requirement in validation_data_requirements(symbol,start,end,config):
+            coverage=self.store.catalog.coverage(self.store.raw_root,
+                market=requirement.request.market,dataset=requirement.dataset,
+                symbol=requirement.request.symbol,interval=requirement.interval)
+            if coverage.last_period is None: return None
+            value=__import__("pandas").Timestamp(coverage.last_period)
+            ends.append(value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC"))
+        return min(ends).to_pydatetime() if ends else None
 
     @staticmethod
     def _blocked(symbol,requirement,state,gaps,report,detail=None):

@@ -21,7 +21,7 @@ class Report:
     def has_non_missing_errors(self): return False
 
 class Store:
-    def __init__(self,missing=()): self.missing=set(missing); self.refreshes=0
+    def __init__(self,missing=()): self.missing=set(missing); self.refreshes=0; self.raw_root="raw"; self.catalog=None
     def refresh_catalog(self): self.refreshes+=1
     def data_quality_report(self,request,dataset,interval=None,required=True):
         key=(request.symbol,dataset,interval)
@@ -93,3 +93,10 @@ def test_1d_1m_preflight_completes_before_single_native_symbol_run(tmp_path):
     HistoricalStrategyValidator(execute,warmup_bars=lambda _:0,preflight=preparer.prepare).run(
         candidates,config(),config_path=tmp_path/"config",publish=False)
     assert native==["SOLUSDT"] and len(backend.calls)==1 and backend.calls[0].interval=="1m"
+
+def test_common_end_uses_all_required_inputs_but_not_optional_families():
+    store=Store(); ends={"1d":pd.Timestamp("2025-01-05T00:00Z"),"1m":pd.Timestamp("2025-01-04T00:00Z")}
+    store.catalog=SimpleNamespace(coverage=lambda *args,**kwargs:SimpleNamespace(last_period=ends[kwargs["interval"]]))
+    end=ValidationDataPreparer(store,Backend(store)).common_available_end(
+        "SOLUSDT",START,datetime(2025,1,6,tzinfo=timezone.utc),config())
+    assert pd.Timestamp(end)==pd.Timestamp("2025-01-04T00:00Z")

@@ -104,7 +104,7 @@ def test_timeout_tail_and_immutable_config_snapshot_are_published(tmp_path):
     association=result.run_dir/"strategy_validation_trade_associations.csv"
     assert association.exists() and result.manifest["artifacts"][association.name]["rows"]==0
     readiness_path=result.run_dir/"strategy_validation_data_readiness.csv"
-    assert readiness_path.exists() and result.manifest["artifacts"][readiness_path.name]["rows"]==1
+    assert readiness_path.exists() and result.manifest["artifacts"][readiness_path.name]["rows"]==2
 
 
 def test_timeout_disabled_uses_latest_coverage_without_forcing_exit(tmp_path):
@@ -274,3 +274,34 @@ def test_required_data_preflight_failure_prevents_native_run_and_publication(tmp
     with pytest.raises(RuntimeError,match="1m KLINES"):
         validator.run(candidates(),ResearchRunConfig(),config_path=tmp_path/"config")
     assert calls==[] and not (tmp_path/"output").exists()
+
+
+def test_recent_timeout_tail_is_right_censored_without_future_acquisition(tmp_path):
+    decision=pd.Timestamp("2026-08-30T00:00Z"); available=pd.Timestamp("2026-08-31T00:00Z")
+    candidates_frame=pd.DataFrame({"decision_timestamp":[decision],"final_rank":[1],
+        "symbol":["SOLUSDT"],"scan_run_id":["scan"],"scanner_source_identity":["source"]})
+    base=ResearchRunConfig(); execution=replace(base.execution,profiles={
+        key:replace(value,timeout_enabled=True,timeout_minutes=7*24*60)
+        for key,value in base.execution.profiles.items()}); config=replace(base,execution=execution)
+    preflight_calls=[]; native=[]
+    def preflight(symbol,start,end,used,**kwargs):
+        preflight_calls.append((pd.Timestamp(start),pd.Timestamp(end),kwargs["coverage_scope"])); return []
+    def execute(symbol,start,end,used):
+        native.append(pd.Timestamp(end)); standard=pd.DataFrame({"pair_id":["open-1"],
+            "entry_time":[decision+pd.Timedelta(hours=1)],"pair_net_r":[0.0],"side":["LONG"],
+            "long_exit_reason":["END_OF_DATA"]})
+        viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
+        return SymbolResearchResult("native",standard,viable,viable.copy(),end,tmp_path/"native",start,end)
+    result=HistoricalStrategyValidator(execute,warmup_bars=lambda _:0,output_root=tmp_path/"output",
+        preflight=preflight,common_available_end=lambda *args:available).run(
+            candidates_frame,config,config_path=tmp_path/"config")
+    assert preflight_calls==[(decision,available,"MANDATORY_ENTRY")]
+    assert native==[available]
+    row=result.outcomes.query("population == 'STANDARD_SINGLE_SYMBOL'").iloc[0]
+    assert row.valid_entry and row.result=="UNRESOLVED"
+    assert result.summary.query("population == 'STANDARD_SINGLE_SYMBOL'").iloc[0].unresolved_candidate_windows==1
+    provenance=result.manifest["native_research_runs_by_symbol"]["SOLUSDT"]
+    assert provenance["mandatory_entry_observation_end"]==available.isoformat()
+    assert provenance["desired_outcome_resolution_end"]==pd.Timestamp("2026-09-07T00:00Z").isoformat()
+    assert provenance["actual_native_run_end"]==available.isoformat()
+    assert provenance["outcome_tail_status"]=="RIGHT_CENSORED_BY_AVAILABLE_DATA"

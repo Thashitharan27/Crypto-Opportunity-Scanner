@@ -81,10 +81,14 @@ package is published.
 
 The entry horizon controls only when a trade may enter. The research request has
 a separate outcome-resolution tail equal to the largest enabled-profile timeout.
-If an enabled profile has no timeout, research runs through the latest catalogued
-validated coverage and leaves native `END_OF_DATA` observations censored. Actual
-usable bundle coverage—not the requested end—decides whether a candidate window
-is complete.
+Required inputs through the entry horizon are mandatory and acquired or fail
+closed. The later outcome tail is best effort: its native end is capped at the
+latest common coverage of strategy/execution-required inputs, and only gaps
+inside that already-published interval are acquired. Unpublished future archives
+are never requested. If an enabled profile has no timeout, the same common-
+coverage boundary applies. Native `END_OF_DATA` observations remain censored,
+not losses or No Entry. Provenance records mandatory, desired, and actual ends
+plus whether the tail was fully available or right-censored.
 
 Completed packages live under `output/opportunity_validation/<validation_run_id>`
 with candidate outcomes, overall/rank/Top-K/year tables, hashes, row counts,
