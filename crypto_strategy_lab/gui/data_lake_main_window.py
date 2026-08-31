@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import timedelta
 import json
-import math
 from pathlib import Path
 import re
 import time
@@ -33,6 +32,7 @@ from crypto_strategy_lab.gui.data_lake_worker import DataLakeGuiBacktestWorker, 
 from crypto_strategy_lab.gui.state_transition_main_window import MainWindow as StateTransitionMainWindow
 from crypto_strategy_lab.output_manager import planned_run_dir
 from crypto_strategy_lab.paths import CACHE_DIR, MARKET_DATA_ROOT
+from crypto_strategy_lab.research_warmup import strategy_warmup_period
 
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -43,27 +43,6 @@ def _utc_timestamp(value) -> pd.Timestamp:
     if timestamp.tzinfo is None:
         return timestamp.tz_localize("UTC")
     return timestamp.tz_convert("UTC")
-
-
-def strategy_warmup_period(config) -> timedelta:
-    """Conservative strategy-candle warm-up for features still inside the engine."""
-
-    profile_rsi = max((p.rsi_period for p in config.strategy_profiles.values()), default=14)
-    momentum_hours = max((p.momentum_lookback_hours for p in config.strategy_profiles.values()), default=24)
-    bars = max(
-        int(config.atr_period) + 5,
-        int(config.adx_period) * 2 + 5,
-        int(config.bb_period) + 5,
-        int(config.mean_reversion_period) + 5,
-        int(profile_rsi) + 5,
-        int(config.sr_lookback_bars) + 5 if config.enable_support_resistance_analysis else 0,
-        30,
-    )
-    bar_days = bars * int(config.strategy_timeframe_minutes) / 1440.0
-    days = max(bar_days, momentum_hours / 24.0, 22.0)  # state-transition research also uses 20d context
-    if config.market_regime_method == "ASSET_RETURN":
-        days = max(days, float(config.bull_regime_lookback_days) + 2.0)
-    return timedelta(days=math.ceil(days) + 2)
 
 
 def _parse_gui_period(start_text: str, end_text: str, coverage_start, coverage_end) -> tuple[pd.Timestamp, pd.Timestamp]:

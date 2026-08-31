@@ -21,6 +21,8 @@ from crypto_strategy_lab.research_sampling import (
     build_episode_table,
     build_sampling_summary,
     research_native_config,
+    generate_strategy_research_samples,
+    generate_strategy_research_sampling_result,
 )
 from crypto_strategy_lab.research_sampling_reporting import (
     _episode_reporting_context,
@@ -197,6 +199,23 @@ def test_research_engine_ignores_open_overlap_but_still_requires_strategy_contex
     assert engine._should_enter(0)
     assert not engine._should_enter(1)
     assert engine._should_enter(2)
+
+
+def test_legacy_and_structured_every_viable_entry_postprocessing_are_identical(monkeypatch):
+    calls=[]
+    class Engine:
+        @classmethod
+        def from_prepared(cls,*args): calls.append(1); return cls()
+        def run(self): return _viable_rows()
+        def research_exit_optimization_stats(self): return {"research_fast_path":True}
+    monkeypatch.setattr("crypto_strategy_lab.research_sampling.StrategyResearchSamplingEngine",Engine)
+    native=SimpleNamespace(strategy_timeframe_minutes=15)
+    # research_native_config needs dataclass replacement fields; bypass only that
+    monkeypatch.setattr("crypto_strategy_lab.research_sampling.research_native_config",lambda config,rows:config)
+    legacy=generate_strategy_research_samples([1],None,native,mode="EVERY_VIABLE_ENTRY")
+    structured=generate_strategy_research_sampling_result([1],None,native,mode="EVERY_VIABLE_ENTRY")
+    pd.testing.assert_frame_equal(legacy,structured.resolved)
+    assert legacy.attrs==structured.resolved.attrs and len(calls)==2
 
 
 def test_batched_simple_exit_matches_native_for_overlapping_long_and_short():

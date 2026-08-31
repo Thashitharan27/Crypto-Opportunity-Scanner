@@ -126,6 +126,23 @@ _RESEARCH_RULE_INDICATORS = frozenset(
     (*_RESEARCH_NUMERIC_FIELDS, *_RESEARCH_CATEGORICAL_FIELDS)
 )
 
+def required_research_features_for_strategy(strategy_config) -> frozenset[str]:
+    """Return only research blocks read by enabled profiles' entry/veto rules."""
+    required=set()
+    for profile in strategy_config.profiles.values():
+        if not profile.enabled: continue
+        for rule in profile.entry_rules:
+            indicator=rule.get("indicator")
+            if indicator in _RESEARCH_NUMERIC_FIELDS: required.add(_RESEARCH_NUMERIC_FIELDS[indicator][0])
+            elif indicator in _RESEARCH_CATEGORICAL_FIELDS: required.add(_RESEARCH_CATEGORICAL_FIELDS[indicator][0])
+    return frozenset(required)
+
+def required_research_indicators_for_strategy(strategy_config) -> frozenset[str]:
+    """Expose enabled native rule evidence names for requirement refinement."""
+    return frozenset(rule.get("indicator") for profile in strategy_config.profiles.values()
+        if profile.enabled for rule in profile.entry_rules
+        if rule.get("indicator") in _RESEARCH_RULE_INDICATORS)
+
 
 @dataclass(frozen=True, slots=True)
 class NativeLatestEntryDecision:
