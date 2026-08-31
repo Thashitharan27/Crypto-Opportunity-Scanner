@@ -1,12 +1,13 @@
 """Requirement-driven Data Lake preparation for historical strategy validation."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 import json
 
 from .data import DataRequest, DatasetKind, MarketKind
 from .data.binance.selective_acquisition import AcquisitionState, ArchiveAcquisitionRequest
 from .data.quality import DataQualityStatus
+from .data.timing import floor_fixed_candle_grid
 from .gui.v2_controller import GuiResearchRequest
 from .rich_data_acquisition import (RequirementRequiredness, RichDataAcquisitionConfig,
     resolve_rich_data_requirements)
@@ -25,6 +26,18 @@ class ValidationDataRequirement:
     request: DataRequest
     dataset: DatasetKind
     interval: str | None
+
+
+_FIXED_CANDLE_DATASETS = {DatasetKind.KLINES, DatasetKind.MARK_PRICE_KLINES,
+    DatasetKind.INDEX_PRICE_KLINES, DatasetKind.PREMIUM_INDEX_KLINES}
+
+
+def _align_candle_requirement(item: ValidationDataRequirement) -> ValidationDataRequirement:
+    """Align each candle request to its own grid; leave event data exact."""
+    if item.dataset not in _FIXED_CANDLE_DATASETS or item.interval is None:
+        return item
+    request=replace(item.request,start=floor_fixed_candle_grid(item.request.start,item.interval))
+    return replace(item,request=request)
 
 
 def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDataRequirement,...]:
@@ -65,7 +78,7 @@ def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDat
     for item in requirements:
         key=(item.role,item.request.symbol,item.dataset,item.interval,item.request.start,item.request.end)
         unique[key]=item
-    return tuple(unique.values())
+    return tuple(_align_candle_requirement(item) for item in unique.values())
 
 
 class ValidationDataPreparer:

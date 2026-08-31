@@ -1,7 +1,7 @@
 """Focused Opportunity Scanner QWidget for the active GUI shell."""
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import datetime, timezone
 from dataclasses import replace
 from decimal import Decimal
 from threading import Event
@@ -19,7 +19,8 @@ from crypto_strategy_lab.features import production_feature_registry
 from crypto_strategy_lab.opportunity_scoring import SCORING_MODELS
 from .opportunity_scanner_controller import (HISTORICAL_REPLAY_CADENCES,
     HistoricalRangeRunner, HistoricalReplayFailure, OpportunityScanCancelled,
-    historical_decision_points, build_request)
+    historical_decision_points, historical_range_defaults,
+    historical_single_recommendation, build_request)
 
 NATIVE_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
 RICH_FEATURES = ("funding_context", "basis_context", "futures_positioning",
@@ -89,12 +90,15 @@ class OpportunityScannerWorkspace(QWidget):
         config = QGroupBox("Scan configuration"); form = QFormLayout(config); self._form = form
         self.market = QComboBox(); self.market.addItem("Binance USD-M Futures", "futures_um")
         self.mode = QComboBox(); self.mode.addItem("Live", "LIVE"); self.mode.addItem("Historical", "HISTORICAL")
-        self.decision_time = QDateTimeEdit(QDateTime.currentDateTimeUtc()); self.decision_time.setDisplayFormat("yyyy-MM-dd HH:mm:ss 'UTC'"); self.decision_time.setTimeSpec(Qt.UTC); self.decision_time.setEnabled(False)
+        now=datetime.now(timezone.utc); range_start,range_end=historical_range_defaults(now)
+        self._single_time_manually_edited=False
+        self.decision_time = QDateTimeEdit(QDateTime(historical_single_recommendation(now,candle_defaults.strategy_interval))); self.decision_time.setDisplayFormat("yyyy-MM-dd HH:mm:ss 'UTC'"); self.decision_time.setTimeSpec(Qt.UTC); self.decision_time.setEnabled(False)
         self.execution = QComboBox(); self.execution.addItem("Single timestamp", "SINGLE"); self.execution.addItem("Date/time range", "RANGE")
-        self.range_start = QDateTimeEdit(QDateTime.currentDateTimeUtc()); self.range_end = QDateTimeEdit(QDateTime.currentDateTimeUtc())
+        self.range_start = QDateTimeEdit(QDateTime(range_start)); self.range_end = QDateTimeEdit(QDateTime(range_end))
         for edit in (self.range_start,self.range_end): edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss 'UTC'"); edit.setTimeSpec(Qt.UTC)
         self.cadence = QComboBox(); self.cadence.addItems(tuple(HISTORICAL_REPLAY_CADENCES))
         self.planned = QLabel("Planned scans: 1")
+        self.timing_help=QLabel("Recommended timing uses one minute after each replay boundary. You can edit the exact decision time if needed."); self.timing_help.setWordWrap(True)
         self.listing_age = QSpinBox(); self.listing_age.setRange(0, 10000); self.listing_age.setValue(defaults.minimum_listing_age.days)
         self.volume = QDoubleSpinBox(); self.volume.setRange(0, 1e15); self.volume.setDecimals(2); self.volume.setValue(float(defaults.minimum_quote_volume))
         self.spread = QDoubleSpinBox(); self.spread.setRange(0, 100); self.spread.setDecimals(6); self.spread.setValue(float(defaults.maximum_spread_percent))
@@ -103,7 +107,7 @@ class OpportunityScannerWorkspace(QWidget):
         self.model = QComboBox(); self.model.addItem("Discovery Order / No Opportunity Model", None)
         for definition in SCORING_MODELS: self.model.addItem(f"{definition.name} v{definition.version}", definition)
         self.timeframe = QComboBox(); self.timeframe.addItems(NATIVE_INTERVALS); self.timeframe.setCurrentText(candle_defaults.strategy_interval)
-        for label, widget in (("Market",self.market),("Scan mode",self.mode),("Historical execution",self.execution),("Decision timestamp",self.decision_time),("Start decision timestamp UTC",self.range_start),("End decision timestamp UTC",self.range_end),("Replay cadence",self.cadence),("",self.planned),("Minimum listing age (days, Live only)",self.listing_age),("Minimum quote volume",self.volume),("Maximum spread (%, Live only)",self.spread),("Preliminary shortlist size",self.preliminary_size),("Final candidate size",self.final_size),("Scoring model",self.model),("Strategy timeframe",self.timeframe)): form.addRow(label,widget)
+        for label, widget in (("Market",self.market),("Scan mode",self.mode),("Historical execution",self.execution),("Decision timestamp",self.decision_time),("",self.timing_help),("Start decision timestamp UTC",self.range_start),("End decision timestamp UTC",self.range_end),("Replay cadence",self.cadence),("",self.planned),("Minimum listing age (days, Live only)",self.listing_age),("Minimum quote volume",self.volume),("Maximum spread (%, Live only)",self.spread),("Preliminary shortlist size",self.preliminary_size),("Final candidate size",self.final_size),("Scoring model",self.model),("Strategy timeframe",self.timeframe)): form.addRow(label,widget)
         rich = QWidget(); rich_layout = QHBoxLayout(rich); rich_layout.setContentsMargins(0,0,0,0); self.feature_checks = {}
         available = set(production_feature_registry().names())
         for name in RICH_FEATURES:
@@ -128,6 +132,8 @@ class OpportunityScannerWorkspace(QWidget):
         self._timer=QTimer(self); self._timer.timeout.connect(self._update_elapsed)
         self._validation_timer=QTimer(self); self._validation_timer.timeout.connect(self._update_validation_elapsed)
         self.mode.currentIndexChanged.connect(self._mode_changed); self.execution.currentIndexChanged.connect(self._mode_changed)
+        self.decision_time.dateTimeChanged.connect(self._single_time_edited)
+        self.timeframe.currentTextChanged.connect(self._recommend_single_time)
         for widget in (self.range_start,self.range_end): widget.dateTimeChanged.connect(self._update_planned)
         self.cadence.currentIndexChanged.connect(self._update_planned)
         self.run_button.clicked.connect(self.start_scan); self.cancel_button.clicked.connect(self.cancel_scan)
@@ -140,6 +146,7 @@ class OpportunityScannerWorkspace(QWidget):
         ranged = historical and self.execution.currentData() == "RANGE"
         self._set_row_visible(self.execution, historical)
         self._set_row_visible(self.decision_time, historical and not ranged)
+        self._set_row_visible(self.timing_help, historical)
         for widget in (self.range_start,self.range_end,self.cadence,self.planned):
             self._set_row_visible(widget, ranged)
         self.decision_time.setEnabled(historical and not ranged)
@@ -153,6 +160,17 @@ class OpportunityScannerWorkspace(QWidget):
             self.progress_text.setText("Stage: —\nElapsed: 00:00:00")
         self._update_planned()
         self._sync_controls()
+
+    def _single_time_edited(self, *_):
+        self._single_time_manually_edited=True
+
+    def _recommend_single_time(self, interval):
+        if self._single_time_manually_edited:
+            return
+        value=historical_single_recommendation(datetime.now(timezone.utc),interval)
+        self.decision_time.blockSignals(True)
+        self.decision_time.setDateTime(QDateTime(value))
+        self.decision_time.blockSignals(False)
 
     def _sync_controls(self):
         scanning=self._thread is not None; validating=self._validation_thread is not None

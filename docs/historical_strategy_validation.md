@@ -57,6 +57,10 @@ ASSET_RETURN regime, and support/resistance lookbacks at the configured S/R
 timeframe. Provenance records the warm-up policy version, effective bars, and
 each symbol's native request start. Catalog `last_period` is already the
 authoritative exclusive coverage end; validation never adds a synthetic candle.
+Each fixed-cadence candle request floors that start independently to its own UTC
+Binance grid (strategy, intrabar, structural, or context). Candidate decision
+timestamps and their half-open evaluation horizons remain exact, while event
+datasets such as funding and trades retain their exact request timestamps.
 
 Validation snapshots and hashes that authoritative config before execution. A
 reporting-only clone disables Deep/Bayesian grids, duplicate research sampling,

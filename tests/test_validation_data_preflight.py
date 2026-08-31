@@ -100,3 +100,24 @@ def test_common_end_uses_all_required_inputs_but_not_optional_families():
     end=ValidationDataPreparer(store,Backend(store)).common_available_end(
         "SOLUSDT",START,datetime(2025,1,6,tzinfo=timezone.utc),config())
     assert pd.Timestamp(end)==pd.Timestamp("2025-01-04T00:00Z")
+
+
+def test_each_candle_requirement_aligns_independently_and_events_stay_exact():
+    off_grid=datetime(2025,1,1,1,1,1,tzinfo=timezone.utc)
+    requirements=validation_data_requirements("SOLUSDT",off_grid,END,config(indicator="FUNDING_BIAS"))
+    strategy=next(r for r in requirements if r.role=="STRATEGY")
+    intrabar=next(r for r in requirements if r.role=="INTRABAR")
+    funding=next(r for r in requirements if r.dataset is DatasetKind.FUNDING_RATE)
+    assert strategy.request.start==datetime(2025,1,1,tzinfo=timezone.utc)
+    assert intrabar.request.start==datetime(2025,1,1,1,1,tzinfo=timezone.utc)
+    assert funding.request.start.second==off_grid.second
+
+
+def test_four_hour_context_has_its_own_grid():
+    base=config(intrabar=False)
+    # Exercise the same per-requirement normalizer used by rich/structural plans.
+    from crypto_strategy_lab.validation_data_preflight import ValidationDataRequirement, _align_candle_requirement
+    request=__import__("crypto_strategy_lab.data",fromlist=["DataRequest"]).DataRequest(
+        "SOLUSDT",datetime(2025,1,1,6,37,12,tzinfo=timezone.utc),END,"4h")
+    aligned=_align_candle_requirement(ValidationDataRequirement("STRATEGY_CONTEXT",request,DatasetKind.KLINES,"4h"))
+    assert aligned.request.start==datetime(2025,1,1,4,tzinfo=timezone.utc)

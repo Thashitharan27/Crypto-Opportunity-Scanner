@@ -78,6 +78,25 @@ def normalize_binance_interval(interval: str) -> str:
     return lowered
 
 
+_AUTHORITATIVE_FIXED_GRIDS = {"1m", "5m", "15m", "1h", "4h", "1d"}
+
+
+def floor_fixed_candle_grid(value: datetime, interval: str) -> datetime:
+    """Floor ``value`` to an authoritative Binance fixed-candle UTC grid.
+
+    Decision and event timestamps must not use this helper.  It is exclusively
+    for the bounds of fixed-cadence candle requests.
+    """
+
+    normalized = normalize_binance_interval(interval)
+    if normalized not in _AUTHORITATIVE_FIXED_GRIDS:
+        raise ValueError(f"Unsupported authoritative candle grid: {interval!r}")
+    utc = ensure_utc(value)
+    step = int(interval_to_timedelta(normalized).total_seconds())
+    epoch_seconds = int(utc.timestamp())
+    return datetime.fromtimestamp(epoch_seconds - epoch_seconds % step, tz=timezone.utc)
+
+
 def canonical_available_at(
     dataset: DatasetKind,
     event_time: datetime,

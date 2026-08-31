@@ -29,7 +29,7 @@ from crypto_strategy_lab.data.binance.universe import (
 from crypto_strategy_lab.data.query import DataRequest
 from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
 from crypto_strategy_lab.data.store import MarketDataStore
-from crypto_strategy_lab.data.timing import interval_to_timedelta
+from crypto_strategy_lab.data.timing import floor_fixed_candle_grid, interval_to_timedelta
 from crypto_strategy_lab.data.timing import normalize_binance_interval
 from crypto_strategy_lab.features import production_feature_registry
 from crypto_strategy_lab.final_candidates import (
@@ -108,6 +108,23 @@ MAX_HISTORICAL_REPLAY_SCANS = 1000
 HISTORICAL_REPLAY_CADENCES = {
     "1h": timedelta(hours=1), "4h": timedelta(hours=4), "1d": timedelta(days=1),
 }
+
+
+def historical_range_defaults(now: datetime) -> tuple[datetime, datetime]:
+    """Return 00:01:00--23:59:59 for the last fully completed UTC day."""
+    today=floor_fixed_candle_grid(now,"1d")
+    day=today-timedelta(days=1)
+    return day+timedelta(minutes=1),today-timedelta(seconds=1)
+
+
+def historical_single_recommendation(now: datetime, interval: str) -> datetime:
+    """Return one minute after the latest completed interval boundary."""
+    utc=now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    boundary=floor_fixed_candle_grid(utc,interval)
+    recommendation=boundary+timedelta(minutes=1)
+    if recommendation > utc:
+        recommendation=boundary-interval_to_timedelta(interval)+timedelta(minutes=1)
+    return recommendation.replace(microsecond=0)
 
 
 def historical_decision_points(start: datetime, end: datetime, cadence: timedelta,
@@ -366,12 +383,7 @@ class Task1To7OpportunityScanner:
                        candle_count: int) -> tuple[datetime, datetime]:
         """Return a fixed-grid Task-3 window without changing the decision."""
         interval = interval_to_timedelta(strategy_interval)
-        utc = decision.astimezone(timezone.utc)
-        step = int(interval.total_seconds())
-        epoch_seconds = int(utc.timestamp())
-        end = datetime.fromtimestamp(
-            epoch_seconds - (epoch_seconds % step), tz=timezone.utc
-        )
+        end = floor_fixed_candle_grid(decision, strategy_interval)
         return end - interval * candle_count, end
 
     @staticmethod

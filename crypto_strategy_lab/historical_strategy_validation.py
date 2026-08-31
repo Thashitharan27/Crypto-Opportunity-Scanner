@@ -32,7 +32,7 @@ from .prepared_cache import PreparedRunCache
 from .research_adapters import NativeSimulator, NativeStrategyPolicy
 from .research_runner import ResearchRunner
 from .bayesian_sampling_reporting import BayesianSamplingCsvManifestReporter
-from .data.timing import normalize_binance_interval
+from .data.timing import floor_fixed_candle_grid, normalize_binance_interval
 from .research_warmup import WARMUP_POLICY_VERSION, validation_warmup_bars
 from .validation_data_preflight import ValidationDataPreparer
 
@@ -140,7 +140,9 @@ def load_validation_config(path: str | Path) -> ResearchRunConfig:
 
 def build_validation_data_request(symbol,start,end,config,registry=None):
     """Production DataRequest projection; strategy/execution are untouched."""
-    return DataRequest(symbol,start,end,f"{config.data.strategy_timeframe_minutes}m",
+    strategy=f"{config.data.strategy_timeframe_minutes}m"
+    start=floor_fixed_candle_grid(start,strategy)
+    return DataRequest(symbol,start,end,strategy,
         f"{config.data.intrabar_timeframe_minutes}m" if config.data.use_intrabar_data else None,
         market=MarketKind.FUTURES_UM)
 
