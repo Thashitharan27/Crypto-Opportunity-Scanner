@@ -429,7 +429,7 @@ def create_opportunity_scanner_service(raw_root: Path, cache_root: Path,
         store, backend, Path(output_root), **pipeline_options
     )
     from crypto_strategy_lab.historical_strategy_validation import create_historical_strategy_validation_service
-    validation=create_historical_strategy_validation_service(raw_root,cache_root,Path(output_root)/"opportunity_validation")
+    validation=create_historical_strategy_validation_service(raw_root,cache_root,Path(output_root)/"opportunity_validation",backend)
     return OpportunityScannerApplicationService(pipeline,validation_service=validation)
 
 

@@ -34,6 +34,7 @@ from .research_runner import ResearchRunner
 from .bayesian_sampling_reporting import BayesianSamplingCsvManifestReporter
 from .data.timing import normalize_binance_interval
 from .research_warmup import WARMUP_POLICY_VERSION, validation_warmup_bars
+from .validation_data_preflight import ValidationDataPreparer
 
 STANDARD_SINGLE_SYMBOL = "STANDARD_SINGLE_SYMBOL"
 EVERY_VIABLE_ENTRY = "EVERY_VIABLE_ENTRY"
@@ -67,6 +68,7 @@ class StrategyValidationResult:
     top_k: pd.DataFrame
     by_year: pd.DataFrame
     associations: pd.DataFrame
+    data_readiness: pd.DataFrame
     manifest: Mapping[str, object]
 
 
@@ -313,9 +315,11 @@ class HistoricalStrategyValidator:
     """Sequential one-native-run-per-symbol coordinator."""
     def __init__(self, executor: Callable, *, warmup_bars: Callable[[ResearchRunConfig], int],
                  output_root: Path = Path("output/opportunity_validation"), monotonic=time.monotonic,
-                 latest_available: Callable[[str], datetime | None] = lambda _symbol:None):
+                 latest_available: Callable[[str], datetime | None] = lambda _symbol:None,
+                 preflight: Callable | None = None):
         self.executor, self.warmup_bars = executor, warmup_bars
         self.output_root, self.monotonic, self.latest_available = Path(output_root), monotonic, latest_available
+        self.preflight=preflight
 
     def run(self, candidates: pd.DataFrame, config: ResearchRunConfig, *, config_path: Path,
             evaluation_horizon="24h", cancelled=lambda:False, progress=lambda event:None,
@@ -330,7 +334,7 @@ class HistoricalStrategyValidator:
         candidates=candidates.copy(); candidates["decision_timestamp"]=pd.to_datetime(candidates.decision_timestamp,utc=True)
         candidates["symbol"]=candidates.symbol.astype(str).str.upper()
         if candidates.duplicated(["decision_timestamp","symbol"]).any(): raise ValueError("duplicate candidate identity")
-        symbols=sorted(candidates.symbol.unique()); all_rows=[]; all_assoc=[]; run_ids={}; native_runs={}; durations=[]
+        symbols=sorted(candidates.symbol.unique()); all_rows=[]; all_assoc=[]; readiness=[]; run_ids={}; native_runs={}; durations=[]
         interval=pd.Timedelta(minutes=config.data.strategy_timeframe_minutes)
         warmup_bars=int(self.warmup_bars(config))
         profiles=[key for key,value in config.strategy.profiles.items() if value.enabled]
@@ -343,11 +347,17 @@ class HistoricalStrategyValidator:
             latest=self.latest_available(symbol)
             if tail is not None:
                 desired_end=minimum_end+tail
-                end=min(desired_end,pd.Timestamp(latest)) if latest is not None else desired_end
+                end=desired_end
             else:
-                end=pd.Timestamp(latest) if latest is not None else minimum_end
+                end=max(minimum_end,pd.Timestamp(latest)) if latest is not None else minimum_end
             if end <= start:
                 raise ValueError(f"{symbol}: no usable market data after required warmup start")
+            if self.preflight is not None:
+                def preflight_progress(event,i=index,total=len(symbols),s=symbol):
+                    progress({"symbol_index":i,"symbol_total":total,"symbol":s,
+                        "elapsed":sum(durations),"eta":None,**event})
+                readiness.extend(self.preflight(symbol,start.to_pydatetime(),end.to_pydatetime(),
+                    execution_config,cancelled=cancelled,progress=preflight_progress))
             progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,"stage":"Starting native research","elapsed":sum(durations),"eta":(sum(durations)/len(durations)*(len(symbols)-index+1)) if durations else None})
             began=self.monotonic()
             result: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),execution_config)
@@ -361,6 +371,7 @@ class HistoricalStrategyValidator:
         outcomes=pd.concat(all_rows,ignore_index=True) if all_rows else pd.DataFrame()
         associations=pd.concat(all_assoc,ignore_index=True) if any(not x.empty for x in all_assoc) else pd.DataFrame(columns=["population","final_rank","decision_timestamp","trade_identity","pair_net_r"])
         summary,by_rank,top_k,by_year=aggregate_reports(outcomes,associations)
+        readiness_frame=pd.DataFrame(readiness)
         manifest={"validation_run_id":f"strategy-validation-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}",
                   "created_timestamp":datetime.now(timezone.utc).isoformat(),"status":"COMPLETE",
                   "code_commit":_commit(),"scanner_run_ids":sorted(candidates.scan_run_id.unique()),
@@ -379,13 +390,13 @@ class HistoricalStrategyValidator:
                     "timeout_disabled_behavior":"LATEST_AVAILABLE_DATA_AND_NATIVE_END_OF_DATA_CENSORING" if not finite else None},
                   "scanner_candidate_sources":candidates[["scan_run_id","decision_timestamp","symbol","scanner_source_identity"]].to_dict("records") if "scanner_source_identity" in candidates else [],
                   "population_definitions":{STANDARD_SINGLE_SYMBOL:"independent normal native run per symbol (not a combined portfolio)",EVERY_VIABLE_ENTRY:"native overlapping resilience samples; no portfolio metrics"}}
-        result=StrategyValidationResult(None,outcomes,summary,by_rank,top_k,by_year,associations,manifest)
+        result=StrategyValidationResult(None,outcomes,summary,by_rank,top_k,by_year,associations,readiness_frame,manifest)
         return self._publish(result,canonical_config) if publish else result
 
     def _publish(self,result,canonical_config):
         final=self.output_root/result.manifest["validation_run_id"]; temp=self.output_root/("."+final.name+".tmp")
         self.output_root.mkdir(parents=True,exist_ok=True); shutil.rmtree(temp,ignore_errors=True); temp.mkdir()
-        frames={"candidate_trade_outcomes.csv":result.outcomes,"strategy_validation_summary.csv":result.summary,"strategy_validation_by_rank.csv":result.by_rank,"strategy_validation_top_k.csv":result.top_k,"strategy_validation_by_year.csv":result.by_year,"strategy_validation_trade_associations.csv":result.associations}
+        frames={"candidate_trade_outcomes.csv":result.outcomes,"strategy_validation_summary.csv":result.summary,"strategy_validation_by_rank.csv":result.by_rank,"strategy_validation_top_k.csv":result.top_k,"strategy_validation_by_year.csv":result.by_year,"strategy_validation_trade_associations.csv":result.associations,"strategy_validation_data_readiness.csv":result.data_readiness}
         artifacts={}
         for name,frame in frames.items():
             path=temp/name; frame.to_csv(path,index=False); artifacts[name]={"sha256":file_sha256(path),"rows":len(frame)}
@@ -393,7 +404,7 @@ class HistoricalStrategyValidator:
         artifacts[snapshot.name]={"sha256":file_sha256(snapshot),"rows":1}
         manifest={**result.manifest,"artifacts":artifacts}; (temp/"validation_manifest.json").write_text(json.dumps(manifest,indent=2,default=str),encoding="utf-8")
         (temp/"COMPLETED").write_text(manifest["validation_run_id"]+"\n",encoding="utf-8"); temp.rename(final)
-        return StrategyValidationResult(final,result.outcomes,result.summary,result.by_rank,result.top_k,result.by_year,result.associations,manifest)
+        return StrategyValidationResult(final,result.outcomes,result.summary,result.by_rank,result.top_k,result.by_year,result.associations,result.data_readiness,manifest)
 
 
 def _commit():
@@ -403,13 +414,15 @@ def _commit():
 
 class HistoricalStrategyValidationService:
     """GUI-safe production application boundary; widgets know no engines."""
-    def __init__(self, raw_root: Path, cache_root: Path, output_root: Path):
+    def __init__(self, raw_root: Path, cache_root: Path, output_root: Path,backend=None):
         self.raw_root,self.cache_root,self.output_root=map(Path,(raw_root,cache_root,output_root))
+        self.backend=backend
 
     def validate(self, run_dirs, config_path, horizon, cancelled, progress):
         config=load_validation_config(config_path)
         candidates=extract_final_candidates(run_dirs)
         store=MarketDataStore(self.raw_root,self.cache_root); registry=production_feature_registry()
+        backend=self.backend or __import__("crypto_strategy_lab.data.binance.selective_acquisition",fromlist=["BinanceDataHubBackend"]).BinanceDataHubBackend(self.raw_root)
         native_root=self.output_root/"native_research"
         def runner_factory():
             return ResearchRunner(store,registry,PreparedRunCache(self.cache_root),
@@ -422,8 +435,9 @@ class HistoricalStrategyValidationService:
                 symbol,config.data.strategy_timeframe_minutes,
             )
         executor=NativeResearchExecutor(runner_factory,request)
+        preparer=ValidationDataPreparer(store,backend)
         validator=HistoricalStrategyValidator(executor,warmup_bars=lambda cfg:validation_warmup_bars(cfg,registry),
-            output_root=self.output_root,latest_available=latest)
+            output_root=self.output_root,latest_available=latest,preflight=preparer.prepare)
         # Forward native runner stages while retaining exact symbol counters.
         current={}
         def outer(event): current.update(event); progress(event)
@@ -432,5 +446,5 @@ class HistoricalStrategyValidationService:
             cancelled=cancelled,progress=outer)
 
 
-def create_historical_strategy_validation_service(raw_root,cache_root,output_root):
-    return HistoricalStrategyValidationService(raw_root,cache_root,output_root)
+def create_historical_strategy_validation_service(raw_root,cache_root,output_root,backend=None):
+    return HistoricalStrategyValidationService(raw_root,cache_root,output_root,backend)

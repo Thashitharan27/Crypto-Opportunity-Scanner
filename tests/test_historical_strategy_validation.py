@@ -87,7 +87,9 @@ def test_timeout_tail_and_immutable_config_snapshot_are_published(tmp_path):
         empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"])
         viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
         return SymbolResearchResult("authoritative-run",empty,viable,viable.copy(),end,tmp_path/"native",start,end,("source-sha",))
-    result=HistoricalStrategyValidator(execute,warmup_bars=lambda _:5,output_root=tmp_path/"validation").run(
+    readiness={"symbol":"SOLUSDT","dataset":"klines","interval":"1m","required_role":"INTRABAR","state":"ACQUIRED"}
+    result=HistoricalStrategyValidator(execute,warmup_bars=lambda _:5,output_root=tmp_path/"validation",
+        preflight=lambda *args,**kwargs:[readiness]).run(
         candidates().assign(scanner_source_identity="scanner-source"),config,config_path=external)
     assert calls[0][1] == pd.Timestamp("2025-01-03T00:00Z")
     snapshot=(result.run_dir/"strategy_config_snapshot.json").read_bytes()
@@ -101,6 +103,8 @@ def test_timeout_tail_and_immutable_config_snapshot_are_published(tmp_path):
     assert result.manifest["scanner_candidate_sources"][0]["scanner_source_identity"]=="scanner-source"
     association=result.run_dir/"strategy_validation_trade_associations.csv"
     assert association.exists() and result.manifest["artifacts"][association.name]["rows"]==0
+    readiness_path=result.run_dir/"strategy_validation_data_readiness.csv"
+    assert readiness_path.exists() and result.manifest["artifacts"][readiness_path.name]["rows"]==1
 
 
 def test_timeout_disabled_uses_latest_coverage_without_forcing_exit(tmp_path):
@@ -260,3 +264,13 @@ def test_cancellation_prevents_next_symbol_and_never_publishes_complete(tmp_path
     with pytest.raises(ValidationCancelled):
         validator.run(candidates(("SOLUSDT","BTCUSDT")),ResearchRunConfig(),config_path=tmp_path/"config",cancelled=lambda:cancelled[0])
     assert len(calls)==1 and not (tmp_path/"output").exists()
+
+
+def test_required_data_preflight_failure_prevents_native_run_and_publication(tmp_path):
+    calls=[]
+    def blocked(*args,**kwargs): raise RuntimeError("Required data unavailable: 1m KLINES")
+    validator=HistoricalStrategyValidator(lambda *args:calls.append(args),warmup_bars=lambda _:0,
+        output_root=tmp_path/"output",preflight=blocked)
+    with pytest.raises(RuntimeError,match="1m KLINES"):
+        validator.run(candidates(),ResearchRunConfig(),config_path=tmp_path/"config")
+    assert calls==[] and not (tmp_path/"output").exists()

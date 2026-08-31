@@ -7,8 +7,7 @@ requirement visible and validates it before Setup can report READY TO RUN.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from datetime import timedelta
+from dataclasses import replace
 
 import pandas as pd
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -18,48 +17,10 @@ from crypto_strategy_lab.data import DataQualityReport, DataQualityStatus, Datas
 from crypto_strategy_lab.gui.setup_main_window import MainWindow as SetupMainWindow
 
 
-STRUCTURAL_BENCHMARK_INTERVAL = "1h"
-STRUCTURAL_REGIME_METHODS = {"BTC_STRUCTURAL", "ASSET_STRUCTURAL"}
-
-
-@dataclass(frozen=True)
-class StructuralBenchmarkRequirement:
-    symbol: str
-    interval: str
-    warmup_days: int
-    data_request: object
-
-
-def structural_benchmark_requirement(request, features) -> StructuralBenchmarkRequirement | None:
-    """Mirror the native runtime structural benchmark requirement for preflight."""
-    if request is None or features is None:
-        return None
-    method = str(getattr(features, "market_regime_method", "")).upper()
-    if method not in STRUCTURAL_REGIME_METHODS:
-        return None
-
-    warmup_days = (
-        int(getattr(features, "structural_regime_sma_days", 200))
-        + int(getattr(features, "structural_regime_slope_lookback_days", 30))
-        + 7
-    )
-    symbol = "BTCUSDT" if method == "BTC_STRUCTURAL" else request.symbol.upper()
-    base = request.to_data_request()
-    benchmark_request = replace(
-        base,
-        symbol=symbol,
-        start=request.period_start - timedelta(days=warmup_days),
-        end=request.period_end,
-        strategy_interval=STRUCTURAL_BENCHMARK_INTERVAL,
-        intrabar_interval=None,
-        datasets=(DatasetKind.KLINES,),
-    )
-    return StructuralBenchmarkRequirement(
-        symbol=symbol,
-        interval=STRUCTURAL_BENCHMARK_INTERVAL,
-        warmup_days=warmup_days,
-        data_request=benchmark_request,
-    )
+from crypto_strategy_lab.structural_requirements import (
+    STRUCTURAL_BENCHMARK_INTERVAL, STRUCTURAL_REGIME_METHODS,
+    StructuralBenchmarkRequirement, structural_benchmark_requirement,
+)
 
 
 def required_run_data_quality(service, request, features) -> DataQualityReport:

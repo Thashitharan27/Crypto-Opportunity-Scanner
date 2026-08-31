@@ -64,6 +64,16 @@ telemetry, lifecycle analysis, and charts. The capture reporter runs the native
 Every Viable Entry engine exactly once per unique symbol; StrategyConfig and
 ExecutionConfig remain the original objects.
 
+Before each native symbol run, required strategy candles, the full native
+intrabar execution interval, structural benchmark history, and only context
+families referenced by enabled entry/veto rules are quality checked. Complete
+coverage is reused; reported gaps are delegated to the existing Binance Data Hub
+backend and post-verified. Intrabar begins at the validation request start (the
+native `intrabar_start=None` boundary), because warm-up trades may affect Standard
+Single-Symbol suppression at the first candidate. Optional research context does
+not block validation. Preparation facts are published in
+`strategy_validation_data_readiness.csv`.
+
 Cancellation is cooperative between symbols: it prevents the next symbol from
 starting and preserves completed native runs, but does not terminate a running
 simulator unsafely. Unexpected native failure stops validation and no COMPLETE
