@@ -19,7 +19,7 @@ from crypto_strategy_lab.data.binance.selective_acquisition import (
     BackendAcquisitionResult, BinanceDataHubBackend, CandleAcquisitionRequest,
     SelectiveCandleAcquirer,
     SelectiveCandleAcquisitionConfig, shortlist_from_historical,
-    shortlist_from_live,
+    shortlist_from_live, resolve_binance_data_hub_project_path,
 )
 from crypto_strategy_lab.data.binance.universe import DiscoveryRow
 from crypto_strategy_lab.data.quality import validate_dataset
@@ -231,6 +231,51 @@ def test_unresolved_data_hub_has_clear_configuration_error(monkeypatch, tmp_path
         assert "configure" in str(exc)
     else:
         raise AssertionError("missing Data Hub must not silently fall back")
+
+
+def test_data_hub_path_resolution_override_sibling_and_unconfigured(tmp_path):
+    workspace = tmp_path / "workspace with spaces"
+    scanner = workspace / "Crypto-Opportunity-Scanner"
+    sibling = workspace / "Binance Data Hub"
+    override = workspace / "Other Binance Data Hub"
+    scanner.mkdir(parents=True); sibling.mkdir(); override.mkdir()
+
+    assert resolve_binance_data_hub_project_path(
+        scanner, environment={"BINANCE_DATA_HUB_PROJECT_PATH": str(override)}
+    ) == override.resolve()
+    assert resolve_binance_data_hub_project_path(scanner, environment={}) == sibling.resolve()
+    sibling.rmdir()
+    assert resolve_binance_data_hub_project_path(scanner, environment={}) is None
+
+
+def test_invalid_explicit_data_hub_path_is_a_clear_error(tmp_path):
+    missing = tmp_path / "missing Data Hub"
+    with pytest.raises(AcquisitionBackendConfigurationError) as error:
+        resolve_binance_data_hub_project_path(
+            tmp_path / "scanner",
+            environment={"BINANCE_DATA_HUB_PROJECT_PATH": str(missing)},
+        )
+    assert "BINANCE_DATA_HUB_PROJECT_PATH" in str(error.value)
+    assert str(missing.resolve()) in str(error.value)
+    assert "does not exist" in str(error.value)
+
+
+def test_configured_data_hub_package_imports_from_path_with_spaces(tmp_path, monkeypatch):
+    project = tmp_path / "Binance Data Hub"
+    package = project / "binance_data_hub"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "archive_downloader.py").write_text(
+        "def download_archive_library(*args, **kwargs):\n    return {'counts': {}}\n"
+    )
+    monkeypatch.delitem(__import__("sys").modules, "binance_data_hub", raising=False)
+    monkeypatch.delitem(
+        __import__("sys").modules, "binance_data_hub.archive_downloader", raising=False
+    )
+    original_path = tuple(__import__("sys").path)
+    downloader = BinanceDataHubBackend(tmp_path, project_path=project)._downloader()
+    assert downloader().__class__ is dict
+    assert tuple(__import__("sys").path) == original_path
 
 
 @pytest.mark.parametrize(

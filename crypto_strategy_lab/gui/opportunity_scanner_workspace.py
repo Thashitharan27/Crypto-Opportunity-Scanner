@@ -79,6 +79,13 @@ class OpportunityScannerWorkspace(QWidget):
         self._validation_started=0.0; self._validation_progress_state={}
         defaults, candle_defaults, final_defaults = DiscoveryConfig(), SelectiveCandleAcquisitionConfig(), FinalCandidateBoundaryConfig()
         root = QVBoxLayout(self)
+        data_hub_path = getattr(service, "binance_data_hub_project_path", None)
+        self.data_hub_status = QLabel(
+            f"Binance Data Hub:\n{data_hub_path}" if data_hub_path else
+            "Binance Data Hub:\nNot configured — downloads unavailable"
+        )
+        self.data_hub_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self.data_hub_status)
         config = QGroupBox("Scan configuration"); form = QFormLayout(config); self._form = form
         self.market = QComboBox(); self.market.addItem("Binance USD-M Futures", "futures_um")
         self.mode = QComboBox(); self.mode.addItem("Live", "LIVE"); self.mode.addItem("Historical", "HISTORICAL")

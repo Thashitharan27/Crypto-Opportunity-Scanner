@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 import importlib
+import os
 from pathlib import Path
 import sys
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
@@ -91,6 +92,27 @@ class CandleAcquisitionBackend(Protocol):
 
 class AcquisitionBackendConfigurationError(RuntimeError):
     pass
+
+
+DATA_HUB_PROJECT_PATH_ENV = "BINANCE_DATA_HUB_PROJECT_PATH"
+
+
+def resolve_binance_data_hub_project_path(
+    project_root: Path, *, environment: Mapping[str, str] | None = None
+) -> Path | None:
+    """Resolve the separate Data Hub project without changing import state."""
+    env = os.environ if environment is None else environment
+    configured = env.get(DATA_HUB_PROJECT_PATH_ENV)
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if not path.exists():
+            raise AcquisitionBackendConfigurationError(
+                f"{DATA_HUB_PROJECT_PATH_ENV} is configured as:\n{path}\n\n"
+                "but that Binance Data Hub project path does not exist."
+            )
+        return path
+    sibling = Path(project_root).resolve().parent / "Binance Data Hub"
+    return sibling.resolve() if sibling.exists() else None
 
 
 DATA_HUB_DATASET_KEYS = {
@@ -187,18 +209,33 @@ class BinanceDataHubBackend:
         self.project_path = Path(project_path) if project_path else None
 
     def _downloader(self):
-        if self.project_path is not None:
-            path = str(self.project_path.resolve())
-            if path not in sys.path:
-                sys.path.insert(0, path)
+        path = str(self.project_path.resolve()) if self.project_path is not None else None
+        inserted = path is not None and path not in sys.path
+        if inserted:
+            sys.path.insert(0, path)
         try:
             module = importlib.import_module(self.module)
-            return module.download_archive_library
+            if self.project_path is not None:
+                origin = getattr(module, "__file__", None)
+                if origin is None or not Path(origin).resolve().is_relative_to(
+                    self.project_path.resolve()
+                ):
+                    raise ImportError(
+                        f"{self.module} was not loaded from {self.project_path.resolve()}"
+                    )
+            downloader = module.download_archive_library
         except (ImportError, AttributeError) as exc:
+            location = str(self.project_path.resolve()) if self.project_path else "Not configured"
             raise AcquisitionBackendConfigurationError(
-                f"Binance Data Hub backend {self.module!r} is unavailable; configure "
-                "its import module/project path explicitly"
+                f"Binance Data Hub is configured at:\n{location}\n\n"
+                f"but could not import:\n{self.module}.download_archive_library\n\n"
+                f"Expected module: {self.module}\n"
+                "Expected function: download_archive_library"
             ) from exc
+        finally:
+            if inserted:
+                sys.path.remove(path)
+        return downloader
 
     def acquire(self, request: CandleAcquisitionRequest, *, cancelled=None) -> BackendAcquisitionResult:
         return self.acquire_archive(
