@@ -21,7 +21,7 @@ from crypto_strategy_lab.data.binance.historical_discovery import (
 )
 from crypto_strategy_lab.data.binance.selective_acquisition import (
     AcquisitionState, BinanceDataHubBackend, SelectiveCandleAcquirer,
-    SelectiveCandleAcquisitionConfig,
+    SelectiveCandleAcquisitionConfig, resolve_binance_data_hub_project_path,
 )
 from crypto_strategy_lab.data.binance.universe import (
     BinanceUsdMDiscoveryClient, DiscoveryConfig, scan_universe,
@@ -421,16 +421,22 @@ class Task1To7OpportunityScanner:
 
 
 def create_opportunity_scanner_service(raw_root: Path, cache_root: Path,
-                                       output_root: Path, **pipeline_options):
+                                       output_root: Path, *, project_root: Path | None = None,
+                                       **pipeline_options):
     """Construct the runnable production Task 1--7 GUI service."""
     store = MarketDataStore(Path(raw_root), Path(cache_root))
-    backend = BinanceDataHubBackend(Path(raw_root))
+    scanner_root = (Path(__file__).resolve().parents[2]
+                    if project_root is None else Path(project_root))
+    data_hub_path = resolve_binance_data_hub_project_path(scanner_root)
+    backend = BinanceDataHubBackend(Path(raw_root), project_path=data_hub_path)
     pipeline = Task1To7OpportunityScanner(
         store, backend, Path(output_root), **pipeline_options
     )
     from crypto_strategy_lab.historical_strategy_validation import create_historical_strategy_validation_service
     validation=create_historical_strategy_validation_service(raw_root,cache_root,Path(output_root)/"opportunity_validation",backend)
-    return OpportunityScannerApplicationService(pipeline,validation_service=validation)
+    service = OpportunityScannerApplicationService(pipeline, validation_service=validation)
+    service.binance_data_hub_project_path = data_hub_path
+    return service
 
 
 def build_request(*, mode: str, decision_time: datetime | None,

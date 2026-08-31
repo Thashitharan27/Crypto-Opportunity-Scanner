@@ -155,8 +155,13 @@ def test_application_service_invokes_pipeline_once_then_reads_publication(tmp_pa
 
 
 def test_normal_service_factory_installs_real_task_1_to_7_pipeline(tmp_path):
-    service=create_opportunity_scanner_service(tmp_path/"raw",tmp_path/"cache",tmp_path/"runs")
+    scanner=tmp_path/"Crypto-Opportunity-Scanner"; hub=tmp_path/"Binance Data Hub"
+    scanner.mkdir(); hub.mkdir()
+    service=create_opportunity_scanner_service(tmp_path/"raw",tmp_path/"cache",tmp_path/"runs",project_root=scanner)
     assert isinstance(service._run_once,Task1To7OpportunityScanner)
+    assert service._run_once.backend.project_path == hub.resolve()
+    assert service.validation_service.backend is service._run_once.backend
+    assert service.binance_data_hub_project_path == hub.resolve()
 
 
 @pytest.mark.parametrize("mode",["LIVE","HISTORICAL"])

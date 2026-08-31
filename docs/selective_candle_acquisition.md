@@ -37,6 +37,25 @@ configuration error. Half-open timestamp gaps are translated to the Data Hub's
 inclusive archive dates. The bridge reads the downloader's nested `counts`
 summary and preserves missing, failed, and cancelled as distinct typed outcomes.
 
+The Data Hub remains a separate project; none of its downloader code is copied
+into the scanner. The normal Windows workspace is auto-detected:
+
+```text
+C:\CryptoBots\Crypto-Opportunity-Scanner
+C:\CryptoBots\Binance Data Hub
+```
+
+For another layout, set an explicit override before launching the scanner:
+
+```bat
+set BINANCE_DATA_HUB_PROJECT_PATH=C:\some\other\Binance Data Hub
+```
+
+The override has priority and must name an existing path. With neither an
+override nor the sibling project, the GUI still starts and complete Data Lake
+coverage remains reusable; an acquisition attempt reports the missing Data Hub
+configuration in context.
+
 ## Verification, provenance, and execution policy
 
 Downloader success is provisional. Task 3 refreshes the catalog, reruns the
@@ -59,6 +78,5 @@ reported `CANCELLED`/not attempted.
 
 Task 3 only acquires strategy-timeframe USD-M kline archives. It does not repair
 corrupt raw partitions, provide intrabar/rich datasets, score candidates, or
-guarantee that Data Hub has published a recent archive. Real Data Hub integration
-requires its package/project path to be configured in the deployment; tests do
-not require it or network access.
+guarantee that Data Hub has published a recent archive. Tests do not require Data
+Hub or network access.
