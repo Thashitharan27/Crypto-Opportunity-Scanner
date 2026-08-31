@@ -38,6 +38,11 @@ Insufficient coverage through the horizon is `UNRESOLVED`, never No Entry or a
 loss. Native `END_OF_DATA` trades are censored and likewise unresolved. No
 candles or movement outcomes are fabricated.
 
+Entry observability and trade resolution are reported separately. An entry
+horizon may be `COMPLETE` while its entered trade has outcome status
+`UNRESOLVED`; headline unresolved-window counts include that censored window,
+while observable candidate conversion still counts its authoritative entry.
+
 ## Configuration, cancellation, and output
 
 Version 1 applies **one selected strict v3 ResearchRunConfig to every candidate
@@ -45,6 +50,12 @@ symbol**. Pair-specific mappings and parameter optimization are out of scope.
 StrategyConfig and ExecutionConfig are unchanged; only symbol/time requests and
 validation reporting are varied. Existing Data Lake and feature/prepared caches
 remain authoritative.
+
+Validation snapshots and hashes that authoritative config before execution. A
+reporting-only clone disables Deep/Bayesian grids, duplicate research sampling,
+telemetry, lifecycle analysis, and charts. The capture reporter runs the native
+Every Viable Entry engine exactly once per unique symbol; StrategyConfig and
+ExecutionConfig remain the original objects.
 
 Cancellation is cooperative between symbols: it prevents the next symbol from
 starting and preserves completed native runs, but does not terminate a running

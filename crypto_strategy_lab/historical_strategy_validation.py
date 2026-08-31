@@ -32,6 +32,7 @@ from .prepared_cache import PreparedRunCache
 from .research_adapters import NativeSimulator, NativeStrategyPolicy
 from .research_runner import ResearchRunner
 from .bayesian_sampling_reporting import BayesianSamplingCsvManifestReporter
+from .data.timing import normalize_binance_interval
 
 STANDARD_SINGLE_SYMBOL = "STANDARD_SINGLE_SYMBOL"
 EVERY_VIABLE_ENTRY = "EVERY_VIABLE_ENTRY"
@@ -134,13 +135,42 @@ def load_validation_config(path: str | Path) -> ResearchRunConfig:
     return load_data_lake_config(path)
 
 
-def build_validation_data_request(symbol,start,end,config,registry):
+def build_validation_data_request(symbol,start,end,config,registry=None):
     """Production DataRequest projection; strategy/execution are untouched."""
-    names=registry.names()
-    datasets=tuple(dict.fromkeys((DatasetKind.KLINES,*registry.required_datasets(names))))
     return DataRequest(symbol,start,end,f"{config.data.strategy_timeframe_minutes}m",
         f"{config.data.intrabar_timeframe_minutes}m" if config.data.use_intrabar_data else None,
-        datasets,MarketKind.FUTURES_UM)
+        market=MarketKind.FUTURES_UM)
+
+
+VALIDATION_REPORTING_OVERRIDES={
+    "research_sampling_mode":"PORTFOLIO", "analysis_level":"STANDARD",
+    "enable_trade_telemetry":False, "save_full_telemetry_csv":False,
+    "save_trade_journey_summary":False, "save_trade_journey_charts":False,
+    "enable_indicator_lifecycle_analysis":False, "create_lifecycle_charts":False,
+    "save_feature_analysis_reports":False, "save_indicator_analysis_reports":False,
+    "create_standard_charts":False,
+}
+
+
+def validation_execution_config(config: ResearchRunConfig) -> ResearchRunConfig:
+    """Clone reporting only; strategy and execution objects remain authoritative."""
+    return replace(config,reporting=replace(config.reporting,**VALIDATION_REPORTING_OVERRIDES))
+
+
+def latest_strategy_coverage(rows,symbol,strategy_timeframe_minutes):
+    """Resolve normalized native-kline coverage from catalog-like inventory rows."""
+    interval=normalize_binance_interval(f"{int(strategy_timeframe_minutes)}m")
+    selected=[]
+    for row in rows:
+        if (row.get("symbol")!=symbol or
+            str(getattr(row.get("dataset"),"value",row.get("dataset")))!=DatasetKind.KLINES.value or
+            row.get("last_period") is None): continue
+        try: catalog_interval=normalize_binance_interval(str(row.get("interval")))
+        except ValueError: continue
+        if catalog_interval==interval: selected.append(row)
+    if not selected: return None
+    return (max(pd.Timestamp(r["last_period"]) for r in selected)+
+        pd.Timedelta(minutes=int(strategy_timeframe_minutes))).to_pydatetime()
 
 
 def _trade_id(frame: pd.DataFrame, population: str, run_id: str) -> pd.Series:
@@ -181,7 +211,7 @@ def attach_candidate_trades(candidates: pd.DataFrame, trades: pd.DataFrame, *,
         end = decision + horizon
         complete = coverage >= end
         selected = native[(native.symbol == candidate.symbol) & (native.entry_time >= decision) & (native.entry_time < end)]
-        selected_censored = (censored_native[(censored_native.symbol == candidate.symbol) &
+        external_censored = (censored_native[(censored_native.symbol == candidate.symbol) &
             (censored_native.entry_time >= decision) & (censored_native.entry_time < end)]
             if not censored_native.empty else censored_native)
         # Existing sampling removes END_OF_DATA. Be defensive for standard native rows.
@@ -189,6 +219,8 @@ def attach_candidate_trades(candidates: pd.DataFrame, trades: pd.DataFrame, *,
         censored = pd.Series(False, index=selected.index)
         for column in reason_columns:
             censored |= selected[column].astype(str).str.upper().eq("END_OF_DATA")
+        internal_censored=selected.loc[censored].copy()
+        selected_censored=pd.concat([internal_censored,external_censored],ignore_index=True)
         resolved = selected.loc[~censored & selected.pair_net_r.notna()]
         wins, losses = int(resolved.pair_net_r.gt(0).sum()), int(resolved.pair_net_r.lt(0).sum())
         neutrals = int(resolved.pair_net_r.eq(0).sum())
@@ -199,45 +231,48 @@ def attach_candidate_trades(candidates: pd.DataFrame, trades: pd.DataFrame, *,
         elif wins: result = "WIN"
         elif losses: result = "LOSS"
         else: result = "NEUTRAL"
-        sides = sorted(set(selected.side.dropna().astype(str).str.upper()))
+        all_entries=pd.concat([selected,external_censored],ignore_index=True)
+        sides = sorted(set(all_entries.side.dropna().astype(str).str.upper()))
         side = sides[0] if len(sides) == 1 else "MIXED" if sides else "—"
         base = {"decision_timestamp": decision, "final_rank": int(candidate.final_rank),
                 "symbol": candidate.symbol, "scan_run_id": candidate.scan_run_id,
                 "scanner_source_identity": getattr(candidate,"scanner_source_identity",None),
                 "population": population, "research_run_id": run_id,
                 "evaluation_horizon": str(horizon),
+                "entry_horizon_status": "COMPLETE" if complete else "INSUFFICIENT_FUTURE_DATA",
                 "future_data_status": "COMPLETE" if complete else "INSUFFICIENT_FUTURE_DATA",
-                "valid_entry": bool(len(selected) or len(selected_censored)), "entry_count": len(selected)+len(selected_censored),
+                "outcome_resolution_status":"UNRESOLVED" if unresolved else "RESOLVED",
+                "valid_entry": bool(len(all_entries)), "entry_count": len(all_entries),
                 "completed_trade_count": len(resolved), "wins": wins, "losses": losses,
                 "neutrals": neutrals, "win_rate_resolved": wins/(wins+losses) if wins+losses else None,
                 "win_share_all_completed": wins/len(resolved) if len(resolved) else None,
                 "average_r": resolved.pair_net_r.mean() if len(resolved) else None,
                 "net_r": resolved.pair_net_r.sum() if len(resolved) else None,
-                "first_entry_time": selected.entry_time.min() if len(selected) else None,
-                "last_entry_time": selected.entry_time.max() if len(selected) else None,
+                "first_entry_time": all_entries.entry_time.min() if len(all_entries) else None,
+                "last_entry_time": all_entries.entry_time.max() if len(all_entries) else None,
                 "side": side, "result": result}
         rows.append(base)
         for trade in resolved.itertuples(index=False):
-            associations.append({**{k: base[k] for k in ("decision_timestamp", "final_rank", "symbol", "population")},
+            associations.append({**{k: base[k] for k in ("decision_timestamp", "final_rank", "symbol", "population","scan_run_id","scanner_source_identity")},
                                  "trade_identity": trade.trade_identity, "pair_net_r": trade.pair_net_r,
                                  "entry_time": trade.entry_time, "side": str(trade.side).upper(),
                                  "research_run_id":run_id,"status":"RESOLVED"})
         for trade in selected_censored.itertuples(index=False):
-            associations.append({**{k: base[k] for k in ("decision_timestamp", "final_rank", "symbol", "population")},
+            associations.append({**{k: base[k] for k in ("decision_timestamp", "final_rank", "symbol", "population","scan_run_id","scanner_source_identity")},
                 "research_run_id":run_id,"trade_identity":trade.trade_identity,"pair_net_r":None,
                 "entry_time":trade.entry_time,"side":str(trade.side).upper(),"status":"CENSORED"})
     return pd.DataFrame(rows), pd.DataFrame(associations)
 
 
 def _aggregate(windows: pd.DataFrame, associations: pd.DataFrame) -> dict:
-    observed = windows[windows.future_data_status.eq("COMPLETE")]
+    observed = windows[windows.entry_horizon_status.eq("COMPLETE")]
     resolved_associations = associations[associations.get("status", "RESOLVED").eq("RESOLVED")] if not associations.empty else associations
     unique = resolved_associations.drop_duplicates("trade_identity") if not resolved_associations.empty else resolved_associations
     wins = int(unique.pair_net_r.gt(0).sum()) if len(unique) else 0
     losses = int(unique.pair_net_r.lt(0).sum()) if len(unique) else 0
     neutrals = int(unique.pair_net_r.eq(0).sum()) if len(unique) else 0
     return {"candidate_observations": len(windows), "observed_candidate_windows": len(observed),
-            "unresolved_candidate_windows": len(windows)-len(observed),
+            "unresolved_candidate_windows": int(windows.outcome_resolution_status.eq("UNRESOLVED").sum()),
             "candidate_windows_with_entry": int(observed.valid_entry.sum()),
             "candidate_to_entry_conversion": observed.valid_entry.mean() if len(observed) else None,
             "unique_trade_count": len(unique), "unique_wins": wins, "unique_losses": losses,
@@ -287,6 +322,7 @@ class HistoricalStrategyValidator:
         if horizon <= pd.Timedelta(0): raise ValueError("entry evaluation horizon must be positive")
         canonical_config=json.dumps(config.to_dict(),sort_keys=True,separators=(",",":"),default=str).encode()
         config_hash=sha256(canonical_config).hexdigest()
+        execution_config=validation_execution_config(config)
         required={"decision_timestamp","final_rank","symbol","scan_run_id"}
         if missing:=required-set(candidates): raise ValueError(f"candidates missing columns: {sorted(missing)}")
         candidates=candidates.copy(); candidates["decision_timestamp"]=pd.to_datetime(candidates.decision_timestamp,utc=True)
@@ -311,7 +347,7 @@ class HistoricalStrategyValidator:
                 raise ValueError(f"{symbol}: no usable market data after required warmup start")
             progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,"stage":"Starting native research","elapsed":sum(durations),"eta":(sum(durations)/len(durations)*(len(symbols)-index+1)) if durations else None})
             began=self.monotonic()
-            result: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),config)
+            result: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),execution_config)
             durations.append(self.monotonic()-began); run_ids[symbol]=result.research_run_id
             native_runs[symbol]={"run_id":result.research_run_id,"run_dir":str(result.run_dir),
                 "request_start":pd.Timestamp(result.request_start).isoformat(),"request_end":pd.Timestamp(result.request_end).isoformat(),
@@ -327,6 +363,8 @@ class HistoricalStrategyValidator:
                   "code_commit":_commit(),"scanner_run_ids":sorted(candidates.scan_run_id.unique()),
                   "scanner_decision_timestamps":sorted(x.isoformat() for x in candidates.decision_timestamp.unique()),
                   "strategy_config_snapshot":"strategy_config_snapshot.json","strategy_config_sha256":config_hash,
+                  "authoritative_strategy_config_hash":config_hash,
+                  "validation_reporting_overrides":VALIDATION_REPORTING_OVERRIDES,
                   "strategy_timeframe_minutes":config.data.strategy_timeframe_minutes,
                   "intrabar_timeframe_minutes":config.data.intrabar_timeframe_minutes if config.data.use_intrabar_data else None,
                   "evaluation_horizon":str(horizon),"unique_candidate_symbols":symbols,
@@ -374,13 +412,10 @@ class HistoricalStrategyValidationService:
         def request(symbol,start,end,cfg):
             return build_validation_data_request(symbol,start,end,cfg,registry)
         def latest(symbol):
-            strategy_interval=f"{config.data.strategy_timeframe_minutes}m"
-            rows=[r for r in store.catalog.inventory(store.raw_root,market=MarketKind.FUTURES_UM)
-                if r["symbol"]==symbol
-                and str(getattr(r.get("dataset"),"value",r.get("dataset")))==DatasetKind.KLINES.value
-                and str(r.get("interval"))==strategy_interval]
-            values=[pd.Timestamp(r["last_period"]) for r in rows if r.get("last_period") is not None]
-            return (max(values)+pd.Timedelta(minutes=config.data.strategy_timeframe_minutes)).to_pydatetime() if values else None
+            return latest_strategy_coverage(
+                store.catalog.inventory(store.raw_root,market=MarketKind.FUTURES_UM),
+                symbol,config.data.strategy_timeframe_minutes,
+            )
         executor=NativeResearchExecutor(runner_factory,request)
         validator=HistoricalStrategyValidator(executor,warmup_bars=lambda _cfg:registry.effective_warmup(registry.names()),
             output_root=self.output_root,latest_available=latest)

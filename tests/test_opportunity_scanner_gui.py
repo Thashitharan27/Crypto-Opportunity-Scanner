@@ -315,6 +315,35 @@ def test_validation_worker_retains_complete_range_and_runs_offscreen(tmp_path):
     finally: workspace.shutdown(); workspace.close()
 
 
+def test_validation_live_switch_mutual_exclusion_and_elapsed_timer(tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    widgets=pytest.importorskip("PySide6.QtWidgets",exc_type=ImportError)
+    from PySide6.QtCore import QEventLoop, QTimer
+    from threading import Event
+    from crypto_strategy_lab.data_lake_config import ResearchRunConfig
+    from crypto_strategy_lab.gui.opportunity_scanner_workspace import OpportunityScannerWorkspace
+    release=Event()
+    class Validation:
+        def validate(self,*args):
+            progress=args[-1]; progress({"symbol_index":1,"symbol_total":1,"symbol":"BTCUSDT","native_stage":"Running strategy simulation","eta":None})
+            release.wait(3)
+            return SimpleNamespace(run_dir=tmp_path,outcomes=pd.DataFrame(),summary=pd.DataFrame(),by_rank=pd.DataFrame(),top_k=pd.DataFrame())
+    workspace=OpportunityScannerWorkspace(SimpleNamespace(validation_service=Validation()))
+    config=tmp_path/"config.json"; config.write_text(json.dumps(ResearchRunConfig().to_dict()))
+    try:
+        workspace.mode.setCurrentIndex(1); workspace._validation_scan_run_dirs=(tmp_path/"scan",)
+        workspace.validation_config.setText(str(config)); workspace._sync_controls(); workspace.validate_button.click()
+        app=widgets.QApplication.instance(); app.processEvents()
+        assert not workspace.run_button.isEnabled() and not workspace.validate_button.isEnabled()
+        workspace._validation_started-=2; workspace._update_validation_elapsed()
+        assert "Elapsed: 00:00:02" in workspace.validation_progress.text()
+        workspace.mode.setCurrentIndex(0); release.set()
+        loop=QEventLoop(); QTimer.singleShot(3000,loop.quit)
+        while workspace._validation_thread is not None: QTimer.singleShot(20,loop.quit); loop.exec()
+        assert workspace.run_button.isEnabled() and not workspace.validate_button.isEnabled()
+    finally: release.set(); workspace.shutdown(); workspace.close()
+
+
 def test_workspace_uses_code_commit_and_has_shutdown_wait_contract():
     source=(Path(__file__).parents[1]/"crypto_strategy_lab/gui/opportunity_scanner_workspace.py").read_text(encoding="utf-8")
     assert "m.get('code_commit','—')" in source

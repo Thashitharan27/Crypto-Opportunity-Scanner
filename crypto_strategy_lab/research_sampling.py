@@ -172,46 +172,42 @@ def generate_strategy_research_samples(
     interval_candles: int = 1,
 ) -> pd.DataFrame:
     """Evaluate configured strategy opportunities without portfolio suppression."""
-    normalized_mode = str(mode).upper()
+    return _run_strategy_research_sampling(
+        prepared, intrabar, native_config, mode=mode,
+        interval_candles=interval_candles,
+    ).resolved
+
+
+def _run_strategy_research_sampling(
+    prepared, intrabar, native_config, *, mode: str, interval_candles: int,
+) -> StrategyResearchSamplingResult:
+    """Run the native sampling engine once and share all post-processing."""
+    normalized_mode=str(mode).upper(); interval=int(interval_candles)
     if normalized_mode not in RESEARCH_SAMPLING_MODES:
         raise ValueError(f"unsupported research sampling mode: {normalized_mode}")
-    interval = int(interval_candles)
-    if interval <= 0:
-        raise ValueError("research sampling interval must be positive")
+    if interval <= 0: raise ValueError("research sampling interval must be positive")
     if normalized_mode == "PORTFOLIO":
-        empty = pd.DataFrame()
-        empty.attrs["research_sampling"] = {
-            "enabled": False,
-            "mode": normalized_mode,
-            "interval_candles": interval,
-        }
-        return empty
-
-    config = research_native_config(native_config, len(prepared))
-    engine = StrategyResearchSamplingEngine.from_prepared(prepared, intrabar, config)
-    raw = engine.run()
-    exit_optimization = engine.research_exit_optimization_stats()
-    raw = _annotate_episodes(raw)
-    viable_episode_count = int(raw["research_episode_id"].nunique()) if not raw.empty else 0
-    resolved = _resolved_samples(raw)
-    selected = _select_sampling_mode(resolved, normalized_mode, interval)
-
-    if not selected.empty:
-        selected["research_sampling_version"] = RESEARCH_SAMPLING_VERSION
-        selected["research_sampling_mode"] = normalized_mode
-        selected["research_sampling_interval_candles"] = interval
-        selected["research_sampling_overlap_allowed"] = True
-        selected["research_sampling_independent_equity"] = True
-        selected["research_sampling_population"] = "STRATEGY_VIABLE"
-        selected["research_sample_id"] = (
-            selected["research_signal_index"].astype("int64").astype(str)
-            + "-"
-            + selected["side"].astype(str).str.upper()
-            + "-"
-            + selected["research_episode_id"].astype(str)
-        )
-
-    selected.attrs["research_sampling"] = {
+        empty=pd.DataFrame(); metadata={"enabled":False,"mode":normalized_mode,"interval_candles":interval}
+        empty.attrs["research_sampling"]=metadata
+        return StrategyResearchSamplingResult(empty,empty.copy(),metadata)
+    config=research_native_config(native_config,len(prepared))
+    engine=StrategyResearchSamplingEngine.from_prepared(prepared,intrabar,config)
+    raw=_annotate_episodes(engine.run()); exit_optimization=engine.research_exit_optimization_stats()
+    censored=raw.loc[raw.apply(_exit_reason,axis=1).eq("END_OF_DATA")].copy().reset_index(drop=True)
+    resolved_all=_resolved_samples(raw)
+    selected=_select_sampling_mode(resolved_all,normalized_mode,interval)
+    viable_episode_count=int(raw["research_episode_id"].nunique()) if not raw.empty else 0
+    for frame in (selected,censored):
+        if not frame.empty:
+            frame["research_sampling_version"]=RESEARCH_SAMPLING_VERSION
+            frame["research_sampling_mode"]=normalized_mode
+            frame["research_sampling_interval_candles"]=interval
+            frame["research_sampling_overlap_allowed"]=True
+            frame["research_sampling_independent_equity"]=True
+            frame["research_sampling_population"]="STRATEGY_VIABLE"
+            frame["research_sample_id"]=(frame["research_signal_index"].astype("int64").astype(str)+"-"+
+                frame["side"].astype(str).str.upper()+"-"+frame["research_episode_id"].astype(str))
+    metadata = {
         "version": RESEARCH_SAMPLING_VERSION,
         "enabled": True,
         "mode": normalized_mode,
@@ -224,13 +220,14 @@ def generate_strategy_research_samples(
         "per_trade_execution_semantics_preserved": True,
         **exit_optimization,
         "viable_entries": int(len(raw)),
-        "resolved_viable_entries": int(len(resolved)),
+        "resolved_viable_entries": int(len(resolved_all)),
         "selected_entries": int(len(selected)),
         "viable_episodes": viable_episode_count,
-        "end_of_data_samples_censored": int(len(raw) - len(resolved)),
+        "end_of_data_samples_censored": int(len(censored)),
         "bayesian_cluster_key": "research_episode_id",
     }
-    return selected
+    selected.attrs["research_sampling"]=metadata; censored.attrs["research_sampling"]=metadata
+    return StrategyResearchSamplingResult(selected,censored,metadata)
 
 
 def generate_strategy_research_sampling_result(
@@ -242,35 +239,8 @@ def generate_strategy_research_sampling_result(
     invocation; callers never need to rerun strategy logic to distinguish
     NO_ENTRY from an END_OF_DATA observation.
     """
-    normalized_mode = str(mode).upper()
-    if normalized_mode == "PORTFOLIO":
-        resolved = generate_strategy_research_samples(
-            prepared, intrabar, native_config, mode=mode,
-            interval_candles=interval_candles,
-        )
-        return StrategyResearchSamplingResult(resolved, resolved.copy(), dict(resolved.attrs.get("research_sampling", {})))
-    config = research_native_config(native_config, len(prepared))
-    engine = StrategyResearchSamplingEngine.from_prepared(prepared, intrabar, config)
-    raw = _annotate_episodes(engine.run())
-    exit_optimization = engine.research_exit_optimization_stats()
-    censored = raw.loc[raw.apply(_exit_reason, axis=1).eq("END_OF_DATA")].copy().reset_index(drop=True)
-    resolved_all = _resolved_samples(raw)
-    selected = _select_sampling_mode(resolved_all, normalized_mode, interval_candles)
-    metadata = {
-        "version": RESEARCH_SAMPLING_VERSION, "enabled": True,
-        "mode": normalized_mode, "interval_candles": int(interval_candles),
-        "end_of_data_samples_censored": len(censored), **exit_optimization,
-    }
-    for frame in (selected, censored):
-        if not frame.empty:
-            frame["research_sampling_mode"] = normalized_mode
-            frame["research_sample_id"] = (
-                frame["research_signal_index"].astype("int64").astype(str) + "-" +
-                frame["side"].astype(str).str.upper() + "-" +
-                frame["research_episode_id"].astype(str)
-            )
-        frame.attrs["research_sampling"] = metadata
-    return StrategyResearchSamplingResult(selected, censored, metadata)
+    return _run_strategy_research_sampling(prepared,intrabar,native_config,
+        mode=mode,interval_candles=interval_candles)
 
 
 def build_episode_table(samples: pd.DataFrame) -> pd.DataFrame:

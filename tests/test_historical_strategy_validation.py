@@ -3,12 +3,14 @@ import hashlib, json
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 
 from crypto_strategy_lab.data_lake_config import ResearchRunConfig, ExecutionConfig
 from crypto_strategy_lab.historical_strategy_validation import (
     EVERY_VIABLE_ENTRY, STANDARD_SINGLE_SYMBOL, HistoricalStrategyValidator,
     SymbolResearchResult, aggregate_reports, attach_candidate_trades,
     build_validation_data_request, load_validation_config,
+    latest_strategy_coverage, validation_execution_config,
 )
 from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
 
@@ -110,4 +112,71 @@ def test_strict_v3_load_and_production_request_projection(tmp_path):
     registry=type("Registry",(),{"names":lambda self:("technical",),"required_datasets":lambda self,names:(DatasetKind.FUNDING_RATE,)})()
     request=build_validation_data_request("btcusdt",datetime(2025,1,1,tzinfo=timezone.utc),datetime(2025,1,2,tzinfo=timezone.utc),loaded,registry)
     assert request.market==MarketKind.FUTURES_UM and request.strategy_interval=="15m" and request.intrabar_interval=="1m"
-    assert request.datasets==(DatasetKind.KLINES,DatasetKind.FUNDING_RATE)
+    assert request.datasets==(DatasetKind.KLINES,)
+    assert request.exchange=="binance"
+
+
+def test_native_interval_aliases_find_actual_catalog_coverage():
+    rows=[{"symbol":"BTCUSDT","dataset":"klines","interval":interval,
+           "last_period":pd.Timestamp("2025-01-02T00:00Z")} for interval in ("15m","1h","4h","1d")]
+    expected={15:"2025-01-02T00:15Z",60:"2025-01-02T01:00Z",240:"2025-01-02T04:00Z",1440:"2025-01-03T00:00Z"}
+    for minutes,value in expected.items():
+        assert pd.Timestamp(latest_strategy_coverage(rows,"BTCUSDT",minutes))==pd.Timestamp(value)
+
+
+def test_standard_end_of_data_is_auditable_and_unresolved_denominator_counts_it():
+    c=candidates().assign(scanner_source_identity="scanner-source")
+    trades=pd.DataFrame({"symbol":["SOLUSDT"],"pair_id":["pair-7"],
+        "entry_time":pd.to_datetime(["2025-01-01T02:00Z"]),"pair_net_r":[-1.0],
+        "side":["LONG"],"long_exit_reason":["END_OF_DATA"]})
+    rows,associations=attach_candidate_trades(c,trades,population=STANDARD_SINGLE_SYMBOL,
+        run_id="native-run",horizon=pd.Timedelta("24h"),available_through=pd.Timestamp("2025-01-02T00:00Z"))
+    row=rows.iloc[0]
+    assert row.entry_horizon_status=="COMPLETE" and row.outcome_resolution_status=="UNRESOLVED"
+    assert row.valid_entry and row.result=="UNRESOLVED" and row.side=="LONG"
+    assert row.first_entry_time==row.last_entry_time==pd.Timestamp("2025-01-01T02:00Z")
+    association=associations.iloc[0]
+    assert association.status=="CENSORED" and association.trade_identity.endswith("pair-7")
+    assert association.scan_run_id=="scan" and association.scanner_source_identity=="scanner-source"
+    summary,*_=aggregate_reports(rows,associations)
+    assert summary.iloc[0].unresolved_candidate_windows==1
+    assert summary.iloc[0].candidate_to_entry_conversion==1
+
+
+def test_validation_reporting_override_preserves_strategy_and_execution_identity():
+    base=ResearchRunConfig(); source=replace(base,reporting=replace(base.reporting,
+        research_sampling_mode="EVERY_VIABLE_ENTRY",analysis_level="DEEP",
+        enable_trade_telemetry=True,telemetry_interval_minutes=15))
+    effective=validation_execution_config(source)
+    assert effective.strategy is source.strategy and effective.execution is source.execution
+    assert effective.reporting.research_sampling_mode=="PORTFOLIO"
+    assert effective.reporting.analysis_level=="STANDARD" and not effective.reporting.enable_trade_telemetry
+
+
+def test_source_eve_deep_reporting_is_overridden_once_per_symbol(tmp_path):
+    base=ResearchRunConfig(); source=replace(base,reporting=replace(base.reporting,
+        research_sampling_mode="EVERY_VIABLE_ENTRY",analysis_level="DEEP"))
+    calls=[]
+    def execute(symbol,start,end,effective):
+        calls.append(effective)
+        empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"])
+        viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
+        return SymbolResearchResult("native",empty,viable,viable.copy(),end,tmp_path/symbol,start,end)
+    HistoricalStrategyValidator(execute,warmup_bars=lambda _:0).run(candidates(("SOLUSDT","BTCUSDT")),source,config_path=tmp_path/"config",publish=False)
+    assert len(calls)==2
+    assert all(c.reporting.research_sampling_mode=="PORTFOLIO" and c.reporting.analysis_level=="STANDARD" for c in calls)
+    assert all(c.strategy is source.strategy and c.execution is source.execution for c in calls)
+
+
+def test_cancellation_prevents_next_symbol_and_never_publishes_complete(tmp_path):
+    calls=[]; cancelled=[False]
+    def execute(symbol,start,end,config):
+        calls.append(symbol); cancelled[0]=True
+        empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"])
+        viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
+        return SymbolResearchResult("native",empty,viable,viable.copy(),end,tmp_path/symbol,start,end)
+    validator=HistoricalStrategyValidator(execute,warmup_bars=lambda _:0,output_root=tmp_path/"output")
+    from crypto_strategy_lab.historical_strategy_validation import ValidationCancelled
+    with pytest.raises(ValidationCancelled):
+        validator.run(candidates(("SOLUSDT","BTCUSDT")),ResearchRunConfig(),config_path=tmp_path/"config",cancelled=lambda:cancelled[0])
+    assert len(calls)==1 and not (tmp_path/"output").exists()

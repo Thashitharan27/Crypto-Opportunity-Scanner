@@ -76,6 +76,7 @@ class OpportunityScannerWorkspace(QWidget):
     def __init__(self, service, parent=None):
         super().__init__(parent); self.service = service; self._thread = None; self._cancel = Event()
         self._validation_thread=None; self._validation_worker=None; self._validation_cancel=Event(); self._validation_scan_run_dirs=()
+        self._validation_started=0.0; self._validation_progress_state={}
         defaults, candle_defaults, final_defaults = DiscoveryConfig(), SelectiveCandleAcquisitionConfig(), FinalCandidateBoundaryConfig()
         root = QVBoxLayout(self)
         config = QGroupBox("Scan configuration"); form = QFormLayout(config); self._form = form
@@ -118,6 +119,7 @@ class OpportunityScannerWorkspace(QWidget):
         self.validation_views=QTabWidget(); self.validation_outcomes=QTableWidget(); self.validation_summary=QTableWidget(); self.validation_rank=QTableWidget(); self.validation_views.addTab(self.validation_outcomes,"Candidate Outcomes"); self.validation_views.addTab(self.validation_summary,"Summary"); self.validation_views.addTab(self.validation_rank,"Rank Performance"); validation_layout.addWidget(self.validation_views,1)
         self.tabs.addTab(validation,"Strategy Validation")
         self._timer=QTimer(self); self._timer.timeout.connect(self._update_elapsed)
+        self._validation_timer=QTimer(self); self._validation_timer.timeout.connect(self._update_validation_elapsed)
         self.mode.currentIndexChanged.connect(self._mode_changed); self.execution.currentIndexChanged.connect(self._mode_changed)
         for widget in (self.range_start,self.range_end): widget.dateTimeChanged.connect(self._update_planned)
         self.cadence.currentIndexChanged.connect(self._update_planned)
@@ -143,8 +145,14 @@ class OpportunityScannerWorkspace(QWidget):
             self.range_progress.setValue(0)
             self.progress_text.setText("Stage: —\nElapsed: 00:00:00")
         self._update_planned()
-        if not historical:
-            self.validate_button.setEnabled(False)
+        self._sync_controls()
+
+    def _sync_controls(self):
+        scanning=self._thread is not None; validating=self._validation_thread is not None
+        historical=self.mode.currentData()=="HISTORICAL"
+        self.run_button.setEnabled(not scanning and not validating)
+        self.validate_button.setEnabled(historical and bool(self._validation_scan_run_dirs) and not scanning and not validating)
+        self.validation_cancel.setEnabled(validating)
 
     def _browse_validation_config(self):
         path,_=QFileDialog.getOpenFileName(self,"Select v3 ResearchRunConfig",self.validation_config.text(),"JSON (*.json)")
@@ -159,7 +167,7 @@ class OpportunityScannerWorkspace(QWidget):
         self._fill(self.validation_rank,__import__("pandas").concat([rank,top],ignore_index=True),("population","final_rank","candidate_observations","candidate_to_entry_conversion","unique_trade_count","unique_wins","unique_losses","unique_neutrals","resolved_unique_trade_win_rate","average_r_per_unique_trade"))
 
     def start_validation(self):
-        if self._validation_thread is not None: return
+        if self._validation_thread is not None or self._thread is not None: return
         validation_service=getattr(self.service,"validation_service",None)
         if validation_service is None: self.validation_progress.setText("Validation service is not configured."); return
         try:
@@ -169,24 +177,28 @@ class OpportunityScannerWorkspace(QWidget):
             if horizon <= __import__("pandas").Timedelta(0): raise ValueError("Entry evaluation horizon must be positive")
             if not self._validation_scan_run_dirs: raise ValueError("A complete Historical scan is required")
         except Exception as exc: self.validation_progress.setText(f"Cannot start validation: {exc}"); return
-        self._validation_cancel.clear(); self.validate_button.setEnabled(False); self.validation_cancel.setEnabled(True)
+        self._validation_cancel.clear(); self._validation_started=time.monotonic(); self._validation_progress_state={"symbol_index":0,"symbol_total":0,"symbol":"—","stage":"Starting","eta":None}
         thread=QThread(self); worker=_ValidationWorker(validation_service,self._validation_scan_run_dirs,path,str(horizon),self._validation_cancel.is_set); worker.moveToThread(thread)
         thread.started.connect(worker.run); worker.progress.connect(self._validation_progress_event); worker.finished.connect(self._validation_completed); worker.failed.connect(self._validation_failed); worker.cancelled.connect(self._validation_cancelled)
         worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.cancelled.connect(thread.quit); thread.finished.connect(self._validation_thread_finished)
-        self._validation_thread,self._validation_worker=thread,worker; thread.start()
+        self._validation_thread,self._validation_worker=thread,worker; self._sync_controls(); self._validation_timer.start(250); thread.start()
 
     def cancel_validation(self):
         self._validation_cancel.set(); self.validation_progress.setText("Cancelling after current native symbol run…")
 
     def _validation_progress_event(self,event):
-        index,total=event.get("symbol_index",0),event.get("symbol_total",0); elapsed=event.get("elapsed",0); eta=event.get("eta")
-        self.validation_progress.setText(f"Strategy validation: {index} / {total} symbols\nCurrent symbol: {event.get('symbol','—')}\nNative stage: {event.get('native_stage',event.get('stage','—'))}\nElapsed: {self._duration(elapsed)}\nETA: {'calculating…' if eta is None else self._duration(eta)}")
+        self._validation_progress_state.update(event); self._update_validation_elapsed()
+    def _update_validation_elapsed(self):
+        if self._validation_thread is None: return
+        event=self._validation_progress_state; index,total=event.get("symbol_index",0),event.get("symbol_total",0); eta=event.get("eta")
+        self.validation_progress.setText(f"Strategy validation: {index} / {total} symbols\nCurrent symbol: {event.get('symbol','—')}\nNative stage: {event.get('native_stage',event.get('stage','—'))}\nElapsed: {self._duration(time.monotonic()-self._validation_started)}\nETA: {'calculating…' if eta is None else self._duration(eta)}")
     def _validation_completed(self,result): self.render_validation(result); self.validation_progress.setText(f"Completed — {result.run_dir}")
     def _validation_failed(self,error): self.validation_progress.setText(f"Validation failed: {error}")
     def _validation_cancelled(self): self.validation_progress.setText("Validation cancelled; completed native runs were preserved.")
     def _validation_thread_finished(self):
+        self._validation_timer.stop()
         self._validation_thread.deleteLater(); self._validation_thread=None; self._validation_worker=None
-        self.validation_cancel.setEnabled(False); self.validate_button.setEnabled(bool(self._validation_scan_run_dirs))
+        self._sync_controls()
 
     def _set_row_visible(self, field, visible):
         """Hide both parts of a form row on Qt versions without setRowVisible."""
@@ -224,7 +236,7 @@ class OpportunityScannerWorkspace(QWidget):
             enabled_features=tuple(name for name,check in self.feature_checks.items() if check.isChecked()))
 
     def start_scan(self):
-        if self._thread is not None: return
+        if self._thread is not None or self._validation_thread is not None: return
         self._validation_scan_run_dirs=(); self.validate_button.setEnabled(False)
         ranged=self.mode.currentData()=="HISTORICAL" and self.execution.currentData()=="RANGE"
         try:
@@ -239,6 +251,7 @@ class OpportunityScannerWorkspace(QWidget):
         request_factory=lambda decision, template=request: replace(template,decision_time=decision)
         thread=QThread(self); worker=(_RangeWorker(HistoricalRangeRunner(self.service,monotonic=time.monotonic),points,request_factory,self._cancel.is_set) if ranged else _ScanWorker(self.service,request,self._cancel.is_set)); worker.moveToThread(thread); thread.started.connect(worker.run); worker.progress.connect(self._progress); worker.finished.connect(self._completed); worker.failed.connect(self._failed); worker.cancelled.connect(self._cancelled); worker.finished.connect(thread.quit); worker.failed.connect(thread.quit); worker.cancelled.connect(thread.quit); thread.finished.connect(self._thread_finished)
         self._thread=thread; self._worker=worker; thread.start()
+        self._sync_controls()
 
     def cancel_scan(self): self._cancel.set(); self.status.setText("Cancelling…")
     def _completed(self,result):
@@ -254,7 +267,7 @@ class OpportunityScannerWorkspace(QWidget):
         else:
             self.render(result); self.status.setText("Completed")
             if result.manifest.get("opportunity_scan",{}).get("discovery_mode")=="HISTORICAL": self._validation_scan_run_dirs=(result.run_dir,)
-        self.validate_button.setEnabled(bool(self._validation_scan_run_dirs))
+        self._sync_controls()
     def _cancelled(self):
         self._validation_scan_run_dirs=(); self.validate_button.setEnabled(False); self.status.setText(f"Cancelled — {self._range_completed} / {self._range_total} completed" if self._range_total else "Cancelled")
     def _failed(self,error):
@@ -280,6 +293,7 @@ class OpportunityScannerWorkspace(QWidget):
     def _thread_finished(self):
         self._timer.stop()
         self._thread.deleteLater(); self._thread=None; self._worker=None; self.run_button.setEnabled(True); self.cancel_button.setEnabled(False)
+        self._sync_controls()
 
     def shutdown(self):
         """Cooperatively stop backend work before Qt destroys its QThread."""
