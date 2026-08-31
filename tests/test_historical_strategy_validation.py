@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
+import numpy as np
 
 from crypto_strategy_lab.data_lake_config import ResearchRunConfig, ExecutionConfig
 from crypto_strategy_lab.historical_strategy_validation import (
@@ -12,6 +13,10 @@ from crypto_strategy_lab.historical_strategy_validation import (
     build_validation_data_request, load_validation_config,
     latest_strategy_coverage, validation_execution_config,
 )
+from crypto_strategy_lab.research_warmup import WARMUP_POLICY_VERSION, validation_warmup_bars
+from crypto_strategy_lab.research_adapters import native_simulator_config
+from crypto_strategy_lab.features.market_regime import prepare_policy_market_features
+from crypto_strategy_lab.support_resistance import SupportResistanceDetector
 from crypto_strategy_lab.data.schemas import DatasetKind, MarketKind
 
 
@@ -89,6 +94,10 @@ def test_timeout_tail_and_immutable_config_snapshot_are_published(tmp_path):
     assert hashlib.sha256(snapshot).hexdigest()==result.manifest["strategy_config_sha256"]
     assert b'"changed"' not in snapshot
     assert result.manifest["native_research_run_ids_by_symbol"]["SOLUSDT"]=="authoritative-run"
+    assert result.manifest["authoritative_research_config_sha256"]==result.manifest["strategy_config_sha256"]
+    assert result.manifest["validation_warmup_policy_version"]==WARMUP_POLICY_VERSION
+    assert result.manifest["validation_warmup_bars"]==5
+    assert result.manifest["native_research_runs_by_symbol"]["SOLUSDT"]["request_start"]==pd.Timestamp(calls[0][0]).isoformat()
     assert result.manifest["scanner_candidate_sources"][0]["scanner_source_identity"]=="scanner-source"
     association=result.run_dir/"strategy_validation_trade_associations.csv"
     assert association.exists() and result.manifest["artifacts"][association.name]["rows"]==0
@@ -118,10 +127,81 @@ def test_strict_v3_load_and_production_request_projection(tmp_path):
 
 def test_native_interval_aliases_find_actual_catalog_coverage():
     rows=[{"symbol":"BTCUSDT","dataset":"klines","interval":interval,
-           "last_period":pd.Timestamp("2025-01-02T00:00Z")} for interval in ("15m","1h","4h","1d")]
+           "last_period":pd.Timestamp(end)} for interval,end in
+          (("15m","2025-01-02T00:15Z"),("1h","2025-01-02T01:00Z"),
+           ("4h","2025-01-02T04:00Z"),("1d","2025-01-03T00:00Z"))]
     expected={15:"2025-01-02T00:15Z",60:"2025-01-02T01:00Z",240:"2025-01-02T04:00Z",1440:"2025-01-03T00:00Z"}
     for minutes,value in expected.items():
         assert pd.Timestamp(latest_strategy_coverage(rows,"BTCUSDT",minutes))==pd.Timestamp(value)
+
+
+def test_catalog_coverage_uses_partition_end_without_inventing_a_candle():
+    rows=[{"symbol":"BTCUSDT","dataset":"klines","interval":"4h","last_period":value}
+          for value in ("2025-01-01T04:00Z","2025-01-03T00:00Z","2025-01-02T20:00Z")]
+    assert pd.Timestamp(latest_strategy_coverage(rows,"BTCUSDT",240))==pd.Timestamp("2025-01-03T00:00Z")
+    assert latest_strategy_coverage(rows,"ETHUSDT",240) is None
+    partial=[{"symbol":"BTCUSDT","dataset":"klines","interval":"1d","last_period":"2025-01-02T12:00Z"}]
+    assert pd.Timestamp(latest_strategy_coverage(partial,"BTCUSDT",1440))==pd.Timestamp("2025-01-02T12:00Z")
+
+
+@pytest.mark.parametrize("minutes",[240,1440])
+def test_configured_warmup_covers_asset_return_and_higher_timeframe_sr(minutes):
+    base=ResearchRunConfig()
+    data=replace(base.data,strategy_timeframe_minutes=minutes,
+        intrabar_timeframe_minutes=60 if minutes==240 else 240)
+    features=replace(base.features,market_regime_method="ASSET_RETURN",
+        bull_regime_lookback_days=120,enable_support_resistance_analysis=True,
+        sr_timeframe_minutes=1440,sr_lookback_bars=80,sr_pivot_left=7,
+        sr_pivot_right=9,enable_sr_hold_confirmation=True,sr_hold_confirmation_bars=4)
+    config=replace(base,data=data,features=features)
+    registry=type("Registry",(),{"names":lambda self:("core",),"effective_warmup":lambda self,names:10})()
+    bars=validation_warmup_bars(config,registry)
+    duration=pd.Timedelta(minutes=bars*minutes)
+    assert duration>=pd.Timedelta(days=124)  # 120d regime + mature safety margin
+    assert duration>=pd.Timedelta(minutes=(80+7+9+4+5)*1440)
+
+
+def test_partial_catalog_end_keeps_candidate_unresolved():
+    coverage=latest_strategy_coverage([{"symbol":"SOLUSDT","dataset":"klines","interval":"1h",
+        "last_period":"2025-01-01T23:00Z"}],"SOLUSDT",60)
+    empty=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"])
+    rows,_=attach_candidate_trades(candidates(),empty,population=STANDARD_SINGLE_SYMBOL,
+        run_id="native",horizon=pd.Timedelta("24h"),available_through=coverage)
+    assert rows.iloc[0].entry_horizon_status=="INSUFFICIENT_FUTURE_DATA"
+    assert rows.iloc[0].result=="UNRESOLVED"
+
+
+def test_asset_return_context_at_first_candidate_matches_long_native_history():
+    base=ResearchRunConfig(); config=replace(base,
+        data=replace(base.data,strategy_timeframe_minutes=240,intrabar_timeframe_minutes=60),
+        features=replace(base.features,market_regime_method="ASSET_RETURN",bull_regime_lookback_days=90))
+    registry=type("Registry",(),{"names":lambda self:("policy_market_context",),"effective_warmup":lambda self,names:0})()
+    warmup=validation_warmup_bars(config,registry)
+    times=pd.date_range("2024-01-01",periods=1400,freq="4h",tz="UTC")
+    closes=np.linspace(100,180,len(times)); candidate_index=1300
+    native=native_simulator_config(config.data,config.features,config.strategy,config.execution)
+    _,long_regime,_=prepare_policy_market_features(times[:candidate_index+1],closes[:candidate_index+1],native)
+    start=candidate_index-warmup
+    _,validation_regime,_=prepare_policy_market_features(times[start:candidate_index+1],closes[start:candidate_index+1],native)
+    assert validation_regime[-1]==long_regime[-1]
+
+
+def test_sr_context_at_first_candidate_matches_long_native_history():
+    base=ResearchRunConfig(); config=replace(base,
+        data=replace(base.data,strategy_timeframe_minutes=1440,intrabar_timeframe_minutes=240),
+        features=replace(base.features,enable_support_resistance_analysis=True,
+            sr_timeframe_minutes=1440,sr_lookback_bars=80,sr_pivot_left=4,sr_pivot_right=4,
+            enable_sr_hold_confirmation=True,sr_hold_confirmation_bars=3))
+    registry=type("Registry",(),{"names":lambda self:("support_resistance",),"effective_warmup":lambda self,names:0})()
+    warmup=validation_warmup_bars(config,registry); count=220; x=np.arange(count)
+    close=100+8*np.sin(x/7); open_=close-.2; high=close+1; low=close-1; atr=np.full(count,2.0)
+    kwargs=dict(pivot_left=4,pivot_right=4,lookback_bars=80,enable_hold_confirmation=True,hold_confirmation_bars=3)
+    long=SupportResistanceDetector(**kwargs).analyze_price_location(count-1,open_,high,low,close,atr,"LONG")
+    start=max(0,count-1-warmup)
+    validation=SupportResistanceDetector(**kwargs).analyze_price_location(count-1-start,open_[start:],high[start:],low[start:],close[start:],atr[start:],"LONG")
+    assert validation.nearest_support_price==pytest.approx(long.nearest_support_price)
+    assert validation.nearest_resistance_price==pytest.approx(long.nearest_resistance_price)
+    assert validation.support_state==long.support_state and validation.resistance_state==long.resistance_state
 
 
 def test_standard_end_of_data_is_auditable_and_unresolved_denominator_counts_it():

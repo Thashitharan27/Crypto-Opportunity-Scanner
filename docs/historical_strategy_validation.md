@@ -51,6 +51,13 @@ StrategyConfig and ExecutionConfig are unchanged; only symbol/time requests and
 validation reporting are varied. Existing Data Lake and feature/prepared caches
 remain authoritative.
 
+The request start combines the shared native warm-up projection with the
+production feature registry. It includes configured indicator, profile momentum,
+ASSET_RETURN regime, and support/resistance lookbacks at the configured S/R
+timeframe. Provenance records the warm-up policy version, effective bars, and
+each symbol's native request start. Catalog `last_period` is already the
+authoritative exclusive coverage end; validation never adds a synthetic candle.
+
 Validation snapshots and hashes that authoritative config before execution. A
 reporting-only clone disables Deep/Bayesian grids, duplicate research sampling,
 telemetry, lifecycle analysis, and charts. The capture reporter runs the native

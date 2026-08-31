@@ -33,6 +33,7 @@ from .research_adapters import NativeSimulator, NativeStrategyPolicy
 from .research_runner import ResearchRunner
 from .bayesian_sampling_reporting import BayesianSamplingCsvManifestReporter
 from .data.timing import normalize_binance_interval
+from .research_warmup import WARMUP_POLICY_VERSION, validation_warmup_bars
 
 STANDARD_SINGLE_SYMBOL = "STANDARD_SINGLE_SYMBOL"
 EVERY_VIABLE_ENTRY = "EVERY_VIABLE_ENTRY"
@@ -169,8 +170,9 @@ def latest_strategy_coverage(rows,symbol,strategy_timeframe_minutes):
         except ValueError: continue
         if catalog_interval==interval: selected.append(row)
     if not selected: return None
-    return (max(pd.Timestamp(r["last_period"]) for r in selected)+
-        pd.Timedelta(minutes=int(strategy_timeframe_minutes))).to_pydatetime()
+    latest=max(pd.Timestamp(r["last_period"]) for r in selected)
+    latest=latest.tz_localize("UTC") if latest.tzinfo is None else latest.tz_convert("UTC")
+    return latest.to_pydatetime()
 
 
 def _trade_id(frame: pd.DataFrame, population: str, run_id: str) -> pd.Series:
@@ -330,12 +332,13 @@ class HistoricalStrategyValidator:
         if candidates.duplicated(["decision_timestamp","symbol"]).any(): raise ValueError("duplicate candidate identity")
         symbols=sorted(candidates.symbol.unique()); all_rows=[]; all_assoc=[]; run_ids={}; native_runs={}; durations=[]
         interval=pd.Timedelta(minutes=config.data.strategy_timeframe_minutes)
+        warmup_bars=int(self.warmup_bars(config))
         profiles=[key for key,value in config.strategy.profiles.items() if value.enabled]
         finite=all(config.execution.profiles[key].timeout_enabled for key in profiles)
         tail=pd.Timedelta(minutes=max((config.execution.profiles[key].timeout_minutes for key in profiles),default=0)) if finite else None
         for index,symbol in enumerate(symbols,1):
             if cancelled(): raise ValidationCancelled(f"cancelled after {index-1} of {len(symbols)} symbols")
-            subset=candidates[candidates.symbol.eq(symbol)]; start=subset.decision_timestamp.min()-self.warmup_bars(config)*interval
+            subset=candidates[candidates.symbol.eq(symbol)]; start=subset.decision_timestamp.min()-warmup_bars*interval
             minimum_end=subset.decision_timestamp.max()+horizon
             latest=self.latest_available(symbol)
             if tail is not None:
@@ -363,8 +366,10 @@ class HistoricalStrategyValidator:
                   "code_commit":_commit(),"scanner_run_ids":sorted(candidates.scan_run_id.unique()),
                   "scanner_decision_timestamps":sorted(x.isoformat() for x in candidates.decision_timestamp.unique()),
                   "strategy_config_snapshot":"strategy_config_snapshot.json","strategy_config_sha256":config_hash,
-                  "authoritative_strategy_config_hash":config_hash,
+                  "authoritative_research_config_sha256":config_hash,
                   "validation_reporting_overrides":VALIDATION_REPORTING_OVERRIDES,
+                  "validation_warmup_bars":warmup_bars,
+                  "validation_warmup_policy_version":WARMUP_POLICY_VERSION,
                   "strategy_timeframe_minutes":config.data.strategy_timeframe_minutes,
                   "intrabar_timeframe_minutes":config.data.intrabar_timeframe_minutes if config.data.use_intrabar_data else None,
                   "evaluation_horizon":str(horizon),"unique_candidate_symbols":symbols,
@@ -417,7 +422,7 @@ class HistoricalStrategyValidationService:
                 symbol,config.data.strategy_timeframe_minutes,
             )
         executor=NativeResearchExecutor(runner_factory,request)
-        validator=HistoricalStrategyValidator(executor,warmup_bars=lambda _cfg:registry.effective_warmup(registry.names()),
+        validator=HistoricalStrategyValidator(executor,warmup_bars=lambda cfg:validation_warmup_bars(cfg,registry),
             output_root=self.output_root,latest_available=latest)
         # Forward native runner stages while retaining exact symbol counters.
         current={}
