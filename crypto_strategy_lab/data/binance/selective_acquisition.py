@@ -20,6 +20,7 @@ from ..query import DataRequest
 from ..schemas import DatasetKind, MarketKind
 from ..source_identity import SourceSignature
 from ..store import DataNotAvailableError, MarketDataStore
+from ..timing import normalize_native_fixed_candle_interval
 from .historical_discovery import HistoricalDiscoveryResult
 from .universe import DiscoveryRow
 
@@ -44,11 +45,9 @@ class SelectiveCandleAcquisitionConfig:
             raise ValueError("shortlist_size must be positive")
         if not 1 <= self.max_workers <= 32:
             raise ValueError("max_workers must be between 1 and 32")
-        # DataRequest owns interval normalization and validation.
-        normalized = DataRequest(
-            "INTERVALCHECK", datetime(2000, 1, 1), datetime(2000, 1, 2),
-            self.strategy_interval,
-        ).strategy_interval
+        # Scanner acquisition requires exchange-native candles. Generic
+        # DataRequest deliberately remains permissive for explicit resampling.
+        normalized = normalize_native_fixed_candle_interval(self.strategy_interval)
         object.__setattr__(self, "strategy_interval", normalized)
 
 

@@ -189,6 +189,42 @@ def test_gui_rows_and_timestamp_precision_match_displayed_seconds():
         workspace.close()
 
 
+def test_historical_timing_defaults_recommendations_and_exact_replay():
+    from crypto_strategy_lab.gui.opportunity_scanner_controller import (
+        historical_range_defaults, historical_single_recommendation)
+    now=datetime(2026,8,31,14,30,tzinfo=timezone.utc)
+    start,end=historical_range_defaults(now)
+    assert start==datetime(2026,8,30,0,1,tzinfo=timezone.utc)
+    assert end==datetime(2026,8,30,23,59,59,tzinfo=timezone.utc)
+    assert historical_single_recommendation(now,"1h")==datetime(2026,8,31,14,1,tzinfo=timezone.utc)
+    assert historical_single_recommendation(now,"4h")==datetime(2026,8,31,12,1,tzinfo=timezone.utc)
+    assert historical_single_recommendation(now,"1d")==datetime(2026,8,31,0,1,tzinfo=timezone.utc)
+    midnight=datetime(2026,8,31,0,0,30,tzinfo=timezone.utc)
+    assert historical_single_recommendation(midnight,"1d")==datetime(2026,8,30,0,1,tzinfo=timezone.utc)
+    assert historical_single_recommendation(midnight,"1d") <= midnight
+    custom=datetime(2026,8,30,6,37,12,tzinfo=timezone.utc)
+    for name,step in HISTORICAL_REPLAY_CADENCES.items():
+        points=historical_decision_points(custom,custom+step*2,step)
+        assert points==(custom,custom+step,custom+step*2),name
+
+
+def test_manual_single_edit_is_not_overwritten_by_timeframe_change():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
+    widgets=pytest.importorskip("PySide6.QtWidgets",exc_type=ImportError)
+    from PySide6.QtCore import QDateTime
+    from crypto_strategy_lab.gui.opportunity_scanner_workspace import OpportunityScannerWorkspace
+    app=widgets.QApplication.instance() or widgets.QApplication([])
+    workspace=OpportunityScannerWorkspace(object())
+    try:
+        custom=QDateTime(datetime(2025,8,30,6,37,12,tzinfo=timezone.utc))
+        workspace.decision_time.setDateTime(custom)
+        workspace.timeframe.setCurrentText("4h")
+        assert workspace._utc(workspace.decision_time)==datetime(2025,8,30,6,37,12,tzinfo=timezone.utc)
+    finally:
+        workspace.close()
+
+
 def test_gui_progress_has_exact_counts_stages_and_time_based_eta():
     import os
     os.environ.setdefault("QT_QPA_PLATFORM","offscreen")

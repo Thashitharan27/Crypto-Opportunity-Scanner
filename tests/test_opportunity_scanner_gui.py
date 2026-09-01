@@ -56,6 +56,16 @@ def test_gui_values_map_to_native_task_configs():
             model=SCORING_MODELS[0],enabled_features=())
 
 
+def test_scanner_request_rejects_non_native_grid_during_construction():
+    decision=datetime(2026,1,2,3,4,5,tzinfo=timezone.utc)
+    with pytest.raises(ValueError,match="not a native fixed Binance candle grid"):
+        build_request(mode="HISTORICAL",decision_time=decision,
+            minimum_listing_age_days=30,minimum_quote_volume=Decimal(0),
+            maximum_spread_percent=Decimal(1),preliminary_size=1,final_size=1,
+            strategy_interval="7m",model=None,enabled_features=())
+    assert decision==datetime(2026,1,2,3,4,5,tzinfo=timezone.utc)
+
+
 def _published_run(directory: Path):
     frames={"universe_snapshot":"symbol,eligible,range_percent\nBTCUSDT,True,2.5\n",
         "discovery_rejections":"symbol,eligible\n",
@@ -207,6 +217,18 @@ def test_off_grid_decision_aligns_task3_but_preserves_pipeline_boundary(
     if mode == "HISTORICAL":
         assert ("historical",decision) in calls
     assert any(call[0]=="task7" for call in calls)
+
+
+@pytest.mark.parametrize(("interval","expected"),[
+    ("30m",datetime(2026,1,2,12,30,tzinfo=timezone.utc)),
+    ("2h",datetime(2026,1,2,12,0,tzinfo=timezone.utc)),
+])
+def test_task3_accepts_additional_native_fixed_grids_without_changing_decision(interval,expected):
+    decision=datetime(2026,1,2,12,34,56,tzinfo=timezone.utc)
+    start,end=Task1To7OpportunityScanner._candle_bounds(decision,interval,2)
+    assert end==expected
+    assert start==expected-2*__import__("crypto_strategy_lab.data.timing",fromlist=["interval_to_timedelta"]).interval_to_timedelta(interval)
+    assert decision==datetime(2026,1,2,12,34,56,tzinfo=timezone.utc)
 
 
 def test_cancelled_facade_never_enters_task7_publication(monkeypatch,tmp_path):

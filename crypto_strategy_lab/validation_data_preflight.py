@@ -1,12 +1,13 @@
 """Requirement-driven Data Lake preparation for historical strategy validation."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 import json
 
 from .data import DataRequest, DatasetKind, MarketKind
 from .data.binance.selective_acquisition import AcquisitionState, ArchiveAcquisitionRequest
 from .data.quality import DataQualityStatus
+from .data.timing import floor_fixed_candle_grid, normalize_native_fixed_candle_interval
 from .gui.v2_controller import GuiResearchRequest
 from .rich_data_acquisition import (RequirementRequiredness, RichDataAcquisitionConfig,
     resolve_rich_data_requirements)
@@ -27,9 +28,22 @@ class ValidationDataRequirement:
     interval: str | None
 
 
+_FIXED_CANDLE_DATASETS = {DatasetKind.KLINES, DatasetKind.MARK_PRICE_KLINES,
+    DatasetKind.INDEX_PRICE_KLINES, DatasetKind.PREMIUM_INDEX_KLINES}
+
+
+def _align_candle_requirement(item: ValidationDataRequirement) -> ValidationDataRequirement:
+    """Align each candle request to its own grid; leave event data exact."""
+    if item.dataset not in _FIXED_CANDLE_DATASETS or item.interval is None:
+        return item
+    request=replace(item.request,start=floor_fixed_candle_grid(item.request.start,item.interval))
+    return replace(item,request=request)
+
+
 def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDataRequirement,...]:
-    strategy=f"{config.data.strategy_timeframe_minutes}m"
-    intrabar=f"{config.data.intrabar_timeframe_minutes}m" if config.data.use_intrabar_data else None
+    strategy=normalize_native_fixed_candle_interval(f"{config.data.strategy_timeframe_minutes}m")
+    intrabar=(normalize_native_fixed_candle_interval(f"{config.data.intrabar_timeframe_minutes}m")
+        if config.data.use_intrabar_data else None)
     base=DataRequest(symbol,start,end,strategy,intrabar,market=MarketKind.FUTURES_UM)
     requirements=[ValidationDataRequirement("STRATEGY",base,DatasetKind.KLINES,base.strategy_interval)]
     # Full native interval is intentional: warm-up trades can affect Standard
@@ -65,7 +79,7 @@ def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDat
     for item in requirements:
         key=(item.role,item.request.symbol,item.dataset,item.interval,item.request.start,item.request.end)
         unique[key]=item
-    return tuple(unique.values())
+    return tuple(_align_candle_requirement(item) for item in unique.values())
 
 
 class ValidationDataPreparer:

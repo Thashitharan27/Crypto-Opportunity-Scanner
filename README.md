@@ -203,8 +203,12 @@ rather than risking broken orphan processes.
 
 **Single timestamp** reconstructs one causal decision point at the exact UTC timestamp supplied. It continues to use the native Task 1–7 scan and immutable `OPPORTUNITY_SCAN` publication path.
 
+The suggested time is one minute after the latest completed boundary for the selected strategy timeframe. This is only a convenience: custom decision times, including seconds, remain exact.
+
 ### Historical Range
 
 **Date/time range** generates `start`, `start + cadence`, and subsequent exact UTC decision timestamps through the inclusive end, then runs the same single historical scan sequentially for each timestamp. **A range replay is not one giant backtest. It is a sequence of immutable historical `OPPORTUNITY_SCAN` experiments.** Completed publications are retained if a later scan is cancelled or fails.
+
+New ranges default to the last fully completed UTC day, with normal clocks of `00:01:00` through `23:59:59`. Users can still edit either timestamp precisely. Fixed-cadence candle requests are aligned internally to their Binance grids, so users do not need to choose midnight to avoid candle data-quality errors; the scanner decision timestamp itself is never rounded.
 
 Runtime depends heavily on range length, preliminary shortlist size, selected rich features, existing Data Lake coverage, and how much missing data must be acquired. The GUI displays exact range completion and monotonic elapsed time; estimated remaining time appears only after completed scans provide timing evidence.

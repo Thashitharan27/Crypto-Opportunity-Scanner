@@ -37,6 +37,26 @@ def test_half_open_horizon_neutral_and_incomplete_coverage():
     assert unresolved.iloc[0].result == "UNRESOLVED"
 
 
+@pytest.mark.parametrize(("minutes","expected"),[(1440,"2025-07-01T00:00:00+00:00"),(240,"2025-07-01T00:00:00+00:00"),(120,"2025-07-01T00:00:00+00:00"),(30,"2025-07-01T01:00:00+00:00"),(15,"2025-07-01T01:00:00+00:00")])
+def test_native_validation_request_start_uses_strategy_grid(minutes,expected):
+    base=ResearchRunConfig()
+    config=replace(base,data=replace(base.data,strategy_timeframe_minutes=minutes))
+    decision=datetime(2025,8,30,1,1,1,tzinfo=timezone.utc)
+    warmup=datetime(2025,7,1,1,1,1,tzinfo=timezone.utc)
+    request=build_validation_data_request("ADAUSDT",warmup,decision+pd.Timedelta("1D"),config)
+    assert request.start.isoformat()==expected
+    assert decision==datetime(2025,8,30,1,1,1,tzinfo=timezone.utc)
+
+
+def test_native_validation_request_rejects_non_native_strategy_before_execution():
+    base=ResearchRunConfig()
+    config=replace(base,data=replace(base.data,strategy_timeframe_minutes=7,
+        use_intrabar_data=False))
+    with pytest.raises(ValueError,match="not a native fixed Binance candle grid"):
+        build_validation_data_request("ADAUSDT",datetime(2025,7,1,tzinfo=timezone.utc),
+            datetime(2025,8,31,tzinfo=timezone.utc),config)
+
+
 def test_overlap_conversion_counts_windows_unique_trade_once():
     c=pd.concat([candidates(),candidates().assign(decision_timestamp=pd.Timestamp("2025-01-02T00:00Z"))],ignore_index=True)
     trade=pd.DataFrame({"symbol":["SOLUSDT"],"research_sample_id":["sample-1"],"entry_time":pd.to_datetime(["2025-01-03T00:00Z"]),"pair_net_r":[1.0],"side":["LONG"]})
