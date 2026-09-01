@@ -56,6 +56,16 @@ def test_gui_values_map_to_native_task_configs():
             model=SCORING_MODELS[0],enabled_features=())
 
 
+def test_scanner_request_rejects_non_native_grid_during_construction():
+    decision=datetime(2026,1,2,3,4,5,tzinfo=timezone.utc)
+    with pytest.raises(ValueError,match="not a native fixed Binance candle grid"):
+        build_request(mode="HISTORICAL",decision_time=decision,
+            minimum_listing_age_days=30,minimum_quote_volume=Decimal(0),
+            maximum_spread_percent=Decimal(1),preliminary_size=1,final_size=1,
+            strategy_interval="7m",model=None,enabled_features=())
+    assert decision==datetime(2026,1,2,3,4,5,tzinfo=timezone.utc)
+
+
 def _published_run(directory: Path):
     frames={"universe_snapshot":"symbol,eligible,range_percent\nBTCUSDT,True,2.5\n",
         "discovery_rejections":"symbol,eligible\n",

@@ -7,7 +7,7 @@ import json
 from .data import DataRequest, DatasetKind, MarketKind
 from .data.binance.selective_acquisition import AcquisitionState, ArchiveAcquisitionRequest
 from .data.quality import DataQualityStatus
-from .data.timing import floor_fixed_candle_grid
+from .data.timing import floor_fixed_candle_grid, normalize_native_fixed_candle_interval
 from .gui.v2_controller import GuiResearchRequest
 from .rich_data_acquisition import (RequirementRequiredness, RichDataAcquisitionConfig,
     resolve_rich_data_requirements)
@@ -41,8 +41,9 @@ def _align_candle_requirement(item: ValidationDataRequirement) -> ValidationData
 
 
 def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDataRequirement,...]:
-    strategy=f"{config.data.strategy_timeframe_minutes}m"
-    intrabar=f"{config.data.intrabar_timeframe_minutes}m" if config.data.use_intrabar_data else None
+    strategy=normalize_native_fixed_candle_interval(f"{config.data.strategy_timeframe_minutes}m")
+    intrabar=(normalize_native_fixed_candle_interval(f"{config.data.intrabar_timeframe_minutes}m")
+        if config.data.use_intrabar_data else None)
     base=DataRequest(symbol,start,end,strategy,intrabar,market=MarketKind.FUTURES_UM)
     requirements=[ValidationDataRequirement("STRATEGY",base,DatasetKind.KLINES,base.strategy_interval)]
     # Full native interval is intentional: warm-up trades can affect Standard

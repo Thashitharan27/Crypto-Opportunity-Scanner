@@ -135,3 +135,10 @@ def test_preflight_accepts_and_aligns_additional_native_strategy_intervals(minut
         if r.role=="STRATEGY")
     assert strategy.request.start==expected
     assert decision==datetime(2025,1,1,6,37,12,tzinfo=timezone.utc)
+
+
+def test_preflight_rejects_non_native_grid_before_quality_or_acquisition():
+    base=config(intrabar=False)
+    configured=replace(base,data=replace(base.data,strategy_timeframe_minutes=7))
+    with pytest.raises(ValueError,match="not a native fixed Binance candle grid"):
+        validation_data_requirements("SOLUSDT",START,END,configured)

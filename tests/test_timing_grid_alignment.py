@@ -36,5 +36,5 @@ def test_daily_floor_accepts_off_grid_decision_without_changing_it():
 
 @pytest.mark.parametrize("interval",["7m","1M","", "nonsense"])
 def test_non_native_or_non_fixed_grids_are_rejected(interval):
-    with pytest.raises(ValueError,match="Unsupported|must not be empty"):
+    with pytest.raises(ValueError,match="native fixed Binance|must not be empty|Unsupported"):
         floor_fixed_candle_grid(datetime(2025,8,30,tzinfo=timezone.utc),interval)
