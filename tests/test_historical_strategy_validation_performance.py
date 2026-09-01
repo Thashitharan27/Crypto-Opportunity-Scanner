@@ -1,5 +1,7 @@
 from dataclasses import replace
 from datetime import datetime, timezone
+import json
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -10,6 +12,7 @@ from crypto_strategy_lab.data_lake_config import ResearchRunConfig
 from crypto_strategy_lab.historical_strategy_validation import (
     EVERY_VIABLE_ENTRY,
     HistoricalStrategyValidator,
+    NativeResearchExecutor,
     SymbolResearchResult,
 )
 from crypto_strategy_lab.validation_data_preflight import ValidationDataPreparer
@@ -221,3 +224,60 @@ def test_validation_aborts_if_git_head_changes_during_publication(tmp_path, monk
             config_path=tmp_path / "unused", publish=True)
     assert not list(output_root.glob("strategy-validation-*"))
     assert not list(output_root.glob(".strategy-validation-*.tmp"))
+
+
+def test_native_executor_normalizes_schema_less_empty_standard_trades(tmp_path, monkeypatch):
+    run_dir = tmp_path / "native-empty"
+    run_dir.mkdir()
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "run_id": "native-empty",
+        "request": {
+            "start": "2025-01-01T00:00:00+00:00",
+            "end": "2025-01-02T00:00:00+00:00",
+        },
+        "catalog": {"datasets": []},
+    }), encoding="utf-8")
+
+    sampling = SimpleNamespace(resolved=_empty_viable(), censored=_empty_viable())
+    monkeypatch.setattr(validation_module, "native_simulator_config", lambda *args: object())
+    monkeypatch.setattr(validation_module, "intrabar_from_data_lake_bundle", lambda bundle: pd.DataFrame())
+    monkeypatch.setattr(
+        validation_module,
+        "generate_strategy_research_sampling_result",
+        lambda *args, **kwargs: sampling,
+    )
+
+    bundle = SimpleNamespace(strategy=pd.DataFrame({
+        "period_start": pd.to_datetime(["2025-01-01T00:00:00Z"]),
+    }))
+
+    class Runner:
+        def __init__(self):
+            self.reporters = ()
+
+        def run(self, request, config):
+            context = SimpleNamespace(config=config, prepared=object(), bundle=bundle)
+            for reporter in self.reporters:
+                reporter.report(SimpleNamespace(), context)
+            return SimpleNamespace(output_dir=run_dir, trades=pd.DataFrame())
+
+    executor = NativeResearchExecutor(lambda: Runner(), lambda *args: object())
+    result = executor(
+        "SOLUSDT",
+        datetime(2025, 1, 1, tzinfo=timezone.utc),
+        datetime(2025, 1, 2, tzinfo=timezone.utc),
+        _timeout_disabled_config(),
+    )
+
+    assert result.standard_trades.empty
+    assert list(result.standard_trades.columns) == ["entry_time", "pair_net_r", "side", "pair_id"]
+    windows, associations = validation_module.attach_candidate_trades(
+        _candidates(),
+        result.standard_trades,
+        population=validation_module.STANDARD_SINGLE_SYMBOL,
+        run_id=result.research_run_id,
+        horizon=pd.Timedelta("24h"),
+        available_through=datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+    assert windows.iloc[0].result == "NO_ENTRY"
+    assert associations.empty
