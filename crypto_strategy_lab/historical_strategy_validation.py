@@ -272,6 +272,24 @@ def attach_candidate_trades(candidates: pd.DataFrame, trades: pd.DataFrame, *,
     return pd.DataFrame(rows), pd.DataFrame(associations)
 
 
+def _attach_symbol_result(candidates: pd.DataFrame, result: SymbolResearchResult,
+                          horizon: pd.Timedelta) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Project one native symbol run onto both validation populations."""
+    rows=[]; associations=[]
+    for population,trades,censored in (
+        (STANDARD_SINGLE_SYMBOL,result.standard_trades,None),
+        (EVERY_VIABLE_ENTRY,result.viable_trades,result.viable_censored),
+    ):
+        window_rows,assoc=attach_candidate_trades(candidates,trades,population=population,
+            run_id=result.research_run_id,horizon=horizon,available_through=result.available_through,
+            censored_trades=censored)
+        rows.append(window_rows); associations.append(assoc)
+    combined_rows=pd.concat(rows,ignore_index=True) if rows else pd.DataFrame()
+    combined_assoc=(pd.concat([x for x in associations if not x.empty],ignore_index=True)
+        if any(not x.empty for x in associations) else pd.DataFrame())
+    return combined_rows,combined_assoc
+
+
 def _aggregate(windows: pd.DataFrame, associations: pd.DataFrame) -> dict:
     observed = windows[windows.entry_horizon_status.eq("COMPLETE")]
     resolved_associations = associations[associations.get("status", "RESOLVED").eq("RESOLVED")] if not associations.empty else associations
@@ -316,21 +334,33 @@ def aggregate_reports(outcomes: pd.DataFrame, associations: pd.DataFrame):
 
 
 class HistoricalStrategyValidator:
-    """Sequential one-native-run-per-symbol coordinator."""
+    """Sequential native validator with an optional causal two-stage fast path."""
     def __init__(self, executor: Callable, *, warmup_bars: Callable[[ResearchRunConfig], int],
                  output_root: Path = Path("output/opportunity_validation"), monotonic=time.monotonic,
                  latest_available: Callable[[str], datetime | None] = lambda _symbol:None,
-                 preflight: Callable | None = None, common_available_end: Callable | None = None):
+                 preflight: Callable | None = None, common_available_end: Callable | None = None,
+                 defer_outcome_tail_until_needed: bool = False,
+                 enforce_stable_code_provenance: bool = True):
         self.executor, self.warmup_bars = executor, warmup_bars
         self.output_root, self.monotonic, self.latest_available = Path(output_root), monotonic, latest_available
         self.preflight=preflight
         self.common_available_end=common_available_end
+        self.defer_outcome_tail_until_needed=bool(defer_outcome_tail_until_needed)
+        self.enforce_stable_code_provenance=bool(enforce_stable_code_provenance)
 
     def run(self, candidates: pd.DataFrame, config: ResearchRunConfig, *, config_path: Path,
             evaluation_horizon="24h", cancelled=lambda:False, progress=lambda event:None,
             publish=True) -> StrategyValidationResult:
         config.validate(); horizon=pd.Timedelta(evaluation_horizon)
         if horizon <= pd.Timedelta(0): raise ValueError("entry evaluation horizon must be positive")
+        started_timestamp=datetime.now(timezone.utc); validation_started=self.monotonic()
+        code_commit_start=_commit()
+        def assert_code_stable():
+            current=_commit()
+            if (self.enforce_stable_code_provenance and code_commit_start!="UNKNOWN" and
+                current!="UNKNOWN" and current!=code_commit_start):
+                raise RuntimeError("validation code provenance changed during the run; rerun from one pinned commit")
+            return current
         canonical_config=json.dumps(config.to_dict(),sort_keys=True,separators=(",",":"),default=str).encode()
         config_hash=sha256(canonical_config).hexdigest()
         execution_config=validation_execution_config(config)
@@ -340,6 +370,9 @@ class HistoricalStrategyValidator:
         candidates["symbol"]=candidates.symbol.astype(str).str.upper()
         if candidates.duplicated(["decision_timestamp","symbol"]).any(): raise ValueError("duplicate candidate identity")
         symbols=sorted(candidates.symbol.unique()); all_rows=[]; all_assoc=[]; readiness=[]; run_ids={}; native_runs={}; durations=[]
+        phase_totals={"mandatory_preflight":0.0,"latest_coverage":0.0,"common_coverage":0.0,
+            "outcome_tail_preflight":0.0,"entry_probe":0.0,"native_research":0.0,
+            "outcome_extension":0.0}
         interval=pd.Timedelta(minutes=config.data.strategy_timeframe_minutes)
         warmup_bars=int(self.warmup_bars(config))
         profiles=[key for key,value in config.strategy.profiles.items() if value.enabled]
@@ -347,50 +380,129 @@ class HistoricalStrategyValidator:
         tail=pd.Timedelta(minutes=max((config.execution.profiles[key].timeout_minutes for key in profiles),default=0)) if finite else None
         for index,symbol in enumerate(symbols,1):
             if cancelled(): raise ValidationCancelled(f"cancelled after {index-1} of {len(symbols)} symbols")
+            symbol_started=self.monotonic(); timing={key:0.0 for key in phase_totals}
             subset=candidates[candidates.symbol.eq(symbol)]; start=subset.decision_timestamp.min()-warmup_bars*interval
             mandatory_end=subset.decision_timestamp.max()+horizon
-            latest=self.latest_available(symbol)
-            if tail is not None:
-                desired_end=mandatory_end+tail
-            else:
-                desired_end=max(mandatory_end,pd.Timestamp(latest)) if latest is not None else mandatory_end
             if mandatory_end <= start:
                 raise ValueError(f"{symbol}: no usable market data after required warmup start")
-            if self.preflight is not None:
-                def preflight_progress(event,i=index,total=len(symbols),s=symbol):
-                    progress({"symbol_index":i,"symbol_total":total,"symbol":s,
-                        "elapsed":sum(durations),"eta":None,**event})
-                readiness.extend(self.preflight(symbol,start.to_pydatetime(),mandatory_end.to_pydatetime(),
-                    execution_config,coverage_scope="MANDATORY_ENTRY",cancelled=cancelled,progress=preflight_progress))
-            common_end=(self.common_available_end(symbol,start.to_pydatetime(),desired_end.to_pydatetime(),execution_config)
-                if self.common_available_end is not None else desired_end.to_pydatetime())
-            common=pd.Timestamp(common_end) if common_end is not None else mandatory_end
-            end=min(desired_end,common)
-            if end < mandatory_end:
-                raise ValueError(f"{symbol}: required inputs end before mandatory entry-observation coverage")
-            if self.preflight is not None and end > mandatory_end:
-                readiness.extend(self.preflight(symbol,mandatory_end.to_pydatetime(),end.to_pydatetime(),
-                    execution_config,coverage_scope="OUTCOME_TAIL",cancelled=cancelled,progress=preflight_progress))
-            progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,"stage":"Starting native research","elapsed":sum(durations),"eta":(sum(durations)/len(durations)*(len(symbols)-index+1)) if durations else None})
-            began=self.monotonic()
-            result: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),execution_config)
-            durations.append(self.monotonic()-began); run_ids[symbol]=result.research_run_id
-            native_runs[symbol]={"run_id":result.research_run_id,"run_dir":str(result.run_dir),
-                "request_start":pd.Timestamp(result.request_start).isoformat(),"request_end":pd.Timestamp(result.request_end).isoformat(),
-                "available_through":pd.Timestamp(result.available_through).isoformat(),"source_identities":list(result.source_identities),
-                "mandatory_entry_observation_end":mandatory_end.isoformat(),
-                "desired_outcome_resolution_end":desired_end.isoformat(),"actual_native_run_end":end.isoformat(),
-                "outcome_tail_status":"FULLY_RESOLVED_HORIZON_AVAILABLE" if end>=desired_end else "RIGHT_CENSORED_BY_AVAILABLE_DATA"}
-            for population,trades,censored in ((STANDARD_SINGLE_SYMBOL,result.standard_trades,None),(EVERY_VIABLE_ENTRY,result.viable_trades,result.viable_censored)):
-                rows,assoc=attach_candidate_trades(subset,trades,population=population,run_id=result.research_run_id,horizon=horizon,available_through=result.available_through,censored_trades=censored)
-                all_rows.append(rows); all_assoc.append(assoc)
+            def preflight_progress(event,i=index,total=len(symbols),s=symbol):
+                progress({"symbol_index":i,"symbol_total":total,"symbol":s,
+                    "elapsed":sum(durations),"eta":None,**event})
+
+            if self.defer_outcome_tail_until_needed:
+                if self.preflight is not None:
+                    began=self.monotonic()
+                    readiness.extend(self.preflight(symbol,start.to_pydatetime(),mandatory_end.to_pydatetime(),
+                        execution_config,coverage_scope="MANDATORY_ENTRY",cancelled=cancelled,progress=preflight_progress))
+                    timing["mandatory_preflight"]+=self.monotonic()-began
+                progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,
+                    "stage":"Probing candidate entry horizon","elapsed":sum(durations),
+                    "eta":(sum(durations)/len(durations)*(len(symbols)-index+1)) if durations else None})
+                assert_code_stable(); began=self.monotonic()
+                probe: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),mandatory_end.to_pydatetime(),execution_config)
+                timing["entry_probe"]+=self.monotonic()-began; timing["native_research"]+=timing["entry_probe"]
+                assert_code_stable()
+                final_result=probe; final_rows,final_assoc=_attach_symbol_result(subset,probe,horizon)
+                needs_extension=bool(final_rows.outcome_resolution_status.eq("UNRESOLVED").any())
+                desired_end=mandatory_end; end=mandatory_end
+                tail_status="NOT_REQUIRED_CANDIDATE_WINDOWS_RESOLVED"
+                extension_run_id=None
+                if needs_extension:
+                    began=self.monotonic(); latest=self.latest_available(symbol); timing["latest_coverage"]+=self.monotonic()-began
+                    if tail is not None:
+                        desired_end=mandatory_end+tail
+                    else:
+                        desired_end=max(mandatory_end,pd.Timestamp(latest)) if latest is not None else mandatory_end
+                    began=self.monotonic()
+                    common_end=(self.common_available_end(symbol,start.to_pydatetime(),desired_end.to_pydatetime(),execution_config)
+                        if self.common_available_end is not None else desired_end.to_pydatetime())
+                    timing["common_coverage"]+=self.monotonic()-began
+                    common=pd.Timestamp(common_end) if common_end is not None else mandatory_end
+                    end=min(desired_end,common)
+                    if end < mandatory_end:
+                        raise ValueError(f"{symbol}: required inputs end before mandatory entry-observation coverage")
+                    if self.preflight is not None and end > mandatory_end:
+                        began=self.monotonic()
+                        readiness.extend(self.preflight(symbol,mandatory_end.to_pydatetime(),end.to_pydatetime(),
+                            execution_config,coverage_scope="OUTCOME_TAIL",cancelled=cancelled,progress=preflight_progress))
+                        timing["outcome_tail_preflight"]+=self.monotonic()-began
+                    if end > mandatory_end:
+                        progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,
+                            "stage":"Extending native research for unresolved candidate outcome",
+                            "elapsed":sum(durations),"eta":None})
+                        assert_code_stable(); began=self.monotonic()
+                        final_result=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),execution_config)
+                        timing["outcome_extension"]+=self.monotonic()-began
+                        timing["native_research"]+=timing["outcome_extension"]
+                        assert_code_stable(); extension_run_id=final_result.research_run_id
+                        final_rows,final_assoc=_attach_symbol_result(subset,final_result,horizon)
+                    tail_status=("FULLY_RESOLVED_HORIZON_AVAILABLE" if end>=desired_end
+                        else "RIGHT_CENSORED_BY_AVAILABLE_DATA")
+                run_ids[symbol]=final_result.research_run_id
+                native_runs[symbol]={"run_id":final_result.research_run_id,"run_dir":str(final_result.run_dir),
+                    "entry_probe_run_id":probe.research_run_id,"tail_extension_run_id":extension_run_id,
+                    "tail_extension_performed":bool(extension_run_id),
+                    "request_start":pd.Timestamp(final_result.request_start).isoformat(),
+                    "request_end":pd.Timestamp(final_result.request_end).isoformat(),
+                    "available_through":pd.Timestamp(final_result.available_through).isoformat(),
+                    "source_identities":list(final_result.source_identities),
+                    "mandatory_entry_observation_end":mandatory_end.isoformat(),
+                    "desired_outcome_resolution_end":desired_end.isoformat(),"actual_native_run_end":end.isoformat(),
+                    "outcome_tail_status":tail_status,"timings_seconds":timing}
+                all_rows.append(final_rows); all_assoc.append(final_assoc)
+            else:
+                began=self.monotonic(); latest=self.latest_available(symbol); timing["latest_coverage"]+=self.monotonic()-began
+                if tail is not None:
+                    desired_end=mandatory_end+tail
+                else:
+                    desired_end=max(mandatory_end,pd.Timestamp(latest)) if latest is not None else mandatory_end
+                if self.preflight is not None:
+                    began=self.monotonic()
+                    readiness.extend(self.preflight(symbol,start.to_pydatetime(),mandatory_end.to_pydatetime(),
+                        execution_config,coverage_scope="MANDATORY_ENTRY",cancelled=cancelled,progress=preflight_progress))
+                    timing["mandatory_preflight"]+=self.monotonic()-began
+                began=self.monotonic()
+                common_end=(self.common_available_end(symbol,start.to_pydatetime(),desired_end.to_pydatetime(),execution_config)
+                    if self.common_available_end is not None else desired_end.to_pydatetime())
+                timing["common_coverage"]+=self.monotonic()-began
+                common=pd.Timestamp(common_end) if common_end is not None else mandatory_end
+                end=min(desired_end,common)
+                if end < mandatory_end:
+                    raise ValueError(f"{symbol}: required inputs end before mandatory entry-observation coverage")
+                if self.preflight is not None and end > mandatory_end:
+                    began=self.monotonic()
+                    readiness.extend(self.preflight(symbol,mandatory_end.to_pydatetime(),end.to_pydatetime(),
+                        execution_config,coverage_scope="OUTCOME_TAIL",cancelled=cancelled,progress=preflight_progress))
+                    timing["outcome_tail_preflight"]+=self.monotonic()-began
+                progress({"symbol_index":index,"symbol_total":len(symbols),"symbol":symbol,"stage":"Starting native research","elapsed":sum(durations),"eta":(sum(durations)/len(durations)*(len(symbols)-index+1)) if durations else None})
+                assert_code_stable(); began=self.monotonic()
+                final_result: SymbolResearchResult=self.executor(symbol,start.to_pydatetime(),end.to_pydatetime(),execution_config)
+                timing["native_research"]+=self.monotonic()-began; assert_code_stable()
+                run_ids[symbol]=final_result.research_run_id
+                native_runs[symbol]={"run_id":final_result.research_run_id,"run_dir":str(final_result.run_dir),
+                    "request_start":pd.Timestamp(final_result.request_start).isoformat(),"request_end":pd.Timestamp(final_result.request_end).isoformat(),
+                    "available_through":pd.Timestamp(final_result.available_through).isoformat(),"source_identities":list(final_result.source_identities),
+                    "mandatory_entry_observation_end":mandatory_end.isoformat(),
+                    "desired_outcome_resolution_end":desired_end.isoformat(),"actual_native_run_end":end.isoformat(),
+                    "outcome_tail_status":"FULLY_RESOLVED_HORIZON_AVAILABLE" if end>=desired_end else "RIGHT_CENSORED_BY_AVAILABLE_DATA",
+                    "timings_seconds":timing}
+                final_rows,final_assoc=_attach_symbol_result(subset,final_result,horizon)
+                all_rows.append(final_rows); all_assoc.append(final_assoc)
+
+            symbol_elapsed=self.monotonic()-symbol_started; timing["total"]=symbol_elapsed
+            native_runs[symbol]["timings_seconds"]={**timing,"total":symbol_elapsed}
+            durations.append(symbol_elapsed)
+            for key in phase_totals: phase_totals[key]+=timing.get(key,0.0)
         outcomes=pd.concat(all_rows,ignore_index=True) if all_rows else pd.DataFrame()
-        associations=pd.concat(all_assoc,ignore_index=True) if any(not x.empty for x in all_assoc) else pd.DataFrame(columns=["population","final_rank","decision_timestamp","trade_identity","pair_net_r"])
+        associations=pd.concat([x for x in all_assoc if not x.empty],ignore_index=True) if any(not x.empty for x in all_assoc) else pd.DataFrame(columns=["population","final_rank","decision_timestamp","trade_identity","pair_net_r"])
         summary,by_rank,top_k,by_year=aggregate_reports(outcomes,associations)
         readiness_frame=pd.DataFrame(readiness)
-        manifest={"validation_run_id":f"strategy-validation-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}",
-                  "created_timestamp":datetime.now(timezone.utc).isoformat(),"status":"COMPLETE",
-                  "code_commit":_commit(),"scanner_run_ids":sorted(candidates.scan_run_id.unique()),
+        code_commit_end=assert_code_stable(); completed_timestamp=datetime.now(timezone.utc)
+        total_elapsed=self.monotonic()-validation_started
+        manifest={"validation_run_id":f"strategy-validation-{completed_timestamp:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}",
+                  "started_timestamp":started_timestamp.isoformat(),"created_timestamp":completed_timestamp.isoformat(),"status":"COMPLETE",
+                  "code_commit":code_commit_start,"code_commit_end":code_commit_end,"code_provenance_stable":True,
+                  "scanner_run_ids":sorted(candidates.scan_run_id.unique()),
                   "scanner_decision_timestamps":sorted(x.isoformat() for x in candidates.decision_timestamp.unique()),
                   "strategy_config_snapshot":"strategy_config_snapshot.json","strategy_config_sha256":config_hash,
                   "authoritative_research_config_sha256":config_hash,
@@ -402,14 +514,19 @@ class HistoricalStrategyValidator:
                   "evaluation_horizon":str(horizon),"unique_candidate_symbols":symbols,
                   "native_research_run_ids_by_symbol":run_ids,
                   "native_research_runs_by_symbol":native_runs,
+                  "performance_timings":{"total_elapsed_seconds":total_elapsed,
+                    "phase_totals_seconds":phase_totals,"symbol_total_seconds":dict(zip(symbols,durations))},
                   "resolution_policy":{"finite":finite,"timeout_tail":str(tail) if tail is not None else None,
+                    "defer_outcome_tail_until_needed":self.defer_outcome_tail_until_needed,
                     "timeout_disabled_behavior":"LATEST_AVAILABLE_DATA_AND_NATIVE_END_OF_DATA_CENSORING" if not finite else None},
                   "scanner_candidate_sources":candidates[["scan_run_id","decision_timestamp","symbol","scanner_source_identity"]].to_dict("records") if "scanner_source_identity" in candidates else [],
                   "population_definitions":{STANDARD_SINGLE_SYMBOL:"independent normal native run per symbol (not a combined portfolio)",EVERY_VIABLE_ENTRY:"native overlapping resilience samples; no portfolio metrics"}}
         result=StrategyValidationResult(None,outcomes,summary,by_rank,top_k,by_year,associations,readiness_frame,manifest)
-        return self._publish(result,canonical_config) if publish else result
+        if not publish: return result
+        expected_commit=code_commit_start if self.enforce_stable_code_provenance else None
+        return self._publish(result,canonical_config,expected_code_commit=expected_commit)
 
-    def _publish(self,result,canonical_config):
+    def _publish(self,result,canonical_config,*,expected_code_commit=None):
         final=self.output_root/result.manifest["validation_run_id"]; temp=self.output_root/("."+final.name+".tmp")
         self.output_root.mkdir(parents=True,exist_ok=True); shutil.rmtree(temp,ignore_errors=True); temp.mkdir()
         frames={"candidate_trade_outcomes.csv":result.outcomes,"strategy_validation_summary.csv":result.summary,"strategy_validation_by_rank.csv":result.by_rank,"strategy_validation_top_k.csv":result.top_k,"strategy_validation_by_year.csv":result.by_year,"strategy_validation_trade_associations.csv":result.associations,"strategy_validation_data_readiness.csv":result.data_readiness}
@@ -419,7 +536,13 @@ class HistoricalStrategyValidator:
         snapshot=temp/"strategy_config_snapshot.json"; snapshot.write_bytes(canonical_config)
         artifacts[snapshot.name]={"sha256":file_sha256(snapshot),"rows":1}
         manifest={**result.manifest,"artifacts":artifacts}; (temp/"validation_manifest.json").write_text(json.dumps(manifest,indent=2,default=str),encoding="utf-8")
-        (temp/"COMPLETED").write_text(manifest["validation_run_id"]+"\n",encoding="utf-8"); temp.rename(final)
+        (temp/"COMPLETED").write_text(manifest["validation_run_id"]+"\n",encoding="utf-8")
+        if expected_code_commit is not None:
+            current=_commit()
+            if (expected_code_commit!="UNKNOWN" and current!="UNKNOWN" and current!=expected_code_commit):
+                shutil.rmtree(temp,ignore_errors=True)
+                raise RuntimeError("validation code provenance changed during publication; rerun from one pinned commit")
+        temp.rename(final)
         return StrategyValidationResult(final,result.outcomes,result.summary,result.by_rank,result.top_k,result.by_year,result.associations,result.data_readiness,manifest)
 
 
@@ -454,8 +577,8 @@ class HistoricalStrategyValidationService:
         preparer=ValidationDataPreparer(store,backend)
         validator=HistoricalStrategyValidator(executor,warmup_bars=lambda cfg:validation_warmup_bars(cfg,registry),
             output_root=self.output_root,latest_available=latest,preflight=preparer.prepare,
-            common_available_end=preparer.common_available_end)
-        # Forward native runner stages while retaining exact symbol counters.
+            common_available_end=preparer.common_available_end,
+            defer_outcome_tail_until_needed=True,enforce_stable_code_provenance=True)
         current={}
         def outer(event): current.update(event); progress(event)
         store.progress_callback=lambda event:progress({**current,"native_stage":event.get("label",event.get("phase","—"))})

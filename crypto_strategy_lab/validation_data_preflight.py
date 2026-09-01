@@ -83,11 +83,24 @@ def validation_data_requirements(symbol,start,end,config) -> tuple[ValidationDat
 
 
 class ValidationDataPreparer:
-    def __init__(self,store,backend): self.store,self.backend=store,backend
+    """Prepare required validation inputs while reusing one catalog snapshot.
+
+    Catalog refresh is expensive on large Data Lake roots. A validation service owns
+    one preparer for the whole job, so refresh once up front and refresh again only
+    after this preparer actually acquires new data.
+    """
+    def __init__(self,store,backend):
+        self.store,self.backend=store,backend
+        self._catalog_ready=False
+
+    def _ensure_catalog(self):
+        if not self._catalog_ready:
+            self.store.refresh_catalog()
+            self._catalog_ready=True
 
     def prepare(self,symbol,start,end,config,*,coverage_scope="MANDATORY_ENTRY",
                 cancelled=lambda:False,progress=lambda event:None):
-        rows=[]; self.store.refresh_catalog()
+        rows=[]; self._ensure_catalog()
         for requirement in validation_data_requirements(symbol,start,end,config):
             if cancelled(): raise ValidationDataUnavailable(f"Validation blocked on {symbol}: cancelled")
             progress({"stage":"Checking required validation data","symbol":symbol,
@@ -107,7 +120,9 @@ class ValidationDataPreparer:
                     requirement.request,requirement.dataset,requirement.interval,gaps),cancelled=cancelled)
                 if outcome.state is not AcquisitionState.ACQUIRED:
                     self._blocked(symbol,requirement,outcome.state.value,gaps,report,outcome.detail)
-                self.store.refresh_catalog()
+                # Acquisition mutates the Data Lake, so this is the only point at
+                # which the cached catalog snapshot must be refreshed.
+                self.store.refresh_catalog(); self._catalog_ready=True
                 report=quality(requirement.request,requirement.dataset,
                     interval=requirement.interval,required=True)
                 if report.status is not DataQualityStatus.OK:
@@ -127,6 +142,7 @@ class ValidationDataPreparer:
 
     def common_available_end(self,symbol,start,end,config):
         """Latest common catalog end across strategy-decision-required inputs."""
+        self._ensure_catalog()
         ends=[]
         for requirement in validation_data_requirements(symbol,start,end,config):
             coverage=self.store.catalog.coverage(self.store.raw_root,
