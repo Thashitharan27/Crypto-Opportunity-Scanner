@@ -166,9 +166,11 @@ class ChatGPTConnectionManager(QObject):
         self._starting = True; self.state = "Starting MCP..."; self._deadline = 40
         env = QProcessEnvironment.systemEnvironment()
         env.insert("CRYPTO_STRATEGY_LAB_MCP_PORT", str(port))
-        env.insert("CRYPTO_STRATEGY_LAB_OUTPUT_DIR", str(Path(self.output_dir()).resolve()))
+        output_root = Path(self.output_dir()).resolve()
+        env.insert("CRYPTO_STRATEGY_LAB_OUTPUT_DIR", str(output_root))
         self.mcp.setProcessEnvironment(env); self._mcp_started = True
         self._log("GUI", f"Starting local MCP server on 127.0.0.1:{port}.")
+        self._log("GUI", f"MCP read root: {output_root}.")
         self.mcp.start(sys.executable, ["-m", "mcp_server.server"]); self.monitor.start(); self._emit(); return True
 
     def _poll(self):
@@ -240,12 +242,21 @@ class ChatGPTConnectionManager(QObject):
 
 class ChatGPTIntegrationWidget(QWidget):
     def __init__(self, settings, output_dir, parent=None):
-        super().__init__(parent); self.settings = settings
-        self.manager = ChatGPTConnectionManager(output_dir, self)
+        super().__init__(parent); self.settings = settings; self.default_output_dir = output_dir
+        self.manager = ChatGPTConnectionManager(
+            lambda: self.mcp_output_dir.text().strip() or self._default_mcp_output_dir(), self
+        )
         self._build(); self._load()
         self.manager.state_changed.connect(self._status)
         self.manager.diagnostic_changed.connect(self._diagnostic)
         self.manager.error.connect(lambda text: QMessageBox.warning(self, "ChatGPT Connection", text))
+
+    def _default_mcp_output_dir(self):
+        """Prefer Opportunity Scanner publications for the v2 research shell."""
+        base = Path(str(self.default_output_dir())).expanduser()
+        if base.name.lower() == "data_lake_v2":
+            return str(base.parent / "opportunity_scans")
+        return str(base)
 
     def _build(self):
         outer = QVBoxLayout(self); title = QLabel("ChatGPT Integration"); title.setStyleSheet("font-size:20px;font-weight:600")
@@ -260,10 +271,11 @@ class ChatGPTIntegrationWidget(QWidget):
         self.path=QLineEdit(); browse=QPushButton("Browse"); row=QHBoxLayout(); row.addWidget(self.path); row.addWidget(browse); cf.addRow("Tunnel Client",row)
         self.tunnel_id=QLineEdit(); cf.addRow("Tunnel ID",self.tunnel_id)
         self.key_status=QLabel("Not configured"); self.key_button=QPushButton("Set / Change API Key"); clear=QPushButton("Clear API Key"); kr=QHBoxLayout(); kr.addWidget(self.key_status); kr.addWidget(self.key_button); kr.addWidget(clear); cf.addRow("API Key",kr)
+        self.mcp_output_dir=QLineEdit(); self.mcp_output_dir.setToolTip("Completed-run folder exposed read-only through MCP. Run folders must be direct children of this folder."); output_browse=QPushButton("Browse"); output_row=QHBoxLayout(); output_row.addWidget(self.mcp_output_dir); output_row.addWidget(output_browse); cf.addRow("MCP Read Folder",output_row)
         self.port=QSpinBox(); self.port.setRange(1,65535); cf.addRow("MCP Port",self.port); outer.addWidget(config)
         actions=QHBoxLayout(); test=QPushButton("Test Configuration"); logs=QPushButton("Open Logs"); actions.addWidget(test); actions.addWidget(logs); actions.addStretch(); outer.addLayout(actions); outer.addStretch()
-        self.start_button.clicked.connect(self.start); self.stop_button.clicked.connect(self.manager.stop); browse.clicked.connect(self.browse); self.key_button.clicked.connect(self.set_key); clear.clicked.connect(self.clear_key); test.clicked.connect(self.test); logs.clicked.connect(self.open_logs)
-        self.path.editingFinished.connect(self._save); self.tunnel_id.editingFinished.connect(self._save); self.port.valueChanged.connect(self._save); self.auto_start.toggled.connect(self._save)
+        self.start_button.clicked.connect(self.start); self.stop_button.clicked.connect(self.manager.stop); browse.clicked.connect(self.browse); output_browse.clicked.connect(self.browse_output); self.key_button.clicked.connect(self.set_key); clear.clicked.connect(self.clear_key); test.clicked.connect(self.test); logs.clicked.connect(self.open_logs)
+        self.path.editingFinished.connect(self._save); self.tunnel_id.editingFinished.connect(self._save); self.mcp_output_dir.editingFinished.connect(self._save); self.port.valueChanged.connect(self._save); self.auto_start.toggled.connect(self._save)
 
     def _credential(self):
         try: return importlib.import_module("keyring").get_password(KEYRING_SERVICE, KEYRING_USERNAME)
@@ -273,6 +285,7 @@ class ChatGPTIntegrationWidget(QWidget):
         default_path = next((str(p) for p in (Path(r"C:\OpenAI-Tunnel\tunnel-client.exe"), Path.cwd()/"tunnel-client.exe") if p.is_file()), "")
         self.path.setText(str(self.settings.value("tunnel_client_path", default_path)))
         self.tunnel_id.setText(str(self.settings.value("tunnel_id", os.getenv("CONTROL_PLANE_TUNNEL_ID", ""))))
+        self.mcp_output_dir.setText(str(self.settings.value("mcp_output_dir", self._default_mcp_output_dir())))
         try: port=int(self.settings.value("mcp_port", os.getenv("CRYPTO_STRATEGY_LAB_MCP_PORT", "8765")))
         except (TypeError,ValueError): port=8765
         self.port.setValue(port if 1 <= port <= 65535 else 8765)
@@ -281,7 +294,7 @@ class ChatGPTIntegrationWidget(QWidget):
 
     def _save(self):
         self.settings.setValue("tunnel_client_path",self.path.text().strip()); self.settings.setValue("tunnel_id",self.tunnel_id.text().strip())
-        self.settings.setValue("mcp_port",self.port.value()); self.settings.setValue("auto_start_chatgpt_connection",self.auto_start.isChecked()); self._update_endpoint()
+        self.settings.setValue("mcp_output_dir",self.mcp_output_dir.text().strip()); self.settings.setValue("mcp_port",self.port.value()); self.settings.setValue("auto_start_chatgpt_connection",self.auto_start.isChecked()); self._update_endpoint()
 
     def _refresh_key(self):
         try: configured=bool(self._credential())
@@ -292,6 +305,9 @@ class ChatGPTIntegrationWidget(QWidget):
     def browse(self):
         value,_=QFileDialog.getOpenFileName(self,"Select tunnel client",self.path.text(),"Executables (*.exe);;All files (*)")
         if value: self.path.setText(value); self._save()
+    def browse_output(self):
+        value=QFileDialog.getExistingDirectory(self,"Select MCP read folder",self.mcp_output_dir.text() or self._default_mcp_output_dir())
+        if value: self.mcp_output_dir.setText(value); self._save()
     def set_key(self):
         value,ok=QInputDialog.getText(self,"Runtime API Key","API key:",QLineEdit.Password)
         if ok and value:
