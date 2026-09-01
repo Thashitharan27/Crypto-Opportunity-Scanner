@@ -356,11 +356,11 @@ class HistoricalStrategyValidator:
         started_timestamp=datetime.now(timezone.utc); validation_started=self.monotonic()
         code_commit_start=_commit()
         def assert_code_stable():
-            if not self.enforce_stable_code_provenance: return
             current=_commit()
-            if (code_commit_start!="UNKNOWN" and current!="UNKNOWN" and
-                current!=code_commit_start):
+            if (self.enforce_stable_code_provenance and code_commit_start!="UNKNOWN" and
+                current!="UNKNOWN" and current!=code_commit_start):
                 raise RuntimeError("validation code provenance changed during the run; rerun from one pinned commit")
+            return current
         canonical_config=json.dumps(config.to_dict(),sort_keys=True,separators=(",",":"),default=str).encode()
         config_hash=sha256(canonical_config).hexdigest()
         execution_config=validation_execution_config(config)
@@ -390,9 +390,6 @@ class HistoricalStrategyValidator:
                     "elapsed":sum(durations),"eta":None,**event})
 
             if self.defer_outcome_tail_until_needed:
-                # Phase 1 proves the entire candidate entry horizon causally. Future
-                # data cannot create an entry inside a completed past window, so a
-                # resolved probe is already authoritative and needs no outcome tail.
                 if self.preflight is not None:
                     began=self.monotonic()
                     readiness.extend(self.preflight(symbol,start.to_pydatetime(),mandatory_end.to_pydatetime(),
@@ -454,8 +451,6 @@ class HistoricalStrategyValidator:
                     "outcome_tail_status":tail_status,"timings_seconds":timing}
                 all_rows.append(final_rows); all_assoc.append(final_assoc)
             else:
-                # Compatibility path: preserve the original eager full-tail behavior
-                # for direct callers/tests. Production validation enables the fast path.
                 began=self.monotonic(); latest=self.latest_available(symbol); timing["latest_coverage"]+=self.monotonic()-began
                 if tail is not None:
                     desired_end=mandatory_end+tail
@@ -502,11 +497,11 @@ class HistoricalStrategyValidator:
         associations=pd.concat([x for x in all_assoc if not x.empty],ignore_index=True) if any(not x.empty for x in all_assoc) else pd.DataFrame(columns=["population","final_rank","decision_timestamp","trade_identity","pair_net_r"])
         summary,by_rank,top_k,by_year=aggregate_reports(outcomes,associations)
         readiness_frame=pd.DataFrame(readiness)
-        assert_code_stable(); completed_timestamp=datetime.now(timezone.utc)
+        code_commit_end=assert_code_stable(); completed_timestamp=datetime.now(timezone.utc)
         total_elapsed=self.monotonic()-validation_started
         manifest={"validation_run_id":f"strategy-validation-{completed_timestamp:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}",
                   "started_timestamp":started_timestamp.isoformat(),"created_timestamp":completed_timestamp.isoformat(),"status":"COMPLETE",
-                  "code_commit":code_commit_start,"code_commit_end":_commit(),"code_provenance_stable":True,
+                  "code_commit":code_commit_start,"code_commit_end":code_commit_end,"code_provenance_stable":True,
                   "scanner_run_ids":sorted(candidates.scan_run_id.unique()),
                   "scanner_decision_timestamps":sorted(x.isoformat() for x in candidates.decision_timestamp.unique()),
                   "strategy_config_snapshot":"strategy_config_snapshot.json","strategy_config_sha256":config_hash,
@@ -527,9 +522,11 @@ class HistoricalStrategyValidator:
                   "scanner_candidate_sources":candidates[["scan_run_id","decision_timestamp","symbol","scanner_source_identity"]].to_dict("records") if "scanner_source_identity" in candidates else [],
                   "population_definitions":{STANDARD_SINGLE_SYMBOL:"independent normal native run per symbol (not a combined portfolio)",EVERY_VIABLE_ENTRY:"native overlapping resilience samples; no portfolio metrics"}}
         result=StrategyValidationResult(None,outcomes,summary,by_rank,top_k,by_year,associations,readiness_frame,manifest)
-        return self._publish(result,canonical_config) if publish else result
+        if not publish: return result
+        expected_commit=code_commit_start if self.enforce_stable_code_provenance else None
+        return self._publish(result,canonical_config,expected_code_commit=expected_commit)
 
-    def _publish(self,result,canonical_config):
+    def _publish(self,result,canonical_config,*,expected_code_commit=None):
         final=self.output_root/result.manifest["validation_run_id"]; temp=self.output_root/("."+final.name+".tmp")
         self.output_root.mkdir(parents=True,exist_ok=True); shutil.rmtree(temp,ignore_errors=True); temp.mkdir()
         frames={"candidate_trade_outcomes.csv":result.outcomes,"strategy_validation_summary.csv":result.summary,"strategy_validation_by_rank.csv":result.by_rank,"strategy_validation_top_k.csv":result.top_k,"strategy_validation_by_year.csv":result.by_year,"strategy_validation_trade_associations.csv":result.associations,"strategy_validation_data_readiness.csv":result.data_readiness}
@@ -539,7 +536,13 @@ class HistoricalStrategyValidator:
         snapshot=temp/"strategy_config_snapshot.json"; snapshot.write_bytes(canonical_config)
         artifacts[snapshot.name]={"sha256":file_sha256(snapshot),"rows":1}
         manifest={**result.manifest,"artifacts":artifacts}; (temp/"validation_manifest.json").write_text(json.dumps(manifest,indent=2,default=str),encoding="utf-8")
-        (temp/"COMPLETED").write_text(manifest["validation_run_id"]+"\n",encoding="utf-8"); temp.rename(final)
+        (temp/"COMPLETED").write_text(manifest["validation_run_id"]+"\n",encoding="utf-8")
+        if expected_code_commit is not None:
+            current=_commit()
+            if (expected_code_commit!="UNKNOWN" and current!="UNKNOWN" and current!=expected_code_commit):
+                shutil.rmtree(temp,ignore_errors=True)
+                raise RuntimeError("validation code provenance changed during publication; rerun from one pinned commit")
+        temp.rename(final)
         return StrategyValidationResult(final,result.outcomes,result.summary,result.by_rank,result.top_k,result.by_year,result.associations,result.data_readiness,manifest)
 
 
@@ -576,7 +579,6 @@ class HistoricalStrategyValidationService:
             output_root=self.output_root,latest_available=latest,preflight=preparer.prepare,
             common_available_end=preparer.common_available_end,
             defer_outcome_tail_until_needed=True,enforce_stable_code_provenance=True)
-        # Forward native runner stages while retaining exact symbol counters.
         current={}
         def outer(event): current.update(event); progress(event)
         store.progress_callback=lambda event:progress({**current,"native_stage":event.get("label",event.get("phase","—"))})
