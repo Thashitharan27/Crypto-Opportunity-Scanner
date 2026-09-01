@@ -195,3 +195,29 @@ def test_validation_aborts_if_git_head_changes_mid_job(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="code provenance changed"):
         validator.run(_candidates(), _timeout_disabled_config(),
             config_path=tmp_path / "unused", publish=False)
+
+
+def test_validation_aborts_if_git_head_changes_during_publication(tmp_path, monkeypatch):
+    commits = iter(["commit-a", "commit-a", "commit-a", "commit-a", "commit-b"])
+    monkeypatch.setattr(validation_module, "_commit", lambda: next(commits))
+
+    def execute(symbol, start, end, config):
+        viable = _empty_viable()
+        return SymbolResearchResult(
+            "probe", _empty_standard(), viable, viable.copy(), end,
+            tmp_path / "probe", start, end,
+        )
+
+    output_root = tmp_path / "validation"
+    validator = HistoricalStrategyValidator(
+        execute,
+        warmup_bars=lambda _: 0,
+        output_root=output_root,
+        defer_outcome_tail_until_needed=True,
+        enforce_stable_code_provenance=True,
+    )
+    with pytest.raises(RuntimeError, match="changed during publication"):
+        validator.run(_candidates(), _timeout_disabled_config(),
+            config_path=tmp_path / "unused", publish=True)
+    assert not list(output_root.glob("strategy-validation-*"))
+    assert not list(output_root.glob(".strategy-validation-*.tmp"))
