@@ -78,23 +78,23 @@ def normalize_binance_interval(interval: str) -> str:
     return lowered
 
 
-_AUTHORITATIVE_FIXED_GRIDS = {"1m", "5m", "15m", "1h", "4h", "1d"}
-
-
 def floor_fixed_candle_grid(value: datetime, interval: str) -> datetime:
     """Floor ``value`` to an authoritative Binance fixed-candle UTC grid.
 
     Decision and event timestamps must not use this helper.  It is exclusively
-    for the bounds of fixed-cadence candle requests.
+    for the bounds of fixed-cadence candle requests. Binance weekly candles are
+    anchored to Monday 00:00 UTC; the remaining native fixed intervals use the
+    Unix epoch UTC anchor. Calendar-month candles are deliberately not fixed.
     """
 
     normalized = normalize_binance_interval(interval)
-    if normalized not in _AUTHORITATIVE_FIXED_GRIDS:
+    if normalized not in _BINANCE_FIXED_INTERVALS:
         raise ValueError(f"Unsupported authoritative candle grid: {interval!r}")
     utc = ensure_utc(value)
-    step = int(interval_to_timedelta(normalized).total_seconds())
-    epoch_seconds = int(utc.timestamp())
-    return datetime.fromtimestamp(epoch_seconds - epoch_seconds % step, tz=timezone.utc)
+    step = interval_to_timedelta(normalized)
+    anchor = (datetime(1970, 1, 5, tzinfo=timezone.utc)
+              if normalized == "1w" else datetime(1970, 1, 1, tzinfo=timezone.utc))
+    return anchor + ((utc - anchor) // step) * step
 
 
 def canonical_available_at(

@@ -121,3 +121,17 @@ def test_four_hour_context_has_its_own_grid():
         "SOLUSDT",datetime(2025,1,1,6,37,12,tzinfo=timezone.utc),END,"4h")
     aligned=_align_candle_requirement(ValidationDataRequirement("STRATEGY_CONTEXT",request,DatasetKind.KLINES,"4h"))
     assert aligned.request.start==datetime(2025,1,1,4,tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(("minutes","expected"),[
+    (30,datetime(2025,1,1,6,30,tzinfo=timezone.utc)),
+    (120,datetime(2025,1,1,6,tzinfo=timezone.utc)),
+])
+def test_preflight_accepts_and_aligns_additional_native_strategy_intervals(minutes,expected):
+    base=config(intrabar=False)
+    configured=replace(base,data=replace(base.data,strategy_timeframe_minutes=minutes))
+    decision=datetime(2025,1,1,6,37,12,tzinfo=timezone.utc)
+    strategy=next(r for r in validation_data_requirements("SOLUSDT",decision,END,configured)
+        if r.role=="STRATEGY")
+    assert strategy.request.start==expected
+    assert decision==datetime(2025,1,1,6,37,12,tzinfo=timezone.utc)

@@ -37,7 +37,7 @@ def test_half_open_horizon_neutral_and_incomplete_coverage():
     assert unresolved.iloc[0].result == "UNRESOLVED"
 
 
-@pytest.mark.parametrize(("minutes","expected"),[(1440,"2025-07-01T00:00:00+00:00"),(240,"2025-07-01T00:00:00+00:00"),(15,"2025-07-01T01:00:00+00:00")])
+@pytest.mark.parametrize(("minutes","expected"),[(1440,"2025-07-01T00:00:00+00:00"),(240,"2025-07-01T00:00:00+00:00"),(120,"2025-07-01T00:00:00+00:00"),(30,"2025-07-01T01:00:00+00:00"),(15,"2025-07-01T01:00:00+00:00")])
 def test_native_validation_request_start_uses_strategy_grid(minutes,expected):
     base=ResearchRunConfig()
     config=replace(base,data=replace(base.data,strategy_timeframe_minutes=minutes))

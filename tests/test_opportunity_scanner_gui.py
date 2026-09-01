@@ -209,6 +209,18 @@ def test_off_grid_decision_aligns_task3_but_preserves_pipeline_boundary(
     assert any(call[0]=="task7" for call in calls)
 
 
+@pytest.mark.parametrize(("interval","expected"),[
+    ("30m",datetime(2026,1,2,12,30,tzinfo=timezone.utc)),
+    ("2h",datetime(2026,1,2,12,0,tzinfo=timezone.utc)),
+])
+def test_task3_accepts_additional_native_fixed_grids_without_changing_decision(interval,expected):
+    decision=datetime(2026,1,2,12,34,56,tzinfo=timezone.utc)
+    start,end=Task1To7OpportunityScanner._candle_bounds(decision,interval,2)
+    assert end==expected
+    assert start==expected-2*__import__("crypto_strategy_lab.data.timing",fromlist=["interval_to_timedelta"]).interval_to_timedelta(interval)
+    assert decision==datetime(2026,1,2,12,34,56,tzinfo=timezone.utc)
+
+
 def test_cancelled_facade_never_enters_task7_publication(monkeypatch,tmp_path):
     import crypto_strategy_lab.gui.opportunity_scanner_controller as controller
     decision=datetime(2026,1,2,12,tzinfo=timezone.utc); cancelled=[False]
