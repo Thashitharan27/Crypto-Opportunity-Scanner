@@ -108,13 +108,16 @@ class NativeResearchExecutor:
         run_dir=Path(result.output_dir)
         manifest=json.loads((run_dir/"run_manifest.json").read_text(encoding="utf-8"))
         sampling=captured["sampling"]; viable=sampling.resolved; censored=sampling.censored
+        standard=result.trades
+        if standard.empty:
+            standard=pd.DataFrame(columns=["entry_time","pair_net_r","side","pair_id"])
         if viable.empty:
             viable=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
         if censored.empty:
             censored=pd.DataFrame(columns=["entry_time","pair_net_r","side","research_sample_id"])
         sources=tuple(x.get("source_signature","") for x in manifest.get("catalog",{}).get("datasets",[]) if x.get("source_signature"))
         request=manifest["request"]
-        return SymbolResearchResult(manifest["run_id"],result.trades,viable,censored,
+        return SymbolResearchResult(manifest["run_id"],standard,viable,censored,
             captured["available_through"].to_pydatetime(),run_dir,
             pd.Timestamp(request["start"]).to_pydatetime(),pd.Timestamp(request["end"]).to_pydatetime(),sources)
 
@@ -222,7 +225,6 @@ def attach_candidate_trades(candidates: pd.DataFrame, trades: pd.DataFrame, *,
         external_censored = (censored_native[(censored_native.symbol == candidate.symbol) &
             (censored_native.entry_time >= decision) & (censored_native.entry_time < end)]
             if not censored_native.empty else censored_native)
-        # Existing sampling removes END_OF_DATA. Be defensive for standard native rows.
         reason_columns = [c for c in ("exit_reason", "long_exit_reason", "short_exit_reason") if c in selected]
         censored = pd.Series(False, index=selected.index)
         for column in reason_columns:
