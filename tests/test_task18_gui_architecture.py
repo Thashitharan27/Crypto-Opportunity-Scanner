@@ -144,8 +144,17 @@ def _qt_window():
         def coverage(self, _request): return []
     class Service:
         catalog=Catalog()
-        def refresh_catalog(self): return 0
+        def refresh_catalog(self):
+            raise AssertionError("GUI construction must not rescan the raw archive catalog")
     return app, MainWindow(service=Service())
+
+
+def test_main_window_startup_uses_persisted_catalog_without_archive_rescan():
+    _app, window = _qt_window()
+    try:
+        assert window.symbol.currentText() == "BTCUSDT"
+    finally:
+        window.close()
 
 
 def test_main_window_constructs_offscreen_and_timeframes_roundtrip():
