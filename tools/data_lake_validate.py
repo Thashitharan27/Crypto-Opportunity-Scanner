@@ -83,7 +83,7 @@ def print_report(report: DataQualityReport) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     store = MarketDataStore(args.raw_root, args.cache_root)
-    count = store.refresh_catalog()
+    count = store.refresh_catalog(force_full=True)
     print(f"Cataloged archives: {count}")
 
     request = DataRequest(
