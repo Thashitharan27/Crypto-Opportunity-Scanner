@@ -107,7 +107,7 @@ class GuiApplicationService:
 
     def refresh_catalog(self) -> int:
         """Refresh discovery only at the application-service boundary."""
-        return self.store.refresh_catalog()
+        return self.store.refresh_catalog(force_full=True)
 
     def required_data_quality(self, request: GuiResearchRequest) -> DataQualityReport:
         """Validate the exact required candle slices selected in the GUI.
