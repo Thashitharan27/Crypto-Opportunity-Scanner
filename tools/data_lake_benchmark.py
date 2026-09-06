@@ -227,7 +227,7 @@ def main() -> int:
     catalog_seconds = 0.0
     if not args.skip_catalog_refresh:
         started = time.perf_counter()
-        store.refresh_catalog()
+        store.refresh_catalog(force_full=True)
         catalog_seconds = time.perf_counter() - started
 
     records: list[dict[str, object]] = []

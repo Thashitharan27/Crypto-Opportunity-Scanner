@@ -33,6 +33,7 @@ RESEARCH_ARTIFACTS = (
 )
 
 TIMING_LABELS = (
+    ("catalog_refresh", "Catalog Refresh"),
     ("data_features", "Data & Features"),
     ("prepared_cache", "Prepared Frame"),
     ("engine_init", "Engine Init"),

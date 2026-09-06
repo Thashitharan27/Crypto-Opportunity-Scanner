@@ -12,10 +12,14 @@ from .schemas import ArchiveRecord
 CANONICAL_CACHE_FORMAT_VERSION = 1
 
 
-def stat_fingerprint(path: Path) -> str:
-    """Fast source fingerprint without hashing multi-gigabyte archive contents."""
+def stat_fingerprint(path: Path, stat_result=None) -> str:
+    """Fast source fingerprint without hashing multi-gigabyte archive contents.
 
-    stat = path.stat()
+    Discovery can pass an already-fetched stat result so a full archive scan does
+    not perform a second filesystem metadata lookup for every file.
+    """
+
+    stat = stat_result if stat_result is not None else path.stat()
     raw = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
     return sha256(raw).hexdigest()
 

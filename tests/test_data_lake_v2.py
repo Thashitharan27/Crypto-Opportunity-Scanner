@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import zipfile
 
 import pandas as pd
@@ -84,6 +85,33 @@ def test_market_data_store_catalogs_caches_and_loads_by_request(tmp_path: Path) 
     assert request.symbol == "BTCUSDT"
     assert frame["source_fingerprint"].nunique() == 1
     assert list((tmp_path / "cache" / "market").rglob("*.parquet"))
+
+
+def test_catalog_refresh_uses_directory_index_after_full_seed(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    first = _make_archive(raw_root)
+    store = MarketDataStore(raw_root=raw_root, cache_root=tmp_path / "cache")
+
+    assert store.refresh_catalog(force_full=True) == 1
+    assert store.last_catalog_refresh["mode"] == "full"
+    assert store.catalog.directory_snapshot(raw_root)
+
+    second = first.parent / "BTCUSDT-1m-2026-01-02.zip"
+    second.write_bytes(first.read_bytes())
+    os.utime(first.parent, None)
+
+    assert store.refresh_catalog() == 2
+    assert store.last_catalog_refresh["mode"] == "incremental"
+    assert store.last_catalog_refresh["directories_changed"] >= 1
+
+    assert store.refresh_catalog() == 2
+    assert store.last_catalog_refresh["mode"] == "incremental"
+    assert store.last_catalog_refresh["directories_changed"] == 0
+
+    second.unlink()
+    os.utime(first.parent, None)
+    assert store.refresh_catalog() == 1
+    assert store.last_catalog_refresh["directories_changed"] >= 1
 
 
 def test_execution_kline_load_projects_filters_and_preserves_ohlcv(tmp_path: Path) -> None:

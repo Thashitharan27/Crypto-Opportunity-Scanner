@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import re
 
@@ -70,13 +71,22 @@ def _period_from_name(name: str, frequency: str) -> tuple[datetime | None, datet
     return None, None
 
 
-def infer_archive_record(path: Path, raw_root: Path) -> ArchiveRecord | None:
+def infer_archive_record(
+    path: Path,
+    raw_root: Path,
+    *,
+    stat_result=None,
+) -> ArchiveRecord | None:
     """Infer canonical archive metadata from standard or collector-preserved paths."""
 
     path = Path(path)
     raw_root = Path(raw_root)
-    if path.suffix.lower() not in {".zip", ".csv"} or not path.is_file():
+    if path.suffix.lower() not in {".zip", ".csv"}:
         return None
+    if stat_result is None:
+        if not path.is_file():
+            return None
+        stat_result = path.stat()
     try:
         relative = path.relative_to(raw_root)
     except ValueError:
@@ -113,10 +123,9 @@ def infer_archive_record(path: Path, raw_root: Path) -> ArchiveRecord | None:
         interval = tail[1]
 
     period_start, period_end = _period_from_name(path.name, frequency)
-    stat = path.stat()
     return ArchiveRecord(
-        raw_root=raw_root.resolve(),
-        path=path.resolve(),
+        raw_root=raw_root,
+        path=path,
         market=market,
         dataset=dataset,
         symbol=symbol,
@@ -124,24 +133,103 @@ def infer_archive_record(path: Path, raw_root: Path) -> ArchiveRecord | None:
         frequency=frequency,
         period_start=period_start,
         period_end=period_end,
-        size_bytes=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-        fingerprint=stat_fingerprint(path),
+        size_bytes=stat_result.st_size,
+        mtime_ns=stat_result.st_mtime_ns,
+        fingerprint=stat_fingerprint(path, stat_result),
     )
+
+
+def _record_sort_key(item: ArchiveRecord):
+    return (
+        item.market.value,
+        item.dataset.value,
+        item.symbol,
+        item.interval or "",
+        item.period_start or datetime.min.replace(tzinfo=timezone.utc),
+        str(item.path),
+    )
+
+
+def scan_archive_directory(
+    directory: Path,
+    raw_root: Path,
+) -> tuple[list[ArchiveRecord], dict[str, int]]:
+    """Scan one directory only, returning direct archives and child-directory mtimes."""
+
+    root = Path(raw_root).resolve()
+    current = Path(directory).resolve()
+    records: list[ArchiveRecord] = []
+    children: dict[str, int] = {}
+    with os.scandir(current) as entries:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stat = entry.stat(follow_symlinks=False)
+                    children[str(Path(entry.path).absolute())] = stat.st_mtime_ns
+                    continue
+                if Path(entry.name).suffix.lower() not in {".zip", ".csv"}:
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # A collector may atomically replace a file while discovery is
+                # observing the directory. The next refresh will see it.
+                continue
+            record = infer_archive_record(
+                Path(entry.path).absolute(),
+                root,
+                stat_result=stat,
+            )
+            if record is not None:
+                records.append(record)
+    records.sort(key=_record_sort_key)
+    return records, children
+
+
+def discover_archive_subtree(
+    scan_root: Path,
+    raw_root: Path,
+) -> tuple[list[ArchiveRecord], dict[str, int]]:
+    """Discover recognized archives and directory mtimes for one subtree."""
+
+    root = Path(raw_root).resolve()
+    start = Path(scan_root).resolve()
+    if not start.exists():
+        raise FileNotFoundError(f"Binance data-lake path does not exist: {start}")
+
+    records: list[ArchiveRecord] = []
+    directories: dict[str, int] = {}
+    stack = [start]
+    while stack:
+        directory = stack.pop()
+        try:
+            directories[str(directory)] = directory.stat().st_mtime_ns
+            direct_records, children = scan_archive_directory(directory, root)
+        except FileNotFoundError:
+            continue
+        records.extend(direct_records)
+        for child, mtime_ns in children.items():
+            directories[child] = mtime_ns
+            stack.append(Path(child))
+
+    records.sort(key=_record_sort_key)
+    return records, directories
+
+
+def discover_archives_with_directories(
+    raw_root: Path,
+) -> tuple[list[ArchiveRecord], dict[str, int]]:
+    """Full discovery plus a directory-mtime index for later incremental refreshes."""
+
+    root = Path(raw_root).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Binance data-lake root does not exist: {root}")
+    return discover_archive_subtree(root, root)
 
 
 def discover_archives(raw_root: Path) -> list[ArchiveRecord]:
     """Recursively catalog recognized Binance ZIP/CSV files under `raw_root`."""
 
-    root = Path(raw_root)
-    if not root.exists():
-        raise FileNotFoundError(f"Binance data-lake root does not exist: {root}")
-    records: list[ArchiveRecord] = []
-    for path in root.rglob("*"):
-        if path.suffix.lower() not in {".zip", ".csv"}:
-            continue
-        record = infer_archive_record(path, root)
-        if record is not None:
-            records.append(record)
-    records.sort(key=lambda item: (item.market.value, item.dataset.value, item.symbol, item.interval or "", item.period_start or datetime.min.replace(tzinfo=timezone.utc), str(item.path)))
+    records, _directories = discover_archives_with_directories(raw_root)
     return records

@@ -85,6 +85,18 @@ def test_controller_invokes_injected_runner_exactly_once(tmp_path):
     assert len(calls) == 1
 
 
+def test_controller_explicit_refresh_forces_full_discovery(tmp_path):
+    calls = []
+    class Store:
+        def refresh_catalog(self, *, force_full=False):
+            calls.append(force_full)
+            return 7
+    service = object.__new__(GuiApplicationService)
+    service.store = Store()
+    assert service.refresh_catalog() == 7
+    assert calls == [True]
+
+
 def test_catalog_coverage_is_utc_normalized_and_path_free(tmp_path):
     class Catalog:
         def inventory(self, *_args, **_kwargs):
@@ -144,8 +156,17 @@ def _qt_window():
         def coverage(self, _request): return []
     class Service:
         catalog=Catalog()
-        def refresh_catalog(self): return 0
+        def refresh_catalog(self):
+            raise AssertionError("GUI construction must not rescan the raw archive catalog")
     return app, MainWindow(service=Service())
+
+
+def test_main_window_startup_uses_persisted_catalog_without_archive_rescan():
+    _app, window = _qt_window()
+    try:
+        assert window.symbol.currentText() == "BTCUSDT"
+    finally:
+        window.close()
 
 
 def test_main_window_constructs_offscreen_and_timeframes_roundtrip():
