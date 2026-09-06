@@ -1257,7 +1257,11 @@ class MainWindow(QMainWindow):
         nav.addWidget(quick_run)
         self._connect_request_refresh()
         self._connect_live_summary()
-        self.service.refresh_catalog()
+        # Startup stays metadata-only. A full raw archive discovery can take
+        # minutes on a large Binance data lake; the persisted catalog is enough
+        # to render the initial shell.
+        if startup_status:
+            startup_status("Loading cached market-data catalog...")
         self._load_catalog()
         self.apply_config(self.config)
         if startup_status:
