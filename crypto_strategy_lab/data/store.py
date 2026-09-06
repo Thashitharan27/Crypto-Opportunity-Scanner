@@ -9,7 +9,11 @@ import json
 import duckdb
 import pandas as pd
 
-from .binance.discovery import discover_archives
+from .binance.discovery import (
+    discover_archive_subtree,
+    discover_archives_with_directories,
+    scan_archive_directory,
+)
 from .binance.events import (
     BookDepthArchiveAdapter,
     BookTickerArchiveAdapter,
@@ -38,6 +42,7 @@ class MarketDataStore:
         self.cache.ensure()
         self.catalog = DataCatalog(self.cache.catalog_db)
         self.canonical_cache_events = {"hit": 0, "miss": 0}
+        self.last_catalog_refresh: dict[str, object] = {}
         self._adapters = {
             DatasetKind.KLINES: KlineArchiveAdapter(),
             DatasetKind.MARK_PRICE_KLINES: KlineLikeArchiveAdapter(
@@ -57,10 +62,154 @@ class MarketDataStore:
             DatasetKind.BOOK_DEPTH: BookDepthArchiveAdapter(),
         }
 
-    def refresh_catalog(self) -> int:
-        records = discover_archives(self.raw_root)
-        self.catalog.sync_root(self.raw_root, records)
-        return len(records)
+    @staticmethod
+    def _path_is_within(path_text: str, directory_text: str) -> bool:
+        path = Path(path_text)
+        directory = Path(directory_text)
+        try:
+            path.relative_to(directory)
+            return True
+        except ValueError:
+            return False
+
+    def refresh_catalog(self, *, force_full: bool = False) -> int:
+        """Refresh raw-archive discovery with a persistent directory index.
+
+        Normal runs stat only known directories and rescan directories whose
+        contents changed. A full recursive file discovery is reserved for the
+        first indexed refresh or an explicit force-full revalidation. Existing
+        archive files are treated as immutable between full validations; repair
+        workflows should use the explicit validation path, which forces a full
+        refresh and therefore notices in-place replacements.
+        """
+
+        snapshot = self.catalog.directory_snapshot(self.raw_root)
+        if force_full or not snapshot:
+            records, directories = discover_archives_with_directories(self.raw_root)
+            self.catalog.sync_root(
+                self.raw_root,
+                records,
+                directory_mtimes=directories,
+            )
+            self.last_catalog_refresh = {
+                "mode": "full",
+                "archive_count": len(records),
+                "directories_checked": len(directories),
+                "directories_changed": len(directories),
+            }
+            return len(records)
+
+        updated_directories = dict(snapshot)
+        changed_directories: list[str] = []
+        removed_directories: set[str] = set()
+
+        # Directory mtimes change when a file/subdirectory is added, removed, or
+        # renamed. Checking directories instead of 100k+ archive files keeps the
+        # common unchanged run path cheap.
+        for directory_text, previous_mtime in snapshot.items():
+            directory = Path(directory_text)
+            try:
+                current_mtime = directory.stat().st_mtime_ns
+            except FileNotFoundError:
+                removed_directories.add(directory_text)
+                continue
+            updated_directories[directory_text] = current_mtime
+            if current_mtime != previous_mtime:
+                changed_directories.append(directory_text)
+
+        if not changed_directories and not removed_directories:
+            count = self.catalog.archive_count(self.raw_root)
+            self.last_catalog_refresh = {
+                "mode": "incremental",
+                "archive_count": count,
+                "directories_checked": len(snapshot),
+                "directories_changed": 0,
+            }
+            return count
+
+        # Keep only the highest removed subtree roots; deleting a parent already
+        # removes every catalog member and directory snapshot beneath it.
+        removed_roots = {
+            candidate
+            for candidate in removed_directories
+            if not any(
+                candidate != other and self._path_is_within(candidate, other)
+                for other in removed_directories
+            )
+        }
+        for directory_text in list(updated_directories):
+            if any(
+                self._path_is_within(directory_text, removed)
+                for removed in removed_roots
+            ):
+                updated_directories.pop(directory_text, None)
+
+        replacements: dict[str, list[ArchiveRecord]] = {}
+        known_directories = set(snapshot)
+        for directory_text in changed_directories:
+            if any(
+                self._path_is_within(directory_text, removed)
+                for removed in removed_roots
+            ):
+                continue
+            directory = Path(directory_text)
+            try:
+                direct_records, children = scan_archive_directory(
+                    directory,
+                    self.raw_root,
+                )
+                updated_directories[directory_text] = directory.stat().st_mtime_ns
+            except FileNotFoundError:
+                removed_roots.add(directory_text)
+                updated_directories.pop(directory_text, None)
+                continue
+            replacements[directory_text] = direct_records
+
+            # A newly created child can contain an entire symbol/interval tree.
+            # Discover that new subtree once; existing child directories are
+            # independently covered by the mtime loop above.
+            for child_text in children:
+                if child_text in known_directories:
+                    continue
+                try:
+                    subtree_records, subtree_directories = discover_archive_subtree(
+                        Path(child_text),
+                        self.raw_root,
+                    )
+                except FileNotFoundError:
+                    continue
+                updated_directories.update(subtree_directories)
+                for subtree_directory in subtree_directories:
+                    replacements.setdefault(subtree_directory, [])
+                for record in subtree_records:
+                    replacements.setdefault(
+                        str(record.path.absolute().parent), []
+                    ).append(record)
+
+        # A directory can disappear between the initial stat pass and its direct
+        # rescan. Remove any stale descendant snapshot rows discovered in that
+        # race before committing the incremental state.
+        for directory_text in list(updated_directories):
+            if any(
+                self._path_is_within(directory_text, removed)
+                for removed in removed_roots
+            ):
+                updated_directories.pop(directory_text, None)
+
+        self.catalog.apply_incremental_root(
+            self.raw_root,
+            replacements=replacements,
+            removed_directories=removed_roots,
+            directory_mtimes=updated_directories,
+        )
+        count = self.catalog.archive_count(self.raw_root)
+        self.last_catalog_refresh = {
+            "mode": "incremental",
+            "archive_count": count,
+            "directories_checked": len(snapshot),
+            "directories_changed": len(replacements) + len(removed_roots),
+        }
+        return count
 
     def _adapter_for(self, dataset: DatasetKind):
         try:
